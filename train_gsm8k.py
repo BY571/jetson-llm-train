@@ -141,7 +141,7 @@ def save_run_config(args, grpo_config, model_info, output_path):
             "temperature": 1.0,
             "loss_type": "dapo",
             "scale_rewards": False,
-            "mask_truncated_completions": False,
+            "mask_truncated_completions": True,
             "max_grad_norm": 1.0,
             "warmup_ratio": 0.1,
             "gradient_checkpointing": True,
@@ -291,7 +291,7 @@ def main():
         temperature=1.0,
         loss_type="dapo",
         scale_rewards=False,
-        mask_truncated_completions=False,
+        mask_truncated_completions=True,  # exclude truncated completions from loss (safe with beta=0)
         fp16=True,
         bf16=False,
         gradient_checkpointing=True,
