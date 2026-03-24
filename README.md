@@ -31,6 +31,35 @@ docker run --runtime nvidia --network=host \
 - JetPack 6.x (CUDA 12.6)
 - NVMe SSD recommended for swap (16GB+)
 
+## Jetson RAM Optimization (do this first)
+
+On 8GB Jetson, every MB counts. These steps free ~1GB+ of RAM and add 16GB NVMe swap.
+See: https://www.jetson-ai-lab.com/tutorials/ram-optimization/
+
+```bash
+# Disable desktop GUI (saves ~800MB RAM)
+sudo systemctl set-default multi-user.target
+sudo systemctl stop gdm3 2>/dev/null; sudo systemctl stop lightdm 2>/dev/null
+
+# Disable camera daemon (not needed for training)
+sudo systemctl disable nvargus-daemon.service
+sudo systemctl stop nvargus-daemon.service
+
+# Replace ZRAM with 16GB NVMe swap
+sudo systemctl disable nvzramconfig
+sudo swapoff -a
+sudo fallocate -l 16G /home/$USER/16GB.swap
+sudo chmod 600 /home/$USER/16GB.swap
+sudo mkswap /home/$USER/16GB.swap
+sudo swapon /home/$USER/16GB.swap
+echo "/home/$USER/16GB.swap  none  swap  sw 0  0" | sudo tee -a /etc/fstab
+
+# Verify
+free -h
+```
+
+After this you should see ~6.5GB available RAM and 16GB swap.
+
 ## Known Jetson Issues & Workarounds
 
 | Issue | Workaround |
