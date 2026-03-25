@@ -60,6 +60,7 @@ extern "C" {
     void launch_fp16_gemv(const half* weight, const half* input, half* output, int out_dim, int in_dim, cudaStream_t stream);
     void launch_nf4_gemv(const uint8_t* packed, const float* absmax, const float* quant_map, const half* input, half* output, int out_dim, int in_dim, int block_size, cudaStream_t stream);
     void launch_rms_norm(const half* input, const half* weight, half* output, int dim, float eps, cudaStream_t stream);
+    void launch_qk_norm(half* q, half* k, const half* q_weight, const half* k_weight, int num_q_heads, int num_kv_heads, int head_dim, float eps, cudaStream_t stream);
     void launch_rope(half* q, half* k, const half* cos_table, const half* sin_table, int pos, int max_seq_len, cudaStream_t stream);
     void launch_gqa_attention(const half* q, const half* k_cache, const half* v_cache, half* output, float* attn_scratch, int pos, int max_seq_len, cudaStream_t stream);
     void launch_silu_gate_mul(const half* gate, const half* up, half* output, int dim, cudaStream_t stream);
@@ -193,17 +194,9 @@ void InferenceEngine::forward_layer(int layer_idx) {
     cublas_hgemv(layer.k_proj_fp16, norm_out, state_.k_buf, KV_DIM, HIDDEN_SIZE);
     cublas_hgemv(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE);
 
-    // 2b. QKNorm (Qwen3: RMSNorm applied per-head to Q and K after projection)
-    // Q: apply norm to each of NUM_HEADS heads (each HEAD_DIM)
-    for (int h = 0; h < NUM_HEADS; h++) {
-        launch_rms_norm(state_.q_buf + h * HEAD_DIM, layer.q_norm,
-                        state_.q_buf + h * HEAD_DIM, HEAD_DIM, RMS_NORM_EPS, stream);
-    }
-    // K: apply norm to each of NUM_KV_HEADS heads
-    for (int h = 0; h < NUM_KV_HEADS; h++) {
-        launch_rms_norm(state_.k_buf + h * HEAD_DIM, layer.k_norm,
-                        state_.k_buf + h * HEAD_DIM, HEAD_DIM, RMS_NORM_EPS, stream);
-    }
+    // 2b. Fused QKNorm (one kernel for all 24 heads instead of 24 separate launches)
+    launch_qk_norm(state_.q_buf, state_.k_buf, layer.q_norm, layer.k_norm,
+                   NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, RMS_NORM_EPS, stream);
 
     // 3. RoPE
     launch_rope(state_.q_buf, state_.k_buf,

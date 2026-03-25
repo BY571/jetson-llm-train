@@ -226,6 +226,63 @@ __global__ void rms_norm_kernel(
 }
 
 // ============================================================================
+// Kernel 2b: Fused QKNorm (RMSNorm applied per-head to Q and K)
+// ============================================================================
+// Replaces 24 separate rms_norm_kernel launches per layer with ONE kernel.
+// Each block handles one head (Q or K).
+
+__global__ void qk_norm_kernel(
+    half* __restrict__ q,           // (Q_DIM,) = (NUM_HEADS * HEAD_DIM,)
+    half* __restrict__ k,           // (KV_DIM,) = (NUM_KV_HEADS * HEAD_DIM,)
+    const half* __restrict__ q_weight, // (HEAD_DIM,) shared across all Q heads
+    const half* __restrict__ k_weight, // (HEAD_DIM,) shared across all K heads
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float eps
+) {
+    int block_id = blockIdx.x;
+    bool is_q = block_id < num_q_heads;
+    int head_idx = is_q ? block_id : (block_id - num_q_heads);
+
+    half* data = is_q ? (q + head_idx * head_dim) : (k + head_idx * head_dim);
+    const half* weight = is_q ? q_weight : k_weight;
+
+    // RMSNorm: compute sum of squares
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float val = __half2float(data[i]);
+        sum_sq += val * val;
+    }
+
+    // Warp reduction
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+
+    __shared__ float shared[32];
+    int warp_id = threadIdx.x / warpSize;
+    int lane_id = threadIdx.x % warpSize;
+    if (lane_id == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        sum_sq = (lane_id < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane_id] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset /= 2)
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+        if (lane_id == 0) shared[0] = sum_sq;
+    }
+    __syncthreads();
+
+    float rms = rsqrtf(shared[0] / head_dim + eps);
+
+    // Normalize and scale
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float val = __half2float(data[i]) * rms;
+        data[i] = __float2half(val * __half2float(weight[i]));
+    }
+}
+
+// ============================================================================
 // Kernel 3: RoPE (Rotary Position Embedding)
 // ============================================================================
 // Apply rotation to Q and K vectors in-place.
@@ -561,6 +618,19 @@ void launch_rms_norm(
     cudaStream_t stream
 ) {
     rms_norm_kernel<<<1, 256, 0, stream>>>(input, weight, output, dim, eps);
+}
+
+void launch_qk_norm(
+    half* q, half* k,
+    const half* q_weight, const half* k_weight,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float eps, cudaStream_t stream
+) {
+    int total_heads = num_q_heads + num_kv_heads;
+    qk_norm_kernel<<<total_heads, 128, 0, stream>>>(
+        q, k, q_weight, k_weight,
+        num_q_heads, num_kv_heads, head_dim, eps
+    );
 }
 
 void launch_rope(
