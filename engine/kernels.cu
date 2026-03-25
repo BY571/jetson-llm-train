@@ -38,7 +38,8 @@ __constant__ float NF4_LOOKUP[16] = {
 
 __global__ void nf4_gemv_kernel(
     const uint8_t* __restrict__ weight_data,    // NF4 packed (2 values per byte)
-    const half* __restrict__ absmax,             // per-block scales
+    const float* __restrict__ absmax,            // per-block scales (float32, pre-dequantized)
+    const float* __restrict__ quant_map,         // NF4 lookup (16 entries)
     const half* __restrict__ input,              // (in_dim,) fp16
     half* __restrict__ output,                   // (out_dim,) fp16
     int in_dim,
@@ -49,30 +50,34 @@ __global__ void nf4_gemv_kernel(
     if (out_idx >= out_dim) return;
 
     // Each output element = dot(weight_row[out_idx], input)
-    // weight_row is (in_dim,) stored as NF4
+    // Flat layout: element [out_idx, j] is at flat index out_idx * in_dim + j
+    // Packed: flat_idx / 2 = byte, hi nibble first, lo nibble second
 
-    const uint8_t* row = weight_data + (size_t)out_idx * (in_dim / 2);
-    int num_blocks = (in_dim + block_size - 1) / block_size;
+    int total_per_row = in_dim;
+    int row_start = out_idx * total_per_row;
+    int num_blocks_per_row = total_per_row / block_size;
 
     float sum = 0.0f;
 
-    // Each thread handles a chunk of the dot product
-    for (int b = threadIdx.x; b < num_blocks; b += blockDim.x) {
-        float scale = __half2float(absmax[out_idx * num_blocks + b]);
-        int start = b * block_size;
-        int end = min(start + block_size, in_dim);
+    // Each thread handles some blocks of the dot product
+    for (int b = threadIdx.x; b < num_blocks_per_row; b += blockDim.x) {
+        int flat_block_idx = out_idx * num_blocks_per_row + b;
+        float scale = absmax[flat_block_idx];
+        int col_start = b * block_size;
 
         float local_sum = 0.0f;
-        for (int j = start; j < end; j += 2) {
-            int byte_idx = j / 2;
-            uint8_t packed = row[byte_idx];
-            uint8_t lo = packed & 0x0F;
-            uint8_t hi = (packed >> 4) & 0x0F;
+        for (int j = col_start; j < col_start + block_size; j += 2) {
+            int flat_idx = row_start + j;
+            int byte_idx = flat_idx / 2;
+            uint8_t packed = weight_data[byte_idx];
+            // BNB nibble order: hi first, lo second
+            uint8_t first_nib = (packed >> 4) & 0x0F;
+            uint8_t second_nib = packed & 0x0F;
 
-            float w0 = NF4_LOOKUP[lo] * scale;
-            float w1 = NF4_LOOKUP[hi] * scale;
+            float w0 = quant_map[first_nib] * scale;
+            float w1 = quant_map[second_nib] * scale;
             float x0 = __half2float(input[j]);
-            float x1 = (j + 1 < end) ? __half2float(input[j + 1]) : 0.0f;
+            float x1 = __half2float(input[j + 1]);
 
             local_sum += w0 * x0 + w1 * x1;
         }
@@ -531,15 +536,19 @@ __global__ void temperature_scale_kernel(
 extern "C" {
 
 void launch_nf4_gemv(
-    const NF4Weight& weight,
+    const uint8_t* packed,
+    const float* absmax,
+    const float* quant_map,
     const half* input,
     half* output,
+    int out_dim,
+    int in_dim,
+    int block_size,
     cudaStream_t stream
 ) {
-    int threads = 128;
-    nf4_gemv_kernel<<<weight.cols, threads, 0, stream>>>(
-        weight.data, weight.absmax, input, output,
-        weight.rows, weight.cols, weight.block_size
+    nf4_gemv_kernel<<<out_dim, 128, 0, stream>>>(
+        packed, absmax, quant_map, input, output,
+        in_dim, out_dim, block_size
     );
 }
 

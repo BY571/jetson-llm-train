@@ -23,15 +23,16 @@ namespace qwen3 {
 
 // NF4 quantized weight: stored as uint8 (2 values per byte) + quantization metadata
 struct NF4Weight {
-    uint8_t* data;          // packed NF4 values (2 per byte)
-    half* absmax;           // per-block scale factors
-    half* quant_map;        // NF4 dequant lookup table (16 entries)
-    int rows;
-    int cols;
+    uint8_t* data;          // packed NF4 values (2 per byte), on GPU
+    float* absmax;          // per-block scale factors (float32, pre-dequantized), on GPU
+    float* quant_map;       // NF4 dequant lookup table (16 entries), on GPU
+    int out_dim;            // output dimension (rows)
+    int in_dim;             // input dimension (cols)
     int block_size;         // typically 64
+    int n_blocks;           // out_dim * in_dim / block_size
 
-    // Size in bytes
-    size_t data_bytes() const { return (size_t)rows * cols / 2; }
+    int total_params() const { return out_dim * in_dim; }
+    size_t data_bytes() const { return (size_t)total_params() / 2; }
 };
 
 // FP16 weight (for embedding, norms, LoRA)
@@ -59,10 +60,16 @@ struct TransformerLayerWeights {
     half* v_proj_fp16;      // (KV_DIM, HIDDEN) = (1024, 1024)
     half* o_proj_fp16;      // (HIDDEN, Q_DIM) = (1024, 2048)
 
-    // MLP (fp16, dequantized from NF4 at load time by convert_weights.py)
-    half* gate_proj_fp16;   // (INTERMEDIATE, HIDDEN) = (3072, 1024)
-    half* up_proj_fp16;     // (INTERMEDIATE, HIDDEN) = (3072, 1024)
-    half* down_proj_fp16;   // (HIDDEN, INTERMEDIATE) = (1024, 3072)
+    // MLP: either fp16 (dequantized) or NF4 (native quantized)
+    // Only one of these is non-null per layer
+    half* gate_proj_fp16;   // (INTERMEDIATE, HIDDEN) if fp16 mode
+    half* up_proj_fp16;     // (INTERMEDIATE, HIDDEN) if fp16 mode
+    half* down_proj_fp16;   // (HIDDEN, INTERMEDIATE) if fp16 mode
+
+    NF4Weight gate_proj_nf4;  // if NF4 mode
+    NF4Weight up_proj_nf4;    // if NF4 mode
+    NF4Weight down_proj_nf4;  // if NF4 mode
+    bool mlp_is_nf4 = false;
 
     // Norms (fp16, small)
     half* input_layernorm;  // (HIDDEN,)

@@ -70,9 +70,53 @@ void InferenceEngine::load_weights(const std::string& prefix) {
         L.k_proj_fp16 = load(p + "self_attn.k_proj.weight");
         L.v_proj_fp16 = load(p + "self_attn.v_proj.weight");
         L.o_proj_fp16 = load(p + "self_attn.o_proj.weight");
-        L.gate_proj_fp16 = load(p + "mlp.gate_proj.weight");
-        L.up_proj_fp16 = load(p + "mlp.up_proj.weight");
-        L.down_proj_fp16 = load(p + "mlp.down_proj.weight");
+        // MLP: check if NF4 (uint8) or fp16
+        std::string gw = p + "mlp.gate_proj.weight";
+        auto git = index.find(gw);
+        if (git != index.end() && git->second.dtype == "uint8") {
+            // NF4 mode: load packed data + dequantized absmax + quant_map
+            L.mlp_is_nf4 = true;
+            L.gate_proj_fp16 = L.up_proj_fp16 = L.down_proj_fp16 = nullptr;
+
+            auto load_nf4 = [&](const std::string& prefix, int out_dim, int in_dim) -> NF4Weight {
+                NF4Weight w = {};
+                w.out_dim = out_dim;
+                w.in_dim = in_dim;
+                w.block_size = 64;
+                w.n_blocks = out_dim * in_dim / 64;
+
+                auto it_d = index.find(prefix + ".weight");
+                auto it_a = index.find(prefix + ".weight.absmax");
+                auto it_q = index.find(prefix + ".weight.quant_map");
+
+                if (it_d != index.end()) {
+                    void* p; cudaMalloc(&p, it_d->second.nbytes);
+                    cudaMemcpy(p, base + it_d->second.offset, it_d->second.nbytes, cudaMemcpyHostToDevice);
+                    w.data = (uint8_t*)p;
+                }
+                if (it_a != index.end()) {
+                    void* p; cudaMalloc(&p, it_a->second.nbytes);
+                    cudaMemcpy(p, base + it_a->second.offset, it_a->second.nbytes, cudaMemcpyHostToDevice);
+                    w.absmax = (float*)p;
+                }
+                if (it_q != index.end()) {
+                    void* p; cudaMalloc(&p, it_q->second.nbytes);
+                    cudaMemcpy(p, base + it_q->second.offset, it_q->second.nbytes, cudaMemcpyHostToDevice);
+                    w.quant_map = (float*)p;
+                }
+                return w;
+            };
+
+            L.gate_proj_nf4 = load_nf4(p + "mlp.gate_proj", INTERMEDIATE_SIZE, HIDDEN_SIZE);
+            L.up_proj_nf4 = load_nf4(p + "mlp.up_proj", INTERMEDIATE_SIZE, HIDDEN_SIZE);
+            L.down_proj_nf4 = load_nf4(p + "mlp.down_proj", HIDDEN_SIZE, INTERMEDIATE_SIZE);
+        } else {
+            // fp16 mode
+            L.mlp_is_nf4 = false;
+            L.gate_proj_fp16 = load(p + "mlp.gate_proj.weight");
+            L.up_proj_fp16 = load(p + "mlp.up_proj.weight");
+            L.down_proj_fp16 = load(p + "mlp.down_proj.weight");
+        }
         L.input_layernorm = load(p + "input_layernorm.weight");
         L.post_attn_layernorm = load(p + "post_attention_layernorm.weight");
         L.q_norm = load(p + "self_attn.q_norm.weight");

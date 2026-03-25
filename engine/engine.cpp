@@ -22,6 +22,7 @@ inline cudaError_t cudaMallocTyped(T** ptr, size_t size) {
 // Forward declarations for kernel launchers (defined in kernels.cu)
 extern "C" {
     void launch_fp16_gemv(const half* weight, const half* input, half* output, int out_dim, int in_dim, cudaStream_t stream);
+    void launch_nf4_gemv(const uint8_t* packed, const float* absmax, const float* quant_map, const half* input, half* output, int out_dim, int in_dim, int block_size, cudaStream_t stream);
     void launch_rms_norm(const half* input, const half* weight, half* output, int dim, float eps, cudaStream_t stream);
     void launch_rope(half* q, half* k, const half* cos_table, const half* sin_table, int pos, int max_seq_len, cudaStream_t stream);
     void launch_gqa_attention(const half* q, const half* k_cache, const half* v_cache, half* output, float* attn_scratch, int pos, int max_seq_len, cudaStream_t stream);
@@ -195,16 +196,21 @@ void InferenceEngine::forward_layer(int layer_idx) {
     launch_rms_norm(state_.residual, layer.post_attn_layernorm, norm_out,
                     HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
-    // 9. FFN: gate_proj and up_proj (fp16, dequantized from NF4 at load time)
-    launch_fp16_gemv(layer.gate_proj_fp16, norm_out, state_.gate_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, stream);
-    launch_fp16_gemv(layer.up_proj_fp16, norm_out, state_.up_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, stream);
-
-    // 10. SiLU gate * up
-    launch_silu_gate_mul(state_.gate_buf, state_.up_buf, state_.gate_buf,
-                          INTERMEDIATE_SIZE, stream);
-
-    // 11. Down projection
-    launch_fp16_gemv(layer.down_proj_fp16, state_.gate_buf, state_.hidden, HIDDEN_SIZE, INTERMEDIATE_SIZE, stream);
+    // 9. FFN: gate_proj and up_proj
+    if (layer.mlp_is_nf4) {
+        auto& g = layer.gate_proj_nf4;
+        auto& u = layer.up_proj_nf4;
+        auto& d = layer.down_proj_nf4;
+        launch_nf4_gemv(g.data, g.absmax, g.quant_map, norm_out, state_.gate_buf, g.out_dim, g.in_dim, g.block_size, stream);
+        launch_nf4_gemv(u.data, u.absmax, u.quant_map, norm_out, state_.up_buf, u.out_dim, u.in_dim, u.block_size, stream);
+        launch_silu_gate_mul(state_.gate_buf, state_.up_buf, state_.gate_buf, INTERMEDIATE_SIZE, stream);
+        launch_nf4_gemv(d.data, d.absmax, d.quant_map, state_.gate_buf, state_.hidden, d.out_dim, d.in_dim, d.block_size, stream);
+    } else {
+        launch_fp16_gemv(layer.gate_proj_fp16, norm_out, state_.gate_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, stream);
+        launch_fp16_gemv(layer.up_proj_fp16, norm_out, state_.up_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, stream);
+        launch_silu_gate_mul(state_.gate_buf, state_.up_buf, state_.gate_buf, INTERMEDIATE_SIZE, stream);
+        launch_fp16_gemv(layer.down_proj_fp16, state_.gate_buf, state_.hidden, HIDDEN_SIZE, INTERMEDIATE_SIZE, stream);
+    }
 
     // 12. Residual add
     launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
