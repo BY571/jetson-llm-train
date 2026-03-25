@@ -14,7 +14,7 @@
 
 // Forward declarations for kernel launchers (defined in kernels.cu)
 extern "C" {
-    void launch_nf4_gemv(const NF4Weight& weight, const half* input, half* output, cudaStream_t stream);
+    void launch_fp16_gemv(const half* weight, const half* input, half* output, int out_dim, int in_dim, cudaStream_t stream);
     void launch_rms_norm(const half* input, const half* weight, half* output, int dim, float eps, cudaStream_t stream);
     void launch_rope(half* q, half* k, const half* cos_table, const half* sin_table, int pos, int max_seq_len, cudaStream_t stream);
     void launch_gqa_attention(const half* q, const half* k_cache, const half* v_cache, half* output, float* attn_scratch, int pos, int max_seq_len, cudaStream_t stream);
@@ -144,10 +144,22 @@ void InferenceEngine::forward_layer(int layer_idx) {
     launch_rms_norm(state_.residual, layer.input_layernorm, norm_out,
                     HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
-    // 2. QKV projections
-    launch_nf4_gemv(layer.q_proj, norm_out, state_.q_buf, stream);
-    launch_nf4_gemv(layer.k_proj, norm_out, state_.k_buf, stream);
-    launch_nf4_gemv(layer.v_proj, norm_out, state_.v_buf, stream);
+    // 2. QKV projections (fp16 GEMV — attention weights not quantized)
+    launch_fp16_gemv(layer.q_proj_fp16, norm_out, state_.q_buf, Q_DIM, HIDDEN_SIZE, stream);
+    launch_fp16_gemv(layer.k_proj_fp16, norm_out, state_.k_buf, KV_DIM, HIDDEN_SIZE, stream);
+    launch_fp16_gemv(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE, stream);
+
+    // 2b. QKNorm (Qwen3: RMSNorm applied per-head to Q and K after projection)
+    // Q: apply norm to each of NUM_HEADS heads (each HEAD_DIM)
+    for (int h = 0; h < NUM_HEADS; h++) {
+        launch_rms_norm(state_.q_buf + h * HEAD_DIM, layer.q_norm,
+                        state_.q_buf + h * HEAD_DIM, HEAD_DIM, RMS_NORM_EPS, stream);
+    }
+    // K: apply norm to each of NUM_KV_HEADS heads
+    for (int h = 0; h < NUM_KV_HEADS; h++) {
+        launch_rms_norm(state_.k_buf + h * HEAD_DIM, layer.k_norm,
+                        state_.k_buf + h * HEAD_DIM, HEAD_DIM, RMS_NORM_EPS, stream);
+    }
 
     // 3. RoPE
     launch_rope(state_.q_buf, state_.k_buf,
@@ -164,8 +176,8 @@ void InferenceEngine::forward_layer(int layer_idx) {
     launch_gqa_attention(state_.q_buf, kv.key, kv.value, state_.attn_out,
                           state_.attn_scores, state_.current_pos, state_.max_seq_len, stream);
 
-    // 6. Output projection
-    launch_nf4_gemv(layer.o_proj, state_.attn_out, state_.hidden, stream);
+    // 6. Output projection (fp16)
+    launch_fp16_gemv(layer.o_proj_fp16, state_.attn_out, state_.hidden, HIDDEN_SIZE, Q_DIM, stream);
 
     // 7. Residual add (hidden += residual)
     launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
@@ -176,16 +188,16 @@ void InferenceEngine::forward_layer(int layer_idx) {
     launch_rms_norm(state_.residual, layer.post_attn_layernorm, norm_out,
                     HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
-    // 9. FFN: gate_proj and up_proj
-    launch_nf4_gemv(layer.gate_proj, norm_out, state_.gate_buf, stream);
-    launch_nf4_gemv(layer.up_proj, norm_out, state_.up_buf, stream);
+    // 9. FFN: gate_proj and up_proj (fp16, dequantized from NF4 at load time)
+    launch_fp16_gemv(layer.gate_proj_fp16, norm_out, state_.gate_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, stream);
+    launch_fp16_gemv(layer.up_proj_fp16, norm_out, state_.up_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, stream);
 
     // 10. SiLU gate * up
     launch_silu_gate_mul(state_.gate_buf, state_.up_buf, state_.gate_buf,
                           INTERMEDIATE_SIZE, stream);
 
     // 11. Down projection
-    launch_nf4_gemv(layer.down_proj, state_.gate_buf, state_.hidden, stream);
+    launch_fp16_gemv(layer.down_proj_fp16, state_.gate_buf, state_.hidden, HIDDEN_SIZE, INTERMEDIATE_SIZE, stream);
 
     // 12. Residual add
     launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);

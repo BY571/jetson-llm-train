@@ -6,3 +6,6 @@ __pycache__/
 .env
 *.log
 CLAUDE.md
+engine/weights.bin
+engine/reference_logits.npz
+engine/build/

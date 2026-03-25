@@ -53,20 +53,24 @@ struct LoRAAdapter {
 
 // One transformer layer's weights
 struct TransformerLayerWeights {
-    // Attention
-    NF4Weight q_proj;       // (HIDDEN, Q_DIM)
-    NF4Weight k_proj;       // (HIDDEN, KV_DIM)
-    NF4Weight v_proj;       // (HIDDEN, KV_DIM)
-    NF4Weight o_proj;       // (Q_DIM, HIDDEN)
+    // Attention (fp16 in unsloth quantized model — attention is NOT quantized)
+    half* q_proj_fp16;      // (Q_DIM, HIDDEN) = (2048, 1024)
+    half* k_proj_fp16;      // (KV_DIM, HIDDEN) = (1024, 1024)
+    half* v_proj_fp16;      // (KV_DIM, HIDDEN) = (1024, 1024)
+    half* o_proj_fp16;      // (HIDDEN, Q_DIM) = (1024, 2048)
 
-    // FFN
-    NF4Weight gate_proj;    // (HIDDEN, INTERMEDIATE)
-    NF4Weight up_proj;      // (HIDDEN, INTERMEDIATE)
-    NF4Weight down_proj;    // (INTERMEDIATE, HIDDEN)
+    // MLP (fp16, dequantized from NF4 at load time by convert_weights.py)
+    half* gate_proj_fp16;   // (INTERMEDIATE, HIDDEN) = (3072, 1024)
+    half* up_proj_fp16;     // (INTERMEDIATE, HIDDEN) = (3072, 1024)
+    half* down_proj_fp16;   // (HIDDEN, INTERMEDIATE) = (1024, 3072)
 
     // Norms (fp16, small)
     half* input_layernorm;  // (HIDDEN,)
     half* post_attn_layernorm; // (HIDDEN,)
+
+    // QKNorm (Qwen3 specific — RMSNorm applied to Q and K after projection)
+    half* q_norm;           // (HEAD_DIM,) = (128,)
+    half* k_norm;           // (HEAD_DIM,) = (128,)
 
     // Optional LoRA adapters (nullptr if not used)
     LoRAAdapter* lora_q;

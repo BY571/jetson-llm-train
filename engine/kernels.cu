@@ -425,7 +425,50 @@ __global__ void residual_add_kernel(
 }
 
 // ============================================================================
-// Kernel 8: GEMV for lm_head (fp16 weight @ fp16 input -> fp32 logits)
+// Kernel 8a: FP16 GEMV (weight @ input -> output, all fp16)
+// ============================================================================
+// Used for attention projections and dequantized MLP weights.
+// One block per output element, threads cooperate on the dot product.
+
+__global__ void fp16_gemv_kernel(
+    const half* __restrict__ weight,    // (out_dim, in_dim) row-major
+    const half* __restrict__ input,     // (in_dim,)
+    half* __restrict__ output,          // (out_dim,)
+    int in_dim,
+    int out_dim
+) {
+    int out_idx = blockIdx.x;
+    if (out_idx >= out_dim) return;
+
+    float sum = 0.0f;
+    const half* row = weight + (size_t)out_idx * in_dim;
+
+    for (int j = threadIdx.x; j < in_dim; j += blockDim.x) {
+        sum += __half2float(row[j]) * __half2float(input[j]);
+    }
+
+    // Warp reduction
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+    __shared__ float shared[32];
+    int warp_id = threadIdx.x / warpSize;
+    int lane_id = threadIdx.x % warpSize;
+    if (lane_id == 0) shared[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        sum = (lane_id < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane_id] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset /= 2)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        if (lane_id == 0) {
+            output[out_idx] = __float2half(sum);
+        }
+    }
+}
+
+// ============================================================================
+// Kernel 8b: GEMV for lm_head (fp16 weight @ fp16 input -> fp32 logits)
 // ============================================================================
 // lm_head is tied to embedding, so weights are fp16 (not NF4)
 
@@ -571,6 +614,19 @@ void launch_residual_add(
     int threads = 256;
     int blocks = (dim + threads - 1) / threads;
     residual_add_kernel<<<blocks, threads, 0, stream>>>(output, residual, dim);
+}
+
+void launch_fp16_gemv(
+    const half* weight,
+    const half* input,
+    half* output,
+    int out_dim,
+    int in_dim,
+    cudaStream_t stream
+) {
+    fp16_gemv_kernel<<<out_dim, 128, 0, stream>>>(
+        weight, input, output, in_dim, out_dim
+    );
 }
 
 void launch_lm_head(
