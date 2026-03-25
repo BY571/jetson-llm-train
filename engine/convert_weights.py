@@ -1,22 +1,19 @@
 """Convert HuggingFace model weights to flat binary for the C++ engine.
 
-Saves two files:
-  weights.bin - raw tensor data (fp16 for non-quantized, uint8 for NF4)
-  weights.idx - text index: "name offset nbytes dtype shape"
-
-NF4 quantized layers (MLP) are saved as raw uint8 with their absmax scales.
-Non-quantized layers (attention, norms, embedding) are saved as fp16.
+For NF4 quantized models: dequantizes MLP weights to fp16 in Python
+(using bitsandbytes reference code for correctness).
+Non-quantized weights (attention, norms, embedding) saved as fp16.
 
 Usage:
     python3 engine/convert_weights.py --model unsloth/Qwen3-0.6B-unsloth-bnb-4bit --output engine/weights
     python3 engine/convert_weights.py --model Qwen/Qwen3-0.6B --output engine/weights
 """
 import argparse
+import json
 import os
 
 import torch
-import safetensors.torch as st
-from huggingface_hub import snapshot_download
+import numpy as np
 
 
 def main():
@@ -25,47 +22,61 @@ def main():
     parser.add_argument("--output", default="engine/weights")
     args = parser.parse_args()
 
-    print(f"Downloading/loading {args.model}...")
-    model_dir = snapshot_download(args.model)
+    print(f"Loading {args.model}...")
 
-    # Find safetensors files
-    st_files = [f for f in os.listdir(model_dir) if f.endswith(".safetensors")]
-    print(f"  Found {len(st_files)} safetensors files")
+    if "bnb-4bit" in args.model or "nf4" in args.model:
+        # Load quantized model, dequantize everything to fp16
+        from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+        import bitsandbytes as bnb
 
-    # Load all tensors
-    all_tensors = {}
-    for fname in st_files:
-        path = os.path.join(model_dir, fname)
-        tensors = st.load_file(path)
-        for name, tensor in tensors.items():
-            # Strip "model." prefix
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, quantization_config=bnb_config,
+            device_map="cuda", torch_dtype=torch.float16,
+        )
+
+        weights = {}
+        for name, param in model.named_parameters():
             clean = name[6:] if name.startswith("model.") else name
-            all_tensors[clean] = tensor
+            if hasattr(param, "quant_state"):
+                # Dequantize NF4 to fp16 using bitsandbytes (known correct)
+                data = bnb.functional.dequantize_4bit(
+                    param.data, param.quant_state
+                ).to(torch.float16).contiguous().cpu()
+            else:
+                data = param.data.to(torch.float16).contiguous().cpu()
+            weights[clean] = data
+            print(f"  {clean}: {list(data.shape)} fp16")
+    else:
+        # Load fp16 model directly
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, torch_dtype=torch.float16, device_map="cpu"
+        )
+        weights = {}
+        for name, param in model.named_parameters():
+            clean = name[6:] if name.startswith("model.") else name
+            data = param.data.to(torch.float16).contiguous().cpu()
+            weights[clean] = data
+            print(f"  {clean}: {list(data.shape)} fp16")
 
-    print(f"  Total tensors: {len(all_tensors)}")
-
-    # Write binary + index
+    # Save as flat binary + text index
     bin_path = args.output + ".bin"
     idx_path = args.output + ".idx"
     offset = 0
     lines = []
 
     with open(bin_path, "wb") as f:
-        for name in sorted(all_tensors.keys()):
-            t = all_tensors[name]
-            # bf16 doesn't have numpy support, convert to fp16 first
-            t_cpu = t.contiguous().cpu()
-            if t_cpu.dtype == torch.bfloat16:
-                t_cpu = t_cpu.to(torch.float16)
-            data = t_cpu.numpy().tobytes()
-            nbytes = len(data)
-            dtype = str(t.dtype).replace("torch.", "")
-            if dtype == "bfloat16":
-                dtype = "float16"  # we converted to fp16 above
-            shape = ",".join(str(s) for s in t.shape)
-
-            lines.append(f"{name} {offset} {nbytes} {dtype} {shape}")
-            f.write(data)
+        for name in sorted(weights.keys()):
+            data = weights[name]
+            raw = data.numpy().tobytes()
+            nbytes = len(raw)
+            shape = ",".join(str(s) for s in data.shape)
+            lines.append(f"{name} {offset} {nbytes} float16 {shape}")
+            f.write(raw)
             offset += nbytes
 
     with open(idx_path, "w") as f:
@@ -73,16 +84,9 @@ def main():
             f.write(line + "\n")
 
     total_mb = os.path.getsize(bin_path) / 1e6
-    print(f"\nSaved {len(lines)} tensors:")
-    print(f"  {bin_path} ({total_mb:.1f}MB)")
-    print(f"  {idx_path}")
-
-    # Print summary by category
-    nf4_count = sum(1 for n in all_tensors if n.endswith(".weight") and all_tensors[n].dtype == torch.uint8 and all_tensors[n].numel() > 10000)
-    fp16_count = sum(1 for n in all_tensors if all_tensors[n].dtype in (torch.float16, torch.bfloat16))
-    print(f"\n  NF4 packed weights: {nf4_count}")
-    print(f"  FP16/BF16 weights: {fp16_count}")
-    print(f"  Other (absmax, quant_map, etc.): {len(all_tensors) - nf4_count - fp16_count}")
+    total_params = sum(w.numel() for w in weights.values())
+    print(f"\nSaved {len(lines)} tensors ({total_mb:.1f}MB)")
+    print(f"Total params: {total_params:,}")
 
 
 if __name__ == "__main__":
