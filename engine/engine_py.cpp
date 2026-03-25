@@ -53,6 +53,21 @@ PYBIND11_MODULE(jetson_engine, m) {
              py::arg("temperature") = 1.0f, py::arg("top_p") = 0.9f,
              "GPU sampling with temperature + top-p (4 bytes copy)")
 
+        .def("update_lora", [](InferenceEngine& self,
+                                int layer_idx, const std::string& proj_name,
+                                py::buffer A_buf, py::buffer B_buf, float scale) {
+                 auto A_info = A_buf.request();
+                 auto B_info = B_buf.request();
+                 self.update_lora_weight(
+                     layer_idx, proj_name.c_str(),
+                     static_cast<const half*>(A_info.ptr), A_info.shape[0], A_info.shape[1],
+                     static_cast<const half*>(B_info.ptr), B_info.shape[0], B_info.shape[1],
+                     scale);
+             },
+             py::arg("layer_idx"), py::arg("proj_name"),
+             py::arg("A"), py::arg("B"), py::arg("scale") = 1.0f,
+             "Update a single LoRA adapter (pass numpy fp16 arrays)")
+
         .def("decode_token", &InferenceEngine::decode,
              py::arg("token_id"),
              "Process one token through the model")

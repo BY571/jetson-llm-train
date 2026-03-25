@@ -24,6 +24,43 @@ static void ensure_cublas() {
     }
 }
 
+// cuBLAS fp16 GEMV with optional LoRA: y = W @ x + scale * B @ (A @ x)
+static void cublas_hgemv_lora(const half* weight, const half* input, half* output,
+                                int out_dim, int in_dim,
+                                const LoRAAdapter* lora, half* lora_scratch) {
+    ensure_cublas();
+    __half alpha_h = __float2half(1.0f);
+    __half beta_zero = __float2half(0.0f);
+
+    // Base: y = W @ x
+    cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                 out_dim, 1, in_dim, &alpha_h,
+                 weight, CUDA_R_16F, in_dim,
+                 input, CUDA_R_16F, in_dim,
+                 &beta_zero, output, CUDA_R_16F, out_dim,
+                 CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    if (lora && lora->A && lora->B) {
+        // Step 1: scratch = A @ x  (rank, in_dim) @ (in_dim, 1) = (rank, 1)
+        cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                     lora->rank, 1, lora->in_features, &alpha_h,
+                     lora->A, CUDA_R_16F, lora->in_features,
+                     input, CUDA_R_16F, lora->in_features,
+                     &beta_zero, lora_scratch, CUDA_R_16F, lora->rank,
+                     CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+        // Step 2: y += scale * B @ scratch  (out_dim, rank) @ (rank, 1)
+        __half scale_h = __float2half(lora->scale);
+        __half one_h = __float2half(1.0f);
+        cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                     lora->out_features, 1, lora->rank, &scale_h,
+                     lora->B, CUDA_R_16F, lora->rank,
+                     lora_scratch, CUDA_R_16F, lora->rank,
+                     &one_h, output, CUDA_R_16F, lora->out_features,
+                     CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    }
+}
+
 // cuBLAS fp16 GEMV: y = weight * x
 // Use cublasGemmEx: treat x as (in_dim, 1) matrix, W as (out_dim, in_dim) row-major
 // y(out_dim,1) = W(out_dim,in_dim) @ x(in_dim,1)
@@ -107,6 +144,9 @@ InferenceEngine::InferenceEngine(int max_seq_len) {
 
     // GPU-side sampling
     cudaMallocTyped(&state_.sample_result, sizeof(int));
+
+    // LoRA scratch
+    cudaMallocTyped(&state_.lora_scratch, 64 * sizeof(half)); // max rank 64
 
     // Zero-init weights
     memset(&weights_, 0, sizeof(weights_));
@@ -195,10 +235,10 @@ void InferenceEngine::forward_layer(int layer_idx) {
     launch_rms_norm(state_.residual, layer.input_layernorm, norm_out,
                     HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
-    // 2. QKV projections (fp16 GEMV — attention weights not quantized)
-    cublas_hgemv(layer.q_proj_fp16, norm_out, state_.q_buf, Q_DIM, HIDDEN_SIZE);
-    cublas_hgemv(layer.k_proj_fp16, norm_out, state_.k_buf, KV_DIM, HIDDEN_SIZE);
-    cublas_hgemv(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE);
+    // 2. QKV projections (with LoRA if available)
+    cublas_hgemv_lora(layer.q_proj_fp16, norm_out, state_.q_buf, Q_DIM, HIDDEN_SIZE, layer.lora_q, state_.lora_scratch);
+    cublas_hgemv_lora(layer.k_proj_fp16, norm_out, state_.k_buf, KV_DIM, HIDDEN_SIZE, layer.lora_k, state_.lora_scratch);
+    cublas_hgemv_lora(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE, layer.lora_v, state_.lora_scratch);
 
     // 2b. Fused QKNorm (one kernel for all 24 heads instead of 24 separate launches)
     launch_qk_norm(state_.q_buf, state_.k_buf, layer.q_norm, layer.k_norm,
@@ -219,8 +259,8 @@ void InferenceEngine::forward_layer(int layer_idx) {
     launch_gqa_attention(state_.q_buf, kv.key, kv.value, state_.attn_out,
                           state_.attn_scores, state_.current_pos, state_.max_seq_len, stream);
 
-    // 6. Output projection (fp16)
-    cublas_hgemv(layer.o_proj_fp16, state_.attn_out, state_.hidden, HIDDEN_SIZE, Q_DIM);
+    // 6. Output projection (with LoRA)
+    cublas_hgemv_lora(layer.o_proj_fp16, state_.attn_out, state_.hidden, HIDDEN_SIZE, Q_DIM, layer.lora_o, state_.lora_scratch);
 
     // 7. Residual add (hidden += residual)
     launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
@@ -246,10 +286,10 @@ void InferenceEngine::forward_layer(int layer_idx) {
         // If gate and up are contiguous, we can do one GEMM of (2*INTERMEDIATE, HIDDEN) @ (HIDDEN, 1)
         // Output goes to gate_buf which must be 2*INTERMEDIATE large
         // For now, still 2 calls (safe). TODO: concat weights at load time.
-        cublas_hgemv(layer.gate_proj_fp16, norm_out, state_.gate_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
-        cublas_hgemv(layer.up_proj_fp16, norm_out, state_.up_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+        cublas_hgemv_lora(layer.gate_proj_fp16, norm_out, state_.gate_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, layer.lora_gate, state_.lora_scratch);
+        cublas_hgemv_lora(layer.up_proj_fp16, norm_out, state_.up_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, layer.lora_up, state_.lora_scratch);
         launch_silu_gate_mul(state_.gate_buf, state_.up_buf, state_.gate_buf, INTERMEDIATE_SIZE, stream);
-        cublas_hgemv(layer.down_proj_fp16, state_.gate_buf, state_.hidden, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+        cublas_hgemv_lora(layer.down_proj_fp16, state_.gate_buf, state_.hidden, HIDDEN_SIZE, INTERMEDIATE_SIZE, layer.lora_down, state_.lora_scratch);
     }
 
     // 12. Residual add
@@ -302,6 +342,47 @@ void InferenceEngine::decode(int token_id) {
 // ============================================================================
 // GPU-side greedy sampling (no CPU copy)
 // ============================================================================
+
+// ============================================================================
+// LoRA weight sync from PyTorch
+// ============================================================================
+
+void InferenceEngine::update_lora_weight(
+    int layer_idx, const char* proj_name,
+    const half* A_data, int A_rows, int A_cols,
+    const half* B_data, int B_rows, int B_cols,
+    float scale
+) {
+    if (layer_idx < 0 || layer_idx >= NUM_LAYERS) return;
+    auto& layer = weights_.layers[layer_idx];
+
+    // Find target adapter
+    LoRAAdapter** target = nullptr;
+    std::string proj(proj_name);
+    if (proj == "q_proj") target = &layer.lora_q;
+    else if (proj == "k_proj") target = &layer.lora_k;
+    else if (proj == "v_proj") target = &layer.lora_v;
+    else if (proj == "o_proj") target = &layer.lora_o;
+    else if (proj == "gate_proj") target = &layer.lora_gate;
+    else if (proj == "up_proj") target = &layer.lora_up;
+    else if (proj == "down_proj") target = &layer.lora_down;
+    if (!target) return;
+
+    // Create or update adapter
+    if (!*target) {
+        *target = new LoRAAdapter();
+        cudaMallocTyped(&(*target)->A, A_rows * A_cols * sizeof(half));
+        cudaMallocTyped(&(*target)->B, B_rows * B_cols * sizeof(half));
+    }
+
+    // Copy weights to GPU
+    cudaMemcpy((*target)->A, A_data, A_rows * A_cols * sizeof(half), cudaMemcpyHostToDevice);
+    cudaMemcpy((*target)->B, B_data, B_rows * B_cols * sizeof(half), cudaMemcpyHostToDevice);
+    (*target)->rank = A_rows;
+    (*target)->in_features = A_cols;
+    (*target)->out_features = B_rows;
+    (*target)->scale = scale;
+}
 
 int InferenceEngine::sample_greedy_gpu() {
     launch_argmax(state_.logits, state_.sample_result, VOCAB_SIZE, 0);

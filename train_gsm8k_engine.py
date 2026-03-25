@@ -31,6 +31,7 @@ sys.path.insert(0, "engine/build")
 import jetson_engine
 
 from jetson_compat import patch_amp_for_jetson, cast_model_to_fp16
+from lora_sync import sync_lora_to_engine
 
 patch_amp_for_jetson()
 
@@ -251,6 +252,9 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+
+        # Sync LoRA weights to engine (keeps generation on-policy)
+        sync_lora_to_engine(model, engine, lora_alpha=args.lora_rank, lora_rank=args.lora_rank)
 
         torch.cuda.synchronize()
         t_train = time.perf_counter() - t_train

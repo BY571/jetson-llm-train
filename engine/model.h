@@ -135,6 +135,9 @@ struct InferenceState {
 
     // GPU-side sampling result
     int* sample_result; // single int on GPU
+
+    // LoRA scratch buffer (for A @ x intermediate, max rank = 64)
+    half* lora_scratch; // (max_lora_rank,)
 };
 
 // Top-level engine
@@ -146,8 +149,14 @@ public:
     // Load weights from safetensors directory (HF format)
     void load_weights(const std::string& model_dir);
 
-    // Load LoRA adapter from safetensors directory
+    // Load LoRA adapter from file
     void load_lora(const std::string& lora_dir, float scale = 1.0f);
+
+    // Update a single LoRA adapter from raw fp16 data (for live sync from PyTorch)
+    void update_lora_weight(int layer_idx, const char* proj_name,
+                            const half* A_data, int A_rows, int A_cols,
+                            const half* B_data, int B_rows, int B_cols,
+                            float scale);
 
     // Reset KV cache for new generation
     void reset();
