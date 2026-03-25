@@ -168,6 +168,9 @@ public:
     // Fast greedy sampling on GPU (only copies 4 bytes instead of 600KB)
     int sample_greedy_gpu();
 
+    // Fast GPU sampling with temperature + top-p (only copies 4 bytes)
+    int sample_gpu(float temperature = 1.0f, float top_p = 0.9f);
+
     // Full generation: prefill + decode loop
     std::vector<int> generate(const std::vector<int>& prompt,
                                int max_new_tokens = 512,

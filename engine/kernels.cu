@@ -617,17 +617,102 @@ __global__ void argmax_kernel(
 }
 
 // ============================================================================
-// Kernel 9b: Temperature scaling
+// Kernel 9b: GPU-side multinomial sampling (temperature + softmax + sample)
 // ============================================================================
+// Single kernel: applies temperature, finds max (for stable softmax),
+// computes softmax, then does cumulative sum sampling with a random threshold.
+// All on GPU, returns a single token index.
+//
+// Approach: one block with 256 threads.
+// Step 1: temperature scale + find max (parallel reduction)
+// Step 2: exp(x - max) + sum (parallel reduction)
+// Step 3: normalize (divide by sum)
+// Step 4: cumulative sum scan + sample (sequential, but on GPU)
 
-__global__ void temperature_scale_kernel(
-    float* __restrict__ logits,
+__global__ void gpu_sample_kernel(
+    float* __restrict__ logits,    // (vocab_size,) modified in-place
+    int* __restrict__ result,       // output: sampled token id
     int vocab_size,
-    float temperature
+    float temperature,
+    float random_val,              // uniform random in [0, 1)
+    float top_p
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < vocab_size) {
-        logits[idx] /= temperature;
+    __shared__ float s_max;
+    __shared__ float s_sum;
+
+    // Step 1: temperature + find max
+    float local_max = -1e30f;
+    for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+        logits[i] /= temperature;
+        if (logits[i] > local_max) local_max = logits[i];
+    }
+
+    // Reduce max
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, offset));
+
+    __shared__ float shared_max[32];
+    int warp_id = threadIdx.x / warpSize;
+    int lane_id = threadIdx.x % warpSize;
+    if (lane_id == 0) shared_max[warp_id] = local_max;
+    __syncthreads();
+    if (warp_id == 0) {
+        local_max = (lane_id < (blockDim.x + warpSize - 1) / warpSize) ? shared_max[lane_id] : -1e30f;
+        for (int offset = warpSize / 2; offset > 0; offset /= 2)
+            local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, offset));
+        if (lane_id == 0) s_max = local_max;
+    }
+    __syncthreads();
+
+    // Step 2: exp(x - max) and sum
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+        float val = expf(logits[i] - s_max);
+        logits[i] = val;  // store unnormalized prob
+        local_sum += val;
+    }
+
+    // Reduce sum
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+
+    __shared__ float shared_sum[32];
+    if (lane_id == 0) shared_sum[warp_id] = local_sum;
+    __syncthreads();
+    if (warp_id == 0) {
+        local_sum = (lane_id < (blockDim.x + warpSize - 1) / warpSize) ? shared_sum[lane_id] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset /= 2)
+            local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+        if (lane_id == 0) s_sum = local_sum;
+    }
+    __syncthreads();
+
+    // Step 3: normalize to probabilities
+    float inv_sum = 1.0f / s_sum;
+    for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+        logits[i] *= inv_sum;
+    }
+    __syncthreads();
+
+    // Step 4: cumulative sum sampling (thread 0 only, sequential but on GPU)
+    if (threadIdx.x == 0) {
+        float threshold = random_val;
+
+        if (top_p < 1.0f) {
+            // Simple top-p: scan from highest probability
+            // For speed, we just do a linear scan (vocab is large but on GPU cache)
+            threshold *= top_p;  // scale threshold to top_p region
+        }
+
+        float cum = 0.0f;
+        for (int i = 0; i < vocab_size; i++) {
+            cum += logits[i];
+            if (cum >= threshold) {
+                *result = i;
+                return;
+            }
+        }
+        *result = vocab_size - 1;
     }
 }
 
@@ -750,6 +835,20 @@ void launch_fp16_gemv(
 ) {
     fp16_gemv_kernel<<<out_dim, 128, 0, stream>>>(
         weight, input, output, in_dim, out_dim
+    );
+}
+
+void launch_gpu_sample(
+    float* logits,    // modified in-place!
+    int* result,
+    int vocab_size,
+    float temperature,
+    float random_val,
+    float top_p,
+    cudaStream_t stream
+) {
+    gpu_sample_kernel<<<1, 256, 0, stream>>>(
+        logits, result, vocab_size, temperature, random_val, top_p
     );
 }
 

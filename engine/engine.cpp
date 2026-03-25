@@ -68,6 +68,7 @@ extern "C" {
     void launch_residual_add(half* output, const half* residual, int dim, cudaStream_t stream);
     void launch_lm_head(const half* weight, const half* input, float* logits, int hidden_dim, int vocab_size, cudaStream_t stream);
     void launch_argmax(const float* logits, int* result, int vocab_size, cudaStream_t stream);
+    void launch_gpu_sample(float* logits, int* result, int vocab_size, float temperature, float random_val, float top_p, cudaStream_t stream);
 }
 
 using namespace qwen3;
@@ -309,6 +310,24 @@ int InferenceEngine::sample_greedy_gpu() {
     return result;
 }
 
+int InferenceEngine::sample_gpu(float temperature, float top_p) {
+    if (temperature < 0.01f) {
+        return sample_greedy_gpu();
+    }
+    // Generate random number on CPU (fast enough, 1 random per token)
+    static std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    float r = dist(rng);
+
+    // GPU kernel: temperature + softmax + cumulative sample
+    // NOTE: this modifies logits in-place (they become probabilities)
+    launch_gpu_sample(state_.logits, state_.sample_result, VOCAB_SIZE,
+                      temperature, r, top_p, 0);
+    int result;
+    cudaMemcpy(&result, state_.sample_result, sizeof(int), cudaMemcpyDeviceToHost);
+    return result;
+}
+
 // ============================================================================
 // Prefill: process multiple tokens
 // ============================================================================
@@ -414,14 +433,11 @@ std::vector<int> InferenceEngine::generate(
     // Prefill
     prefill(prompt.data(), prompt.size());
 
-    // Choose sampling strategy
-    bool use_gpu_sample = (temperature < 0.1f);
-
-    // Sample first token from prefill logits
-    int token = use_gpu_sample ? sample_greedy_gpu() : sample(temperature, top_p);
+    // Sample first token from prefill logits (always GPU)
+    int token = sample_gpu(temperature, top_p);
     std::vector<int> output = {token};
 
-    // Decode loop (pure C++, no Python)
+    // Decode loop (pure C++, no Python, all GPU sampling)
     for (int i = 0; i < max_new_tokens - 1; i++) {
         if (token == eos_token_id) break;
 
@@ -440,7 +456,7 @@ std::vector<int> InferenceEngine::generate(
         if (should_stop) break;
 
         decode(token);
-        token = use_gpu_sample ? sample_greedy_gpu() : sample(temperature, top_p);
+        token = sample_gpu(temperature, top_p);
         output.push_back(token);
     }
 

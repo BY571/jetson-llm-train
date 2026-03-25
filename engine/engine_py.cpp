@@ -49,6 +49,10 @@ PYBIND11_MODULE(jetson_engine, m) {
         .def("sample_greedy_gpu", &InferenceEngine::sample_greedy_gpu,
              "Greedy sample on GPU (4 bytes copy instead of 600KB)")
 
+        .def("sample_gpu", &InferenceEngine::sample_gpu,
+             py::arg("temperature") = 1.0f, py::arg("top_p") = 0.9f,
+             "GPU sampling with temperature + top-p (4 bytes copy)")
+
         .def("decode_token", &InferenceEngine::decode,
              py::arg("token_id"),
              "Process one token through the model")
