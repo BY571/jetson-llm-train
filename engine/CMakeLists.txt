@@ -35,7 +35,7 @@ set_target_properties(kernels PROPERTIES
 
 # Build the Python module
 pybind11_add_module(jetson_engine engine_py.cpp engine.cpp weights.cpp)
-target_link_libraries(jetson_engine PRIVATE kernels CUDA::cudart)
+target_link_libraries(jetson_engine PRIVATE kernels CUDA::cudart CUDA::cublas)
 target_include_directories(jetson_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
 
 # Install to workspace for easy import

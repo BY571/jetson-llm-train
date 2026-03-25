@@ -7,11 +7,47 @@
 
 #include "model.h"
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <random>
 #include <iostream>
+
+// cuBLAS handle (created once, reused)
+static cublasHandle_t cublas_handle = nullptr;
+
+static void ensure_cublas() {
+    if (!cublas_handle) {
+        cublasCreate(&cublas_handle);
+        cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH);
+    }
+}
+
+// cuBLAS fp16 GEMV: y = weight * x
+// Use cublasGemmEx: treat x as (in_dim, 1) matrix, W as (out_dim, in_dim) row-major
+// y(out_dim,1) = W(out_dim,in_dim) @ x(in_dim,1)
+// In cublas col-major: y = W^T(in_dim,out_dim) transposed @ x
+static void cublas_hgemv(const half* weight, const half* input, half* output,
+                          int out_dim, int in_dim) {
+    ensure_cublas();
+    __half alpha = __float2half(1.0f);
+    __half beta = __float2half(0.0f);
+    // W is (out_dim, in_dim) row-major = (in_dim, out_dim) col-major
+    // y = op(W) @ x where op(W) = W^T in col-major = W in row-major
+    // cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, out_dim, 1, in_dim,
+    //              alpha, W, in_dim, x, in_dim, beta, y, out_dim)
+    cublasGemmEx(cublas_handle,
+                 CUBLAS_OP_T, CUBLAS_OP_N,
+                 out_dim, 1, in_dim,  // M, N, K
+                 &alpha,
+                 weight, CUDA_R_16F, in_dim,   // A (in_dim x out_dim col-major), lda=in_dim
+                 input, CUDA_R_16F, in_dim,    // B (in_dim x 1), ldb=in_dim
+                 &beta,
+                 output, CUDA_R_16F, out_dim,  // C (out_dim x 1), ldc=out_dim
+                 CUDA_R_16F,                   // compute type
+                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
 
 // Helper to avoid void** casts everywhere
 template<typename T>
@@ -153,9 +189,9 @@ void InferenceEngine::forward_layer(int layer_idx) {
                     HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
     // 2. QKV projections (fp16 GEMV — attention weights not quantized)
-    launch_fp16_gemv(layer.q_proj_fp16, norm_out, state_.q_buf, Q_DIM, HIDDEN_SIZE, stream);
-    launch_fp16_gemv(layer.k_proj_fp16, norm_out, state_.k_buf, KV_DIM, HIDDEN_SIZE, stream);
-    launch_fp16_gemv(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE, stream);
+    cublas_hgemv(layer.q_proj_fp16, norm_out, state_.q_buf, Q_DIM, HIDDEN_SIZE);
+    cublas_hgemv(layer.k_proj_fp16, norm_out, state_.k_buf, KV_DIM, HIDDEN_SIZE);
+    cublas_hgemv(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE);
 
     // 2b. QKNorm (Qwen3: RMSNorm applied per-head to Q and K after projection)
     // Q: apply norm to each of NUM_HEADS heads (each HEAD_DIM)
@@ -185,7 +221,7 @@ void InferenceEngine::forward_layer(int layer_idx) {
                           state_.attn_scores, state_.current_pos, state_.max_seq_len, stream);
 
     // 6. Output projection (fp16)
-    launch_fp16_gemv(layer.o_proj_fp16, state_.attn_out, state_.hidden, HIDDEN_SIZE, Q_DIM, stream);
+    cublas_hgemv(layer.o_proj_fp16, state_.attn_out, state_.hidden, HIDDEN_SIZE, Q_DIM);
 
     // 7. Residual add (hidden += residual)
     launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
@@ -206,10 +242,10 @@ void InferenceEngine::forward_layer(int layer_idx) {
         launch_silu_gate_mul(state_.gate_buf, state_.up_buf, state_.gate_buf, INTERMEDIATE_SIZE, stream);
         launch_nf4_gemv(d.data, d.absmax, d.quant_map, state_.gate_buf, state_.hidden, d.out_dim, d.in_dim, d.block_size, stream);
     } else {
-        launch_fp16_gemv(layer.gate_proj_fp16, norm_out, state_.gate_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, stream);
-        launch_fp16_gemv(layer.up_proj_fp16, norm_out, state_.up_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, stream);
+        cublas_hgemv(layer.gate_proj_fp16, norm_out, state_.gate_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+        cublas_hgemv(layer.up_proj_fp16, norm_out, state_.up_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
         launch_silu_gate_mul(state_.gate_buf, state_.up_buf, state_.gate_buf, INTERMEDIATE_SIZE, stream);
-        launch_fp16_gemv(layer.down_proj_fp16, state_.gate_buf, state_.hidden, HIDDEN_SIZE, INTERMEDIATE_SIZE, stream);
+        cublas_hgemv(layer.down_proj_fp16, state_.gate_buf, state_.hidden, HIDDEN_SIZE, INTERMEDIATE_SIZE);
     }
 
     // 12. Residual add
