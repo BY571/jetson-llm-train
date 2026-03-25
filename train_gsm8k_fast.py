@@ -108,21 +108,19 @@ def grpo_step(model, tokenizer, generator, prompt_msgs, answer, optimizer,
     combined_rewards, fmt_rewards, cor_rewards = compute_rewards(completions, answer)
 
     # ── GRPO advantages (normalize within group) ──
+    # DAPO-style: use raw rewards without std normalization when std=0
+    # This avoids skipping steps when all completions get the same reward
     rewards_t = torch.tensor(combined_rewards, dtype=torch.float32)
     mean_r = rewards_t.mean()
     std_r = rewards_t.std()
-    if std_r < 1e-8:
-        # All same reward, no gradient signal
-        return {
-            "gen_time": t_gen, "train_time": 0.0, "total_time": t_gen,
-            "mean_reward": mean_r.item(), "mean_format": sum(fmt_rewards) / len(fmt_rewards),
-            "mean_correctness": sum(cor_rewards) / len(cor_rewards),
-            "loss": 0.0, "n_valid": 0, "gen_tok_s": 0,
-            "completions": completions,
-        }
-    advantages = (rewards_t - mean_r) / std_r
+    if std_r > 1e-8:
+        advantages = (rewards_t - mean_r) / std_r
+    else:
+        # All same reward: use raw centered rewards (will be ~0, minimal update)
+        # Don't skip: the model still learns from the log-prob gradient
+        advantages = rewards_t - mean_r
 
-    # ── Backward (PyTorch, already fast) ──
+    # ── Backward (PyTorch) ──
     # Free CUDA graph memory before backward to avoid OOM
     torch.cuda.empty_cache()
 
@@ -131,53 +129,60 @@ def grpo_step(model, tokenizer, generator, prompt_msgs, answer, optimizer,
     torch.cuda.synchronize()
     t_train = time.perf_counter()
 
-    # Pre-compute prompt length once
+    # Pre-compute prompt tokens once
     prompt_text = tokenizer.apply_chat_template(
         prompt_msgs, tokenize=False, add_generation_prompt=True,
     )
-    prompt_len = len(tokenizer(prompt_text).input_ids)
+    prompt_ids = tokenizer(prompt_text).input_ids
+    prompt_len = len(prompt_ids)
 
     total_loss = 0.0
     n_valid = 0
 
     for comp_text, adv in zip(completions, advantages):
-        if abs(adv.item()) < 1e-8:
-            continue
-
         # Tokenize prompt + completion
         full_msgs = prompt_msgs + [{"role": "assistant", "content": comp_text}]
         full_text = tokenizer.apply_chat_template(full_msgs, tokenize=False)
         tokens = tokenizer(full_text, return_tensors="pt", truncation=True,
                            max_length=max_seq_len).to(device)
 
-        # Forward + masked loss (one completion at a time to save memory)
-        outputs = model(**tokens, labels=tokens["input_ids"])
-        logits = outputs.logits[:, :-1, :]
-        labels = tokens["input_ids"][:, 1:]
-        loss_per_token = F.cross_entropy(
+        seq_len = tokens["input_ids"].shape[1]
+        if seq_len <= prompt_len + 1:
+            # Empty completion, skip
+            del tokens
+            continue
+
+        # Forward pass: get per-token log probabilities
+        outputs = model(**tokens)
+        logits = outputs.logits[:, :-1, :]  # (1, seq-1, vocab)
+        labels = tokens["input_ids"][:, 1:]  # (1, seq-1)
+
+        # Per-token negative log-prob (cross-entropy per token)
+        log_probs = -F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
             labels.reshape(-1),
             reduction="none",
-        ).reshape(labels.shape)
+        ).reshape(labels.shape)  # (1, seq-1), negative = log_prob
 
-        # Mask prompt tokens
+        # Mask: only completion tokens (after prompt)
         mask = torch.zeros_like(labels, dtype=torch.float32)
-        mask[:, prompt_len - 1:] = 1.0
-        masked_loss = (loss_per_token * mask).sum() / mask.sum().clamp(min=1)
+        if prompt_len - 1 < mask.shape[1]:
+            mask[:, prompt_len - 1:] = 1.0
 
-        # GRPO: weight loss by advantage, backward immediately, free graph
-        weighted_loss = -masked_loss * adv.item()
-        weighted_loss.backward()
-        total_loss += weighted_loss.item()
+        # REINFORCE-style policy gradient: -advantage * mean_log_prob
+        # (equivalent to GRPO without clipping, which is fine for on-policy)
+        mean_log_prob = (log_probs * mask).sum() / mask.sum().clamp(min=1)
+        loss = -adv.item() * mean_log_prob
+        loss.backward()
+        total_loss += loss.item()
         n_valid += 1
 
-        # Free intermediate tensors
-        del outputs, logits, labels, loss_per_token, mask, masked_loss, weighted_loss, tokens
+        del outputs, logits, labels, log_probs, mask, mean_log_prob, loss, tokens
 
     if n_valid > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-    optimizer.zero_grad(set_to_none=True)  # free grad memory
+    optimizer.zero_grad(set_to_none=True)
 
     torch.cuda.synchronize()
     t_train = time.perf_counter() - t_train
