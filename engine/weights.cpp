@@ -1,251 +1,323 @@
 /**
- * Load model weights from the flat binary format produced by convert_weights.py.
+ * Load model weights from .bin + .idx files produced by convert_weights.py.
  *
- * Format:
- *   8 bytes: header_size (uint64 LE)
- *   header_size bytes: JSON index
- *   padding to 4096 boundary
- *   tensor data: all fp16, contiguous
+ * Index format (one line per tensor):
+ *   name offset nbytes dtype shape
+ *   e.g.: "layers.0.mlp.gate_proj.weight 0 1572864 uint8 1572864,1"
+ *
+ * NF4 layers have multiple associated tensors:
+ *   .weight          (uint8, packed NF4 data)
+ *   .weight.absmax   (uint8, quantized scales)
+ *   .weight.nested_absmax (float32, second-level scales)
+ *   .weight.quant_map (float32, 16 entries NF4 lookup)
+ *   .weight.nested_quant_map (float32, 256 entries for absmax dequant)
  */
 
 #include "model.h"
 #include <fstream>
 #include <iostream>
-#include <cstring>
-#include <cstdint>
-#include <vector>
-#include <unordered_map>
 #include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <cstring>
+#include <cmath>
+
+// CPU-side float to fp16 conversion (no __float2half_rn on host)
+static uint16_t float_to_fp16(float val) {
+    uint32_t f;
+    memcpy(&f, &val, 4);
+    uint32_t sign = (f >> 16) & 0x8000;
+    int32_t exp = ((f >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = f & 0x7FFFFF;
+
+    if (exp <= 0) {
+        return sign; // flush to zero
+    } else if (exp >= 31) {
+        return sign | 0x7C00; // infinity
+    }
+    return sign | (exp << 10) | (mant >> 13);
+}
 
 using namespace qwen3;
 
-// Minimal JSON value parser (just strings, ints, arrays of ints)
 struct TensorInfo {
-    int64_t offset;
-    std::vector<int64_t> shape;
-    int64_t nbytes;
+    std::string name;
+    size_t offset;
+    size_t nbytes;
+    std::string dtype;
+    std::vector<int> shape;
 };
 
-// Simple JSON parser for our specific format
-static std::unordered_map<std::string, TensorInfo> parse_index(const char* json, size_t len) {
-    std::unordered_map<std::string, TensorInfo> result;
-    std::string s(json, len);
+static std::unordered_map<std::string, TensorInfo> load_index(const std::string& idx_path) {
+    std::unordered_map<std::string, TensorInfo> index;
+    std::ifstream f(idx_path);
+    if (!f.is_open()) {
+        throw std::runtime_error("Cannot open index: " + idx_path);
+    }
 
-    // Find each tensor entry: "name": {"offset": N, "shape": [...], "nbytes": N}
-    size_t pos = 0;
-    while (pos < s.size()) {
-        // Find tensor name
-        size_t q1 = s.find('"', pos);
-        if (q1 == std::string::npos) break;
-        size_t q2 = s.find('"', q1 + 1);
-        if (q2 == std::string::npos) break;
-        std::string name = s.substr(q1 + 1, q2 - q1 - 1);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        std::istringstream ss(line);
 
-        // Find offset value
-        size_t off_pos = s.find("\"offset\"", q2);
-        if (off_pos == std::string::npos) break;
-        size_t colon = s.find(':', off_pos + 8);
-        int64_t offset = 0;
-        sscanf(s.c_str() + colon + 1, " %ld", &offset);
+        TensorInfo info;
+        std::string shape_str;
+        ss >> info.name >> info.offset >> info.nbytes >> info.dtype >> shape_str;
 
-        // Find shape array
-        size_t shape_pos = s.find("\"shape\"", q2);
-        size_t bracket_open = s.find('[', shape_pos);
-        size_t bracket_close = s.find(']', bracket_open);
-        std::string shape_str = s.substr(bracket_open + 1, bracket_close - bracket_open - 1);
-        std::vector<int64_t> shape;
-        std::istringstream ss(shape_str);
-        std::string token;
-        while (std::getline(ss, token, ',')) {
-            shape.push_back(std::stol(token));
+        // Parse shape "1572864,1" -> {1572864, 1}
+        std::istringstream shape_ss(shape_str);
+        std::string dim;
+        while (std::getline(shape_ss, dim, ',')) {
+            info.shape.push_back(std::stoi(dim));
         }
 
-        // Find nbytes
-        size_t nb_pos = s.find("\"nbytes\"", q2);
-        size_t nb_colon = s.find(':', nb_pos + 8);
-        int64_t nbytes = 0;
-        sscanf(s.c_str() + nb_colon + 1, " %ld", &nbytes);
-
-        result[name] = {offset, shape, nbytes};
-        pos = bracket_close + 1;
+        index[info.name] = info;
     }
-    return result;
+    return index;
 }
 
-// Allocate GPU memory and copy a tensor from the binary data
-static half* load_fp16_tensor(const char* data_start, const TensorInfo& info) {
-    half* gpu_ptr;
-    cudaMalloc(reinterpret_cast<void**>(&gpu_ptr), info.nbytes);
-    cudaMemcpy(gpu_ptr, data_start + info.offset, info.nbytes, cudaMemcpyHostToDevice);
-    return gpu_ptr;
+// Allocate GPU memory and copy raw bytes
+static void* gpu_alloc_copy(const char* data, size_t nbytes) {
+    void* ptr;
+    cudaMalloc(&ptr, nbytes);
+    cudaMemcpy(ptr, data, nbytes, cudaMemcpyHostToDevice);
+    return ptr;
 }
 
-void InferenceEngine::load_weights(const std::string& path) {
-    std::cout << "Loading weights from: " << path << std::endl;
+void InferenceEngine::load_weights(const std::string& prefix) {
+    std::string idx_path = prefix + ".idx";
+    std::string bin_path = prefix + ".bin";
 
-    // Read entire file
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    std::cout << "Loading weights: " << prefix << std::endl;
+
+    // Load index
+    auto index = load_index(idx_path);
+    std::cout << "  Index: " << index.size() << " tensors" << std::endl;
+
+    // Memory-map the binary file
+    std::ifstream f(bin_path, std::ios::binary | std::ios::ate);
     if (!f.is_open()) {
-        throw std::runtime_error("Cannot open weights file: " + path);
+        throw std::runtime_error("Cannot open: " + bin_path);
     }
     size_t file_size = f.tellg();
     f.seekg(0);
-
-    // Read header size
-    uint64_t header_size;
-    f.read(reinterpret_cast<char*>(&header_size), 8);
-
-    // Read header
-    std::vector<char> header(header_size);
-    f.read(header.data(), header_size);
-
-    // Parse index
-    auto index = parse_index(header.data(), header_size);
-    std::cout << "  Found " << index.size() << " tensors" << std::endl;
-
-    // Calculate data start (after header + padding to 4096)
-    size_t padded_header = ((header_size + 8 + 4095) / 4096) * 4096;
-
-    // Read all tensor data into host memory
-    std::vector<char> data(file_size - padded_header);
-    f.seekg(padded_header);
-    f.read(data.data(), data.size());
+    std::vector<char> data(file_size);
+    f.read(data.data(), file_size);
     f.close();
+    std::cout << "  Binary: " << file_size / 1e6 << "MB" << std::endl;
 
-    const char* data_ptr = data.data();
+    const char* base = data.data();
 
-    // Helper to load a tensor by name
-    auto load = [&](const std::string& name) -> half* {
+    // Helper: load a tensor to GPU, return typed pointer
+    auto load_half = [&](const std::string& name) -> half* {
         auto it = index.find(name);
         if (it == index.end()) {
-            std::cerr << "  WARNING: tensor not found: " << name << std::endl;
+            std::cerr << "  WARN: missing " << name << std::endl;
             return nullptr;
         }
-        return load_fp16_tensor(data_ptr, it->second);
+        return (half*)gpu_alloc_copy(base + it->second.offset, it->second.nbytes);
     };
 
-    // Embedding
-    weights_.embed_tokens = load("embed_tokens.weight");
-    std::cout << "  embed_tokens loaded" << std::endl;
+    auto load_uint8 = [&](const std::string& name) -> uint8_t* {
+        auto it = index.find(name);
+        if (it == index.end()) return nullptr;
+        return (uint8_t*)gpu_alloc_copy(base + it->second.offset, it->second.nbytes);
+    };
+
+    auto load_float = [&](const std::string& name) -> float* {
+        auto it = index.find(name);
+        if (it == index.end()) return nullptr;
+        return (float*)gpu_alloc_copy(base + it->second.offset, it->second.nbytes);
+    };
+
+    auto has = [&](const std::string& name) -> bool {
+        return index.find(name) != index.end();
+    };
+
+    auto shape0 = [&](const std::string& name) -> int {
+        auto it = index.find(name);
+        if (it == index.end()) return 0;
+        return it->second.shape.empty() ? 0 : it->second.shape[0];
+    };
+
+    // Embedding (bf16 or fp16)
+    weights_.embed_tokens = load_half("embed_tokens.weight");
 
     // Final norm
-    weights_.final_layernorm = load("norm.weight");
+    weights_.final_layernorm = load_half("norm.weight");
 
-    // Layers
+    int loaded_layers = 0;
     for (int i = 0; i < NUM_LAYERS; i++) {
         auto& layer = weights_.layers[i];
-        std::string prefix = "layers." + std::to_string(i) + ".";
+        std::string p = "layers." + std::to_string(i) + ".";
 
-        // Attention weights (fp16 in this model)
-        layer.q_proj_fp16 = load(prefix + "self_attn.q_proj.weight");
-        layer.k_proj_fp16 = load(prefix + "self_attn.k_proj.weight");
-        layer.v_proj_fp16 = load(prefix + "self_attn.v_proj.weight");
-        layer.o_proj_fp16 = load(prefix + "self_attn.o_proj.weight");
+        // Attention weights — fp16/bf16 (NOT quantized in unsloth model)
+        layer.q_proj_fp16 = load_half(p + "self_attn.q_proj.weight");
+        layer.k_proj_fp16 = load_half(p + "self_attn.k_proj.weight");
+        layer.v_proj_fp16 = load_half(p + "self_attn.v_proj.weight");
+        layer.o_proj_fp16 = load_half(p + "self_attn.o_proj.weight");
 
-        // MLP weights (dequantized to fp16 by converter)
-        layer.gate_proj_fp16 = load(prefix + "mlp.gate_proj.weight");
-        layer.up_proj_fp16 = load(prefix + "mlp.up_proj.weight");
-        layer.down_proj_fp16 = load(prefix + "mlp.down_proj.weight");
+        // MLP weights — NF4 quantized
+        // For the engine, we need the NF4 data + dequantization info.
+        // For now, we dequantize on CPU at load time and store as fp16.
+        // TODO: store as NF4 and use nf4_gemv_kernel for memory savings.
+        std::string mlp_names[] = {"mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"};
+        half** mlp_ptrs[] = {&layer.gate_proj_fp16, &layer.up_proj_fp16, &layer.down_proj_fp16};
+        int mlp_out_dims[] = {INTERMEDIATE_SIZE, INTERMEDIATE_SIZE, HIDDEN_SIZE};
+        int mlp_in_dims[] = {HIDDEN_SIZE, HIDDEN_SIZE, INTERMEDIATE_SIZE};
+
+        for (int m = 0; m < 3; m++) {
+            std::string wname = p + mlp_names[m] + ".weight";
+            if (has(wname) && index[wname].dtype == "uint8") {
+                // NF4 quantized — dequantize on CPU
+                std::string absmax_name = wname + ".absmax";
+                std::string nested_absmax_name = wname + ".nested_absmax";
+                std::string nested_qmap_name = wname + ".nested_quant_map";
+                std::string qmap_name = wname + ".quant_map";
+
+                auto& wi = index[wname];
+                auto& ai = index[absmax_name];
+                auto& nai = index[nested_absmax_name];
+                auto& nqi = index[nested_qmap_name];
+                auto& qi = index[qmap_name];
+
+                const uint8_t* packed = (const uint8_t*)(base + wi.offset);
+                const uint8_t* absmax_u8 = (const uint8_t*)(base + ai.offset);
+                const float* nested_absmax = (const float*)(base + nai.offset);
+                const float* nested_qmap = (const float*)(base + nqi.offset);
+                const float* qmap = (const float*)(base + qi.offset);
+
+                int out_dim = mlp_out_dims[m];
+                int in_dim = mlp_in_dims[m];
+                int total_params = out_dim * in_dim;
+                int block_size = 64;
+                int n_blocks = total_params / block_size;
+
+                // Step 1: dequantize absmax (uint8 -> float via nested lookup)
+                std::vector<float> absmax_f(n_blocks);
+                int nested_block_size = 256;
+                for (int b = 0; b < n_blocks; b++) {
+                    int nested_group = b / nested_block_size;
+                    float nested_scale = nested_absmax[nested_group];
+                    float dequant_val = nested_qmap[absmax_u8[b]];
+                    absmax_f[b] = dequant_val * nested_scale;
+                }
+
+                // Step 2: dequantize NF4 weights to fp16
+                std::vector<uint16_t> fp16_data(total_params);
+                for (int j = 0; j < total_params; j += 2) {
+                    int byte_idx = j / 2;
+                    uint8_t packed_byte = packed[byte_idx];
+                    uint8_t lo = packed_byte & 0x0F;
+                    uint8_t hi = (packed_byte >> 4) & 0x0F;
+
+                    int block_lo = j / block_size;
+                    int block_hi = (j + 1) / block_size;
+
+                    float w0 = qmap[lo] * absmax_f[block_lo];
+                    float w1 = qmap[hi] * absmax_f[block_hi];
+
+                    // Convert float -> fp16
+                    fp16_data[j] = float_to_fp16(w0);
+                    fp16_data[j + 1] = float_to_fp16(w1);
+                }
+
+                // Upload to GPU
+                half* gpu_ptr;
+                cudaMalloc(reinterpret_cast<void**>(&gpu_ptr), total_params * sizeof(half));
+                cudaMemcpy(gpu_ptr, fp16_data.data(), total_params * sizeof(half), cudaMemcpyHostToDevice);
+                *mlp_ptrs[m] = gpu_ptr;
+            } else {
+                // Already fp16/bf16
+                *mlp_ptrs[m] = load_half(wname);
+            }
+        }
 
         // Norms
-        layer.input_layernorm = load(prefix + "input_layernorm.weight");
-        layer.post_attn_layernorm = load(prefix + "post_attention_layernorm.weight");
+        layer.input_layernorm = load_half(p + "input_layernorm.weight");
+        layer.post_attn_layernorm = load_half(p + "post_attention_layernorm.weight");
 
-        // QKNorm (Qwen3 specific)
-        layer.q_norm = load(prefix + "self_attn.q_norm.weight");
-        layer.k_norm = load(prefix + "self_attn.k_norm.weight");
+        // QKNorm
+        layer.q_norm = load_half(p + "self_attn.q_norm.weight");
+        layer.k_norm = load_half(p + "self_attn.k_norm.weight");
 
-        // LoRA starts as nullptr
-        layer.lora_q = nullptr;
-        layer.lora_k = nullptr;
-        layer.lora_v = nullptr;
-        layer.lora_o = nullptr;
-        layer.lora_gate = nullptr;
-        layer.lora_up = nullptr;
-        layer.lora_down = nullptr;
+        // LoRA (not loaded here)
+        layer.lora_q = layer.lora_k = layer.lora_v = layer.lora_o = nullptr;
+        layer.lora_gate = layer.lora_up = layer.lora_down = nullptr;
 
+        loaded_layers++;
         if (i == 0 || i == NUM_LAYERS - 1) {
-            std::cout << "  layer " << i << " loaded" << std::endl;
+            std::cout << "  Layer " << i << " loaded" << std::endl;
         }
     }
-
-    std::cout << "  All " << NUM_LAYERS << " layers loaded" << std::endl;
+    std::cout << "  All " << loaded_layers << " layers loaded" << std::endl;
 }
 
-void InferenceEngine::load_lora(const std::string& lora_path, float scale) {
-    std::cout << "Loading LoRA from: " << lora_path << std::endl;
+void InferenceEngine::load_lora(const std::string& lora_prefix, float scale) {
+    std::string idx_path = lora_prefix + ".idx";
+    std::string bin_path = lora_prefix + ".bin";
 
-    // Read LoRA weights file (same binary format)
-    std::ifstream f(lora_path, std::ios::binary | std::ios::ate);
+    std::cout << "Loading LoRA: " << lora_prefix << std::endl;
+
+    auto index = load_index(idx_path);
+    std::ifstream f(bin_path, std::ios::binary | std::ios::ate);
     if (!f.is_open()) {
-        throw std::runtime_error("Cannot open LoRA file: " + lora_path);
+        throw std::runtime_error("Cannot open: " + bin_path);
+        return;
     }
     size_t file_size = f.tellg();
     f.seekg(0);
-
-    uint64_t header_size;
-    f.read(reinterpret_cast<char*>(&header_size), 8);
-
-    std::vector<char> header(header_size);
-    f.read(header.data(), header_size);
-
-    auto index = parse_index(header.data(), header_size);
-
-    size_t padded_header = ((header_size + 8 + 4095) / 4096) * 4096;
-    std::vector<char> data(file_size - padded_header);
-    f.seekg(padded_header);
-    f.read(data.data(), data.size());
+    std::vector<char> data(file_size);
+    f.read(data.data(), file_size);
     f.close();
 
-    const char* data_ptr = data.data();
+    const char* base = data.data();
 
-    auto load = [&](const std::string& name) -> half* {
+    auto load_half = [&](const std::string& name) -> half* {
         auto it = index.find(name);
         if (it == index.end()) return nullptr;
-        return load_fp16_tensor(data_ptr, it->second);
+        return (half*)gpu_alloc_copy(base + it->second.offset, it->second.nbytes);
     };
 
-    auto get_dim = [&](const std::string& name, int dim) -> int {
+    auto get_shape = [&](const std::string& name, int dim) -> int {
         auto it = index.find(name);
-        if (it == index.end()) return 0;
-        return (int)it->second.shape[dim];
+        if (it == index.end() || dim >= (int)it->second.shape.size()) return 0;
+        return it->second.shape[dim];
     };
 
-    // Load LoRA for each layer
     int loaded = 0;
     for (int i = 0; i < NUM_LAYERS; i++) {
         auto& layer = weights_.layers[i];
-        std::string prefix = "base_model.model.model.layers." + std::to_string(i) + ".";
+        std::string p = "base_model.model.model.layers." + std::to_string(i) + ".";
 
-        struct { const char* proj; LoRAAdapter** adapter; } targets[] = {
+        struct { const char* proj; LoRAAdapter** ptr; } targets[] = {
             {"self_attn.q_proj", &layer.lora_q},
             {"self_attn.k_proj", &layer.lora_k},
             {"self_attn.v_proj", &layer.lora_v},
             {"self_attn.o_proj", &layer.lora_o},
-            {"mlp.gate_proj",   &layer.lora_gate},
-            {"mlp.up_proj",     &layer.lora_up},
-            {"mlp.down_proj",   &layer.lora_down},
+            {"mlp.gate_proj", &layer.lora_gate},
+            {"mlp.up_proj", &layer.lora_up},
+            {"mlp.down_proj", &layer.lora_down},
         };
 
-        for (auto& [proj, adapter_ptr] : targets) {
-            std::string a_name = prefix + proj + ".lora_A.weight";
-            std::string b_name = prefix + proj + ".lora_B.weight";
-
-            half* a_data = load(a_name);
-            half* b_data = load(b_name);
-
-            if (a_data && b_data) {
+        for (auto& [proj, ptr] : targets) {
+            std::string a_name = p + proj + ".lora_A.weight";
+            std::string b_name = p + proj + ".lora_B.weight";
+            half* a = load_half(a_name);
+            half* b = load_half(b_name);
+            if (a && b) {
                 auto* adapter = new LoRAAdapter();
-                adapter->A = a_data;
-                adapter->B = b_data;
-                adapter->rank = get_dim(a_name, 0);
-                adapter->in_features = get_dim(a_name, 1);
-                adapter->out_features = get_dim(b_name, 0);
+                adapter->A = a;
+                adapter->B = b;
+                adapter->rank = get_shape(a_name, 0);
+                adapter->in_features = get_shape(a_name, 1);
+                adapter->out_features = get_shape(b_name, 0);
                 adapter->scale = scale;
-                *adapter_ptr = adapter;
+                *ptr = adapter;
                 loaded++;
             }
         }
     }
-    std::cout << "  Loaded " << loaded << " LoRA adapters (scale=" << scale << ")" << std::endl;
+    std::cout << "  Loaded " << loaded << " LoRA adapters" << std::endl;
 }

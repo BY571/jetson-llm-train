@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <random>
+#include <iostream>
 
 // Helper to avoid void** casts everywhere
 template<typename T>
@@ -253,9 +254,20 @@ void InferenceEngine::prefill(const int* token_ids, int n_tokens) {
 // ============================================================================
 
 int InferenceEngine::sample(float temperature, float top_p) {
+    // Sync and check for CUDA errors
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA error before sample: " << cudaGetErrorString(err) << std::endl;
+        return 0;
+    }
+
     // Copy logits to host for sampling
     std::vector<float> logits_host(VOCAB_SIZE);
-    cudaMemcpy(logits_host.data(), state_.logits, VOCAB_SIZE * sizeof(float), cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(logits_host.data(), state_.logits, VOCAB_SIZE * sizeof(float), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA memcpy error in sample: " << cudaGetErrorString(err) << std::endl;
+        return 0;
+    }
 
     // Temperature
     if (temperature != 1.0f) {
@@ -273,40 +285,33 @@ int InferenceEngine::sample(float temperature, float top_p) {
 
     // Top-p (nucleus) sampling
     if (top_p < 1.0f) {
-        // Sort indices by probability (descending)
-        std::vector<std::pair<float, int>> sorted_probs;
-        sorted_probs.reserve(VOCAB_SIZE);
-        for (int i = 0; i < VOCAB_SIZE; i++) {
-            if (logits_host[i] > 1e-8f) {
-                sorted_probs.push_back({logits_host[i], i});
-            }
-        }
-        std::sort(sorted_probs.begin(), sorted_probs.end(),
-                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        // Create index array and sort by probability (descending)
+        std::vector<int> indices(VOCAB_SIZE);
+        for (int i = 0; i < VOCAB_SIZE; i++) indices[i] = i;
+        std::partial_sort(indices.begin(), indices.begin() + std::min(1000, VOCAB_SIZE),
+                          indices.end(),
+                          [&](int a, int b) { return logits_host[a] > logits_host[b]; });
 
+        // Find nucleus (top-p cumulative probability)
         float cumsum = 0.0f;
-        std::vector<std::pair<float, int>> nucleus;
-        for (auto& [prob, idx] : sorted_probs) {
-            nucleus.push_back({prob, idx});
-            cumsum += prob;
+        int nucleus_end = 0;
+        for (int i = 0; i < std::min(1000, VOCAB_SIZE); i++) {
+            cumsum += logits_host[indices[i]];
+            nucleus_end = i + 1;
             if (cumsum >= top_p) break;
         }
 
-        // Renormalize
-        float nucleus_sum = 0.0f;
-        for (auto& [prob, _] : nucleus) nucleus_sum += prob;
-
         // Sample from nucleus
         static std::mt19937 rng(42);
-        std::uniform_real_distribution<float> dist(0.0f, nucleus_sum);
+        std::uniform_real_distribution<float> dist(0.0f, cumsum);
         float r = dist(rng);
 
         float running = 0.0f;
-        for (auto& [prob, idx] : nucleus) {
-            running += prob;
-            if (running >= r) return idx;
+        for (int i = 0; i < nucleus_end; i++) {
+            running += logits_host[indices[i]];
+            if (running >= r) return indices[i];
         }
-        return nucleus.back().second;
+        return indices[nucleus_end - 1];
     }
 
     // Multinomial sampling (no top-p)
