@@ -2,6 +2,11 @@ FROM dustynv/l4t-pytorch:r36.4.0
 
 ENV PIP_INDEX_URL=https://pypi.jetson-ai-lab.io/jp6/cu126
 
+# CUDA dev headers needed for torch.compile (Triton backend compiles CUDA code)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cuda-toolkit-12-6 gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
 # Upgrade to torch 2.8 (base has 2.4, TRL needs FSDPModule from 2.6+)
 RUN pip install --no-cache-dir 'torch==2.8.0' 'torchvision==0.23.0' 'numpy<2'
 
