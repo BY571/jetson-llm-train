@@ -33,9 +33,9 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from transformers.cache_utils import StaticCache
 
 from jetson_compat import patch_amp_for_jetson, cast_model_to_fp16
+from cuda_graph_gen import FastGenerator
 
 patch_amp_for_jetson()
 
@@ -80,127 +80,6 @@ def compute_rewards(completions, answer):
 
     combined = [f + c for f, c in zip(format_rewards, correctness_rewards)]
     return combined, format_rewards, correctness_rewards
-
-
-# ── CUDA Graph Generation ──
-
-class CUDAGraphGenerator:
-    """Fast autoregressive generation using CUDA graphs + static KV cache.
-
-    Captures the decode step as a CUDA graph on first call, then replays
-    it for each subsequent token. Eliminates ~120ms of CPU dispatch overhead
-    per token (from 138ms to ~21ms).
-    """
-
-    def __init__(self, model, tokenizer, max_cache_len=512, temperature=1.0):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.max_cache_len = max_cache_len
-        self.temperature = temperature
-        self.device = next(model.parameters()).device
-        self.graph = None
-        self.static_input_ids = None
-        self.static_cache_pos = None
-        self.static_logits = None
-        self.cache = None
-
-    def _capture_graph(self, cache):
-        """Capture a CUDA graph for the decode step."""
-        self.static_input_ids = torch.zeros(1, 1, dtype=torch.long, device=self.device)
-        self.static_cache_pos = torch.zeros(1, dtype=torch.long, device=self.device)
-
-        # Warm up
-        self.static_input_ids.fill_(0)
-        self.static_cache_pos.fill_(0)
-        with torch.no_grad():
-            out = self.model(
-                input_ids=self.static_input_ids,
-                past_key_values=cache,
-                use_cache=True,
-                cache_position=self.static_cache_pos,
-            )
-        self.static_logits = out.logits
-
-        # Capture
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            with torch.no_grad():
-                out = self.model(
-                    input_ids=self.static_input_ids,
-                    past_key_values=cache,
-                    use_cache=True,
-                    cache_position=self.static_cache_pos,
-                )
-            self.static_logits = out.logits
-
-    def generate(self, prompt_messages, max_new_tokens=512):
-        """Generate a completion for a single prompt using CUDA graphs.
-
-        Returns the generated text (string).
-        """
-        # Tokenize prompt
-        input_text = self.tokenizer.apply_chat_template(
-            prompt_messages, tokenize=False, add_generation_prompt=True,
-        )
-        input_ids = self.tokenizer(input_text, return_tensors="pt").input_ids.to(self.device)
-        prompt_len = input_ids.shape[1]
-
-        if prompt_len + max_new_tokens > self.max_cache_len:
-            max_new_tokens = self.max_cache_len - prompt_len - 1
-
-        # Fresh static cache for this generation
-        cache = StaticCache(
-            config=self.model.config,
-            batch_size=1,
-            max_cache_len=self.max_cache_len,
-            device=self.device,
-            dtype=torch.float16,
-        )
-
-        # Prefill (not graphed, variable prompt length)
-        with torch.no_grad():
-            out = self.model(input_ids=input_ids, past_key_values=cache, use_cache=True)
-        cache = out.past_key_values
-
-        # Sample first token
-        logits = out.logits[:, -1, :] / self.temperature
-        next_token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
-
-        # Capture graph if not already done
-        if self.graph is None:
-            self._capture_graph(cache)
-
-        # Decode loop with graph replay
-        generated_ids = [next_token.item()]
-        eos_id = self.tokenizer.eos_token_id
-
-        for i in range(max_new_tokens - 1):
-            self.static_input_ids.copy_(next_token)
-            self.static_cache_pos.fill_(prompt_len + i + 1)
-            self.graph.replay()
-
-            logits = self.static_logits[:, -1, :] / self.temperature
-            next_token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
-            token_id = next_token.item()
-            generated_ids.append(token_id)
-
-            if token_id == eos_id:
-                break
-            # Early stop on </answer>
-            if len(generated_ids) > 5:
-                tail = self.tokenizer.decode(generated_ids[-10:])
-                if "</answer>" in tail:
-                    break
-
-        return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-    def generate_batch(self, prompt_messages, n_completions, max_new_tokens=512):
-        """Generate n_completions for a prompt. Sequential (one at a time)."""
-        completions = []
-        for _ in range(n_completions):
-            text = self.generate(prompt_messages, max_new_tokens)
-            completions.append(text)
-        return completions
 
 
 # ── GRPO Training Step ──
@@ -383,13 +262,13 @@ def main():
     total = sum(p.numel() for p in model.parameters())
     print(f"  LoRA rank={args.lora_rank}, trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
-    # ── CUDA graph generator ──
-    generator = CUDAGraphGenerator(
+    # ── CUDA graph generator (persistent cache, prefill reuse) ──
+    generator = FastGenerator(
         model, tokenizer,
         max_cache_len=args.max_seq_length,
         temperature=args.temperature,
     )
-    print(f"  CUDA graph generator ready (max_cache={args.max_seq_length})")
+    print(f"  FastGenerator ready (persistent cache, prefill reuse, max_cache={args.max_seq_length})")
 
     # ── Dataset ──
     print("\nLoading GSM8K dataset...")
