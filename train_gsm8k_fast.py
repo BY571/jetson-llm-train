@@ -123,10 +123,19 @@ def grpo_step(model, tokenizer, generator, prompt_msgs, answer, optimizer,
     advantages = (rewards_t - mean_r) / std_r
 
     # ── Backward (PyTorch, already fast) ──
+    # Free CUDA graph memory before backward to avoid OOM
+    torch.cuda.empty_cache()
+
     model.train()
     optimizer.zero_grad()
     torch.cuda.synchronize()
     t_train = time.perf_counter()
+
+    # Pre-compute prompt length once
+    prompt_text = tokenizer.apply_chat_template(
+        prompt_msgs, tokenize=False, add_generation_prompt=True,
+    )
+    prompt_len = len(tokenizer(prompt_text).input_ids)
 
     total_loss = 0.0
     n_valid = 0
@@ -141,15 +150,8 @@ def grpo_step(model, tokenizer, generator, prompt_msgs, answer, optimizer,
         tokens = tokenizer(full_text, return_tensors="pt", truncation=True,
                            max_length=max_seq_len).to(device)
 
-        # Get prompt length to mask loss
-        prompt_text = tokenizer.apply_chat_template(
-            prompt_msgs, tokenize=False, add_generation_prompt=True,
-        )
-        prompt_len = len(tokenizer(prompt_text).input_ids)
-
-        # Forward + masked loss
+        # Forward + masked loss (one completion at a time to save memory)
         outputs = model(**tokens, labels=tokens["input_ids"])
-        # Mask prompt tokens from loss (only train on completion)
         logits = outputs.logits[:, :-1, :]
         labels = tokens["input_ids"][:, 1:]
         loss_per_token = F.cross_entropy(
@@ -157,20 +159,25 @@ def grpo_step(model, tokenizer, generator, prompt_msgs, answer, optimizer,
             labels.reshape(-1),
             reduction="none",
         ).reshape(labels.shape)
-        # Mask prompt
+
+        # Mask prompt tokens
         mask = torch.zeros_like(labels, dtype=torch.float32)
         mask[:, prompt_len - 1:] = 1.0
         masked_loss = (loss_per_token * mask).sum() / mask.sum().clamp(min=1)
 
-        # GRPO: weight loss by advantage
+        # GRPO: weight loss by advantage, backward immediately, free graph
         weighted_loss = -masked_loss * adv.item()
         weighted_loss.backward()
         total_loss += weighted_loss.item()
         n_valid += 1
 
+        # Free intermediate tensors
+        del outputs, logits, labels, loss_per_token, mask, masked_loss, weighted_loss, tokens
+
     if n_valid > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+    optimizer.zero_grad(set_to_none=True)  # free grad memory
 
     torch.cuda.synchronize()
     t_train = time.perf_counter() - t_train
