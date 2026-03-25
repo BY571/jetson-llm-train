@@ -138,6 +138,10 @@ struct InferenceState {
 
     // LoRA scratch buffer (for A @ x intermediate, max rank = 64)
     half* lora_scratch; // (max_lora_rank,)
+
+    // CUDA graph: device-side control values (updated before graph replay)
+    int* d_token_id;    // current token id (for embedding lookup)
+    int* d_pos;         // current position (for RoPE, attention, KV cache)
 };
 
 // Top-level engine
@@ -188,12 +192,28 @@ public:
                                int eos_token_id = -1,
                                const std::vector<int>& stop_token_ids = {});
 
+    // CUDA graph for fast decode replay
+    bool use_cuda_graph_ = false;
+    void enable_cuda_graph();  // capture after first decode
+
 private:
     ModelWeights weights_;
     InferenceState state_;
 
+    // CUDA graph state
+    cudaGraph_t cuda_graph_ = nullptr;
+    cudaGraphExec_t cuda_graph_exec_ = nullptr;
+    bool graph_captured_ = false;
+    cudaStream_t graph_stream_ = nullptr;
+
     // Forward pass for one token through one layer
     void forward_layer(int layer_idx);
+
+    // Graph-captured forward (uses device-side position)
+    void forward_layer_graph(int layer_idx, cudaStream_t stream);
+
+    // Graph-accelerated decode (capture on first call, replay after)
+    void decode_graph(int token_id);
 
     // Precompute RoPE cos/sin tables
     void precompute_rope();

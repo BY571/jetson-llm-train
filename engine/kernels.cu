@@ -287,6 +287,51 @@ __global__ void qk_norm_kernel(
 // ============================================================================
 // Apply rotation to Q and K vectors in-place.
 
+// RoPE that reads position from device memory (for CUDA graph)
+__global__ void rope_device_kernel(
+    half* __restrict__ q,
+    half* __restrict__ k,
+    const half* __restrict__ cos_table_base,  // full table: (max_seq, HEAD_DIM/2)
+    const half* __restrict__ sin_table_base,
+    const int* __restrict__ d_pos,            // device-side position
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim
+) {
+    int pos = *d_pos;
+    int half_head = head_dim / 2;
+    const half* cos_table = cos_table_base + pos * half_head;
+    const half* sin_table = sin_table_base + pos * half_head;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_q = num_q_heads * half_head;
+
+    if (idx < total_q) {
+        int head = idx / half_head;
+        int d = idx % half_head;
+        int base = head * head_dim;
+        float q0 = __half2float(q[base + d]);
+        float q1 = __half2float(q[base + d + half_head]);
+        float c = __half2float(cos_table[d]);
+        float s = __half2float(sin_table[d]);
+        q[base + d] = __float2half(q0 * c - q1 * s);
+        q[base + d + half_head] = __float2half(q1 * c + q0 * s);
+    }
+
+    int total_kv = num_kv_heads * half_head;
+    if (idx < total_kv) {
+        int head = idx / half_head;
+        int d = idx % half_head;
+        int base = head * head_dim;
+        float k0 = __half2float(k[base + d]);
+        float k1 = __half2float(k[base + d + half_head]);
+        float c = __half2float(cos_table[d]);
+        float s = __half2float(sin_table[d]);
+        k[base + d] = __float2half(k0 * c - k1 * s);
+        k[base + d + half_head] = __float2half(k1 * c + k0 * s);
+    }
+}
+
 __global__ void rope_kernel(
     half* __restrict__ q,       // (Q_DIM,) = (NUM_HEADS * HEAD_DIM,)
     half* __restrict__ k,       // (KV_DIM,) = (NUM_KV_HEADS * HEAD_DIM,)
@@ -344,7 +389,8 @@ __global__ void gqa_attention_decode_kernel(
     const half* __restrict__ v_cache,   // (max_seq, KV_DIM) full V cache
     half* __restrict__ output,          // (Q_DIM,) attention output
     float* __restrict__ attn_scratch,   // (NUM_HEADS, max_seq) scratch for scores
-    int pos,                            // current position (attend to 0..pos inclusive)
+    const int* __restrict__ d_pos,      // device-side position pointer
+    int pos_unused,                     // kept for non-graph path
     int max_seq_len,
     int num_q_heads,
     int num_kv_heads,
@@ -352,6 +398,8 @@ __global__ void gqa_attention_decode_kernel(
 ) {
     int head = blockIdx.x; // one block per Q head
     if (head >= num_q_heads) return;
+
+    int pos = (d_pos != nullptr) ? *d_pos : pos_unused;
 
     int kv_head = head / (num_q_heads / num_kv_heads); // GQA mapping
     float scale = 1.0f / sqrtf((float)head_dim);
@@ -466,6 +514,39 @@ __global__ void embedding_lookup_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < hidden_dim) {
         output[idx] = embed_table[(size_t)token_id * hidden_dim + idx];
+    }
+}
+
+// Version that reads token_id from device memory (for CUDA graph capture)
+__global__ void embedding_lookup_device_kernel(
+    const half* __restrict__ embed_table,
+    const int* __restrict__ d_token_id,     // device-side token id
+    half* __restrict__ output,
+    int hidden_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < hidden_dim) {
+        output[idx] = embed_table[(size_t)(*d_token_id) * hidden_dim + idx];
+    }
+}
+
+// ============================================================================
+// Kernel 6b: KV cache write (reads position from device memory for CUDA graph)
+// ============================================================================
+
+__global__ void kv_cache_write_kernel(
+    half* __restrict__ k_cache,     // (max_seq, KV_DIM)
+    half* __restrict__ v_cache,     // (max_seq, KV_DIM)
+    const half* __restrict__ k_new, // (KV_DIM,)
+    const half* __restrict__ v_new, // (KV_DIM,)
+    const int* __restrict__ d_pos,
+    int kv_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int pos = *d_pos;
+    if (idx < kv_dim) {
+        k_cache[pos * kv_dim + idx] = k_new[idx];
+        v_cache[pos * kv_dim + idx] = v_new[idx];
     }
 }
 
@@ -791,7 +872,7 @@ void launch_gqa_attention(
     // One block per Q head, 128 threads per block
     gqa_attention_decode_kernel<<<qwen3::NUM_HEADS, 128, 0, stream>>>(
         q, k_cache, v_cache, output, attn_scratch,
-        pos, max_seq_len,
+        nullptr, pos, max_seq_len,
         qwen3::NUM_HEADS, qwen3::NUM_KV_HEADS, qwen3::HEAD_DIM
     );
 }
@@ -803,6 +884,55 @@ void launch_silu_gate_mul(
     int threads = 256;
     int blocks = (dim + threads - 1) / threads;
     silu_gate_mul_kernel<<<blocks, threads, 0, stream>>>(gate, up, output, dim);
+}
+
+void launch_embedding_device(
+    const half* embed_table, const int* d_token_id,
+    half* output, int hidden_dim, cudaStream_t stream
+) {
+    int threads = 256;
+    int blocks = (hidden_dim + threads - 1) / threads;
+    embedding_lookup_device_kernel<<<blocks, threads, 0, stream>>>(
+        embed_table, d_token_id, output, hidden_dim
+    );
+}
+
+void launch_rope_device(
+    half* q, half* k,
+    const half* cos_table_base, const half* sin_table_base,
+    const int* d_pos,
+    cudaStream_t stream
+) {
+    int n = qwen3::NUM_HEADS * qwen3::HEAD_DIM / 2;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    rope_device_kernel<<<blocks, threads, 0, stream>>>(
+        q, k, cos_table_base, sin_table_base, d_pos,
+        qwen3::NUM_HEADS, qwen3::NUM_KV_HEADS, qwen3::HEAD_DIM
+    );
+}
+
+void launch_gqa_attention_device(
+    const half* q, const half* k_cache, const half* v_cache,
+    half* output, float* attn_scratch, const int* d_pos,
+    int max_seq_len, cudaStream_t stream
+) {
+    gqa_attention_decode_kernel<<<qwen3::NUM_HEADS, 128, 0, stream>>>(
+        q, k_cache, v_cache, output, attn_scratch, d_pos, 0,
+        max_seq_len, qwen3::NUM_HEADS, qwen3::NUM_KV_HEADS, qwen3::HEAD_DIM
+    );
+}
+
+void launch_kv_cache_write(
+    half* k_cache, half* v_cache,
+    const half* k_new, const half* v_new,
+    const int* d_pos, int kv_dim, cudaStream_t stream
+) {
+    int threads = 256;
+    int blocks = (kv_dim + threads - 1) / threads;
+    kv_cache_write_kernel<<<blocks, threads, 0, stream>>>(
+        k_cache, v_cache, k_new, v_new, d_pos, kv_dim
+    );
 }
 
 void launch_embedding(
