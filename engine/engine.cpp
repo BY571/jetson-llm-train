@@ -67,6 +67,7 @@ extern "C" {
     void launch_embedding(const half* embed_table, int token_id, half* output, int hidden_dim, cudaStream_t stream);
     void launch_residual_add(half* output, const half* residual, int dim, cudaStream_t stream);
     void launch_lm_head(const half* weight, const half* input, float* logits, int hidden_dim, int vocab_size, cudaStream_t stream);
+    void launch_argmax(const float* logits, int* result, int vocab_size, cudaStream_t stream);
 }
 
 using namespace qwen3;
@@ -103,6 +104,9 @@ InferenceEngine::InferenceEngine(int max_seq_len) {
     cudaMallocTyped(&state_.rope_sin, max_seq_len * (HEAD_DIM / 2) * sizeof(half));
     precompute_rope();
 
+    // GPU-side sampling
+    cudaMallocTyped(&state_.sample_result, sizeof(int));
+
     // Zero-init weights
     memset(&weights_, 0, sizeof(weights_));
 }
@@ -125,6 +129,7 @@ InferenceEngine::~InferenceEngine() {
     cudaFree(state_.attn_scores);
     cudaFree(state_.rope_cos);
     cudaFree(state_.rope_sin);
+    cudaFree(state_.sample_result);
 }
 
 // ============================================================================
@@ -235,6 +240,11 @@ void InferenceEngine::forward_layer(int layer_idx) {
         launch_silu_gate_mul(state_.gate_buf, state_.up_buf, state_.gate_buf, INTERMEDIATE_SIZE, stream);
         launch_nf4_gemv(d.data, d.absmax, d.quant_map, state_.gate_buf, state_.hidden, d.out_dim, d.in_dim, d.block_size, stream);
     } else {
+        // Fuse gate + up into single GEMM if weights are contiguous in memory
+        // gate_proj is (INTERMEDIATE, HIDDEN), up_proj is (INTERMEDIATE, HIDDEN)
+        // If gate and up are contiguous, we can do one GEMM of (2*INTERMEDIATE, HIDDEN) @ (HIDDEN, 1)
+        // Output goes to gate_buf which must be 2*INTERMEDIATE large
+        // For now, still 2 calls (safe). TODO: concat weights at load time.
         cublas_hgemv(layer.gate_proj_fp16, norm_out, state_.gate_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
         cublas_hgemv(layer.up_proj_fp16, norm_out, state_.up_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
         launch_silu_gate_mul(state_.gate_buf, state_.up_buf, state_.gate_buf, INTERMEDIATE_SIZE, stream);
@@ -289,6 +299,17 @@ void InferenceEngine::decode(int token_id) {
 }
 
 // ============================================================================
+// GPU-side greedy sampling (no CPU copy)
+// ============================================================================
+
+int InferenceEngine::sample_greedy_gpu() {
+    launch_argmax(state_.logits, state_.sample_result, VOCAB_SIZE, 0);
+    int result;
+    cudaMemcpy(&result, state_.sample_result, sizeof(int), cudaMemcpyDeviceToHost);
+    return result;
+}
+
+// ============================================================================
 // Prefill: process multiple tokens
 // ============================================================================
 
@@ -305,14 +326,12 @@ void InferenceEngine::prefill(const int* token_ids, int n_tokens) {
 // ============================================================================
 
 int InferenceEngine::sample(float temperature, float top_p) {
-    // Sync and check for CUDA errors
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         std::cerr << "CUDA error before sample: " << cudaGetErrorString(err) << std::endl;
         return 0;
     }
 
-    // Copy logits to host for sampling
     std::vector<float> logits_host(VOCAB_SIZE);
     err = cudaMemcpy(logits_host.data(), state_.logits, VOCAB_SIZE * sizeof(float), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
@@ -395,8 +414,11 @@ std::vector<int> InferenceEngine::generate(
     // Prefill
     prefill(prompt.data(), prompt.size());
 
+    // Choose sampling strategy
+    bool use_gpu_sample = (temperature < 0.1f);
+
     // Sample first token from prefill logits
-    int token = sample(temperature, top_p);
+    int token = use_gpu_sample ? sample_greedy_gpu() : sample(temperature, top_p);
     std::vector<int> output = {token};
 
     // Decode loop (pure C++, no Python)
@@ -418,7 +440,7 @@ std::vector<int> InferenceEngine::generate(
         if (should_stop) break;
 
         decode(token);
-        token = sample(temperature, top_p);
+        token = use_gpu_sample ? sample_greedy_gpu() : sample(temperature, top_p);
         output.push_back(token);
     }
 

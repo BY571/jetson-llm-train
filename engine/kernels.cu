@@ -571,9 +571,54 @@ __global__ void fp16_gemv_logits_kernel(
 }
 
 // ============================================================================
-// Kernel 9: Top-p sampling
+// Kernel 9: GPU-side argmax for greedy/low-temp sampling
 // ============================================================================
-// Temperature scaling + softmax + cumulative top-p + sample
+// Finds the index of the maximum logit value entirely on GPU.
+// Returns result in a single int on device memory.
+
+__global__ void argmax_kernel(
+    const float* __restrict__ logits,
+    int* __restrict__ result,
+    int vocab_size
+) {
+    // Block reduction to find max
+    __shared__ float shared_val[256];
+    __shared__ int shared_idx[256];
+
+    float max_val = -1e30f;
+    int max_idx = 0;
+
+    for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+        float v = logits[i];
+        if (v > max_val) {
+            max_val = v;
+            max_idx = i;
+        }
+    }
+
+    shared_val[threadIdx.x] = max_val;
+    shared_idx[threadIdx.x] = max_idx;
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            if (shared_val[threadIdx.x + s] > shared_val[threadIdx.x]) {
+                shared_val[threadIdx.x] = shared_val[threadIdx.x + s];
+                shared_idx[threadIdx.x] = shared_idx[threadIdx.x + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        *result = shared_idx[0];
+    }
+}
+
+// ============================================================================
+// Kernel 9b: Temperature scaling
+// ============================================================================
 
 __global__ void temperature_scale_kernel(
     float* __restrict__ logits,
@@ -706,6 +751,15 @@ void launch_fp16_gemv(
     fp16_gemv_kernel<<<out_dim, 128, 0, stream>>>(
         weight, input, output, in_dim, out_dim
     );
+}
+
+void launch_argmax(
+    const float* logits,
+    int* result,
+    int vocab_size,
+    cudaStream_t stream
+) {
+    argmax_kernel<<<1, 256, 0, stream>>>(logits, result, vocab_size);
 }
 
 void launch_lm_head(

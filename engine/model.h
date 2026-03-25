@@ -132,6 +132,9 @@ struct InferenceState {
     // RoPE precomputed cos/sin
     half* rope_cos;     // (max_seq_len, HEAD_DIM/2)
     half* rope_sin;     // (max_seq_len, HEAD_DIM/2)
+
+    // GPU-side sampling result
+    int* sample_result; // single int on GPU
 };
 
 // Top-level engine
@@ -159,8 +162,11 @@ public:
     // Get logits (after prefill or decode)
     float* get_logits() const { return state_.logits; }
 
-    // Sample from logits
+    // Sample from logits (CPU-side, full top-p support)
     int sample(float temperature = 1.0f, float top_p = 0.9f);
+
+    // Fast greedy sampling on GPU (only copies 4 bytes instead of 600KB)
+    int sample_greedy_gpu();
 
     // Full generation: prefill + decode loop
     std::vector<int> generate(const std::vector<int>& prompt,
