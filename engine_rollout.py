@@ -44,7 +44,6 @@ class EngineRollout:
             dict with keys: prompt_ids, completion_ids, logprobs
             Each is a list with len = len(prompts) * num_generations
         """
-        num_generations = trainer.num_generations if hasattr(trainer, 'num_generations') else 4
         device = next(self.model.parameters()).device
 
         # Sync LoRA weights to engine before generation
@@ -55,10 +54,11 @@ class EngineRollout:
         all_completion_ids = []
         all_logprobs = []
 
+        # TRL sends batch_size prompts (already includes num_generations duplication).
+        # Each prompt gets exactly 1 completion from us.
         for prompt in prompts:
             # Tokenize prompt
             if isinstance(prompt, list):
-                # Conversational format
                 input_text = self.tokenizer.apply_chat_template(
                     prompt, tokenize=False, add_generation_prompt=True,
                 )
@@ -67,7 +67,7 @@ class EngineRollout:
 
             prompt_ids = self.tokenizer(input_text).input_ids
 
-            for g in range(num_generations):
+            for g in range(1):  # 1 completion per prompt (TRL handles grouping)
                 # Generate with C++ engine
                 self.engine.reset()
                 completion_token_ids = self.engine.generate(
