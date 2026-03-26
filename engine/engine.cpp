@@ -1054,7 +1054,7 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
     project(B->k_buf, L.k_proj_fp16, L.k_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
     project(B->v_buf, L.v_proj_fp16, L.v_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
 
-    if (layer_idx == 0) {
+    if (debug_mode && layer_idx == 0) {
         cudaDeviceSynchronize();
         fprintf(stderr, "[B] L0 norm: "); dump_half("n", B->norm_buf, 8);
         fprintf(stderr, "[B] L0 q: "); dump_half("q", B->q_buf, 8);
