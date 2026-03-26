@@ -1089,26 +1089,6 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
     launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * G, stream);
 }
 
-static void dump_half(const char* label, const half* d, int n, int stride=0) {
-    std::vector<half> h(n);
-    cudaMemcpy(h.data(), d, n * sizeof(half), cudaMemcpyDeviceToHost);
-    fprintf(stderr, "  %s:", label);
-    for (int i = 0; i < std::min(n, 8); i++)
-        fprintf(stderr, " %.4f", __half2float(h[stride ? i * stride : i]));
-    fprintf(stderr, "\n");
-    fflush(stderr);
-}
-
-static void dump_float(const char* label, const float* d, int n) {
-    std::vector<float> h(n);
-    cudaMemcpy(h.data(), d, n * sizeof(float), cudaMemcpyDeviceToHost);
-    printf("  %s:", label);
-    for (int i = 0; i < std::min(n, 8); i++) printf(" %.4f", h[i]);
-    printf("\n");
-}
-
-static int debug_mode = 1;
-
 void InferenceEngine::decode_batch(int G) {
     cudaStream_t stream = 0;
     auto* B = batch_;
