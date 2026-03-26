@@ -706,10 +706,13 @@ std::vector<int> InferenceEngine::generate(
     int token = sample_gpu(temperature, top_p);
     std::vector<int> output = {token};
 
-    // Enable CUDA graph for fast decode replay (works with NF4+cuBLAS mixed layers)
-    if (!graph_captured_ && prompt.size() > 0) {
-        enable_cuda_graph();
-    }
+    // CUDA graph disabled for NF4 on Jetson Orin: graph replay is 14% slower
+    // than the non-graph path because sample→decode serialization prevents
+    // CPU pipelining. The non-graph path benefits from 0.5ms of CPU kernel
+    // submission overlapping with GPU execution.
+    // if (!graph_captured_ && prompt.size() > 0) {
+    //     enable_cuda_graph();
+    // }
 
     // Decode loop (CUDA graph replay, no Python, all GPU sampling)
     for (int i = 0; i < max_new_tokens - 1; i++) {
