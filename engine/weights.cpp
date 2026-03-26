@@ -112,10 +112,20 @@ void InferenceEngine::load_weights(const std::string& prefix) {
         return w;
     };
 
-    // Helper: check if a weight is NF4 (uint8) or fp16
+    // Helper: check quantization format
     auto is_nf4 = [&](const std::string& name) -> bool {
         auto it = index.find(name);
-        return it != index.end() && it->second.dtype == "uint8";
+        if (it == index.end() || it->second.dtype != "uint8") return false;
+        // NF4 has quant_map, Q4L does not
+        return index.find(name.substr(0, name.size()-7) + ".weight.quant_map") != index.end();
+    };
+    auto is_q4l = [&](const std::string& name) -> bool {
+        auto it = index.find(name);
+        if (it == index.end() || it->second.dtype != "uint8") return false;
+        // Q4L has absmax but NO quant_map
+        std::string base = name.substr(0, name.size()-7);
+        return index.find(base + ".weight.absmax") != index.end()
+            && index.find(base + ".weight.quant_map") == index.end();
     };
 
     for (int i = 0; i < NUM_LAYERS; i++) {
@@ -132,7 +142,11 @@ void InferenceEngine::load_weights(const std::string& prefix) {
         };
         for (auto& ap : attn_projs) {
             std::string wname = p + ap.name + ".weight";
-            if (is_nf4(wname)) {
+            if (is_q4l(wname)) {
+                *ap.nf4 = load_nf4(p + ap.name, ap.out_dim, ap.in_dim);
+                *ap.fp16 = nullptr;
+                L.attn_is_q4l = true;
+            } else if (is_nf4(wname)) {
                 *ap.nf4 = load_nf4(p + ap.name, ap.out_dim, ap.in_dim);
                 *ap.fp16 = nullptr;
                 L.attn_is_nf4 = true;
@@ -141,32 +155,34 @@ void InferenceEngine::load_weights(const std::string& prefix) {
             }
         }
 
-        // MLP: check EACH weight individually (unsloth mixes NF4 and fp16 within a layer)
-        L.mlp_is_nf4 = false;  // will be set true if ANY weight is NF4
+        // MLP: check EACH weight individually
+        L.mlp_is_nf4 = false;
+        L.mlp_is_q4l = false;
 
-        // Gate
-        if (is_nf4(p + "mlp.gate_proj.weight")) {
-            L.gate_proj_nf4 = load_nf4(p + "mlp.gate_proj", INTERMEDIATE_SIZE, HIDDEN_SIZE);
-            L.gate_proj_fp16 = nullptr;
-            L.mlp_is_nf4 = true;
-        } else {
-            L.gate_proj_fp16 = load(p + "mlp.gate_proj.weight");
-        }
-        // Up
-        if (is_nf4(p + "mlp.up_proj.weight")) {
-            L.up_proj_nf4 = load_nf4(p + "mlp.up_proj", INTERMEDIATE_SIZE, HIDDEN_SIZE);
-            L.up_proj_fp16 = nullptr;
-            L.mlp_is_nf4 = true;
-        } else {
-            L.up_proj_fp16 = load(p + "mlp.up_proj.weight");
-        }
-        // Down
-        if (is_nf4(p + "mlp.down_proj.weight")) {
-            L.down_proj_nf4 = load_nf4(p + "mlp.down_proj", HIDDEN_SIZE, INTERMEDIATE_SIZE);
-            L.down_proj_fp16 = nullptr;
-            L.mlp_is_nf4 = true;
-        } else {
-            L.down_proj_fp16 = load(p + "mlp.down_proj.weight");
+        // Helper: load one MLP projection (Q4L > NF4 > fp16 priority)
+        auto load_mlp_proj = [&](const char* proj, half** fp16, NF4Weight* nf4,
+                                  int out_d, int in_d, bool& set_nf4, bool& set_q4l) {
+            std::string wname = p + std::string("mlp.") + proj + ".weight";
+            std::string prefix = p + std::string("mlp.") + proj;
+            if (is_q4l(wname)) {
+                *nf4 = load_nf4(prefix, out_d, in_d);
+                *fp16 = nullptr;
+                set_q4l = true;
+            } else if (is_nf4(wname)) {
+                *nf4 = load_nf4(prefix, out_d, in_d);
+                *fp16 = nullptr;
+                set_nf4 = true;
+            } else {
+                *fp16 = load(wname);
+            }
+        };
+
+        load_mlp_proj("gate_proj", &L.gate_proj_fp16, &L.gate_proj_nf4,
+                       INTERMEDIATE_SIZE, HIDDEN_SIZE, L.mlp_is_nf4, L.mlp_is_q4l);
+        load_mlp_proj("up_proj", &L.up_proj_fp16, &L.up_proj_nf4,
+                       INTERMEDIATE_SIZE, HIDDEN_SIZE, L.mlp_is_nf4, L.mlp_is_q4l);
+        load_mlp_proj("down_proj", &L.down_proj_fp16, &L.down_proj_nf4,
+                       HIDDEN_SIZE, INTERMEDIATE_SIZE, L.mlp_is_nf4, L.mlp_is_q4l);
         }
         L.input_layernorm = load(p + "input_layernorm.weight");
         L.post_attn_layernorm = load(p + "post_attention_layernorm.weight");
@@ -175,6 +191,9 @@ void InferenceEngine::load_weights(const std::string& prefix) {
         L.lora_q = L.lora_k = L.lora_v = L.lora_o = nullptr;
         L.lora_gate = L.lora_up = L.lora_down = nullptr;
     }
+    // Detect model-wide Q4L format
+    weights_.is_q4l = weights_.layers[1].attn_is_q4l || weights_.layers[1].mlp_is_q4l;
+    if (weights_.is_q4l) std::cout << "  Weights: Q4 Linear (no lookup table)" << std::endl;
     std::cout << "  All " << NUM_LAYERS << " layers loaded" << std::endl;
 
     // Load NF4 LM head if available (quantized copy of embed_tokens for fast GEMV)

@@ -31,6 +31,32 @@ NF4_TABLE = np.array([
 ], dtype=np.float32)
 
 
+def quantize_fp16_to_q4l(weight_fp16, block_size=64):
+    """Quantize fp16 weight to linear Q4 format (like Q4_0).
+    Dequant at inference: (nibble - 8) * scale.
+    Returns (packed_uint8, scales_float32)."""
+    w = weight_fp16.astype(np.float32).flatten()
+    n = len(w)
+    assert n % block_size == 0
+    n_blocks = n // block_size
+
+    blocks = w.reshape(n_blocks, block_size)
+    # Per-block scale = max absolute value / 7.5 (so that ±7 maps to ±max)
+    maxabs = np.max(np.abs(blocks), axis=1)
+    scales = (maxabs / 7.5).astype(np.float32)
+    scales = np.maximum(scales, 1e-10)
+
+    # Quantize: nibble = round(val / scale) + 8, clamped to [0, 15]
+    normalized = blocks / scales[:, None]  # range ~[-8, 8]
+    nibbles = np.clip(np.round(normalized + 8.0), 0, 15).astype(np.uint8)
+
+    # Pack pairs into bytes (hi nibble first, same as NF4)
+    flat = nibbles.flatten()
+    packed = (flat[0::2] << 4) | flat[1::2]
+
+    return packed, scales
+
+
 def quantize_fp16_to_nf4(weight_fp16, block_size=64):
     """Quantize fp16 weight matrix to NF4 format.
     Returns (packed_uint8, absmax_float32, quant_map_float32)."""
@@ -232,15 +258,82 @@ def convert_fp16(args):
     print(f"Saved {len(lines)} tensors ({total_mb:.1f}MB)")
 
 
+def convert_q4l(args):
+    """Dequantize NF4 to fp16, then re-quantize to linear Q4.
+    This eliminates the NF4 lookup table — dequant is just (nibble-8)*scale."""
+    print(f"Converting {args.model} (Q4L mode: NF4→fp16→Q4Linear)...")
+    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+    import bitsandbytes as bnb
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, quantization_config=bnb_config,
+        device_map="cuda", torch_dtype=torch.float16
+    )
+
+    bin_path = args.output + ".bin"
+    idx_path = args.output + ".idx"
+    offset = 0
+    lines = []
+    n_q4l = 0
+
+    with open(bin_path, "wb") as f:
+        for name, param in model.named_parameters():
+            clean = name[6:] if name.startswith("model.") else name
+
+            if hasattr(param, "quant_state"):
+                # Dequantize NF4 → fp16 → re-quantize to Q4L
+                fp16_data = bnb.functional.dequantize_4bit(
+                    param.data, param.quant_state
+                ).to(torch.float16).contiguous().cpu().numpy()
+
+                packed, q4l_scales = quantize_fp16_to_q4l(fp16_data, block_size=64)
+
+                # Save packed weights as uint8
+                data = packed.tobytes()
+                shape = ",".join(str(s) for s in fp16_data.shape)
+                lines.append(f"{clean} {offset} {len(data)} uint8 {shape}")
+                f.write(data)
+                offset += len(data)
+
+                # Save scales as float32 (with .absmax suffix for compatibility)
+                sdata = q4l_scales.tobytes()
+                lines.append(f"{clean}.absmax {offset} {len(sdata)} float32 {len(q4l_scales)}")
+                f.write(sdata)
+                offset += len(sdata)
+
+                # Marker: no quant_map means Q4L format (not NF4)
+                n_q4l += 1
+            else:
+                # Keep fp16 (embeddings, norms, etc.)
+                data = param.data.to(torch.float16).contiguous().cpu().numpy().tobytes()
+                shape = ",".join(str(s) for s in param.shape)
+                lines.append(f"{clean} {offset} {len(data)} float16 {shape}")
+                f.write(data)
+                offset += len(data)
+
+    with open(idx_path, "w") as f:
+        for line in lines:
+            f.write(line + "\n")
+
+    total_mb = os.path.getsize(bin_path) / 1e6
+    print(f"Saved {len(lines)} tensors ({total_mb:.1f}MB, {n_q4l} Q4L projections)")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="unsloth/Qwen3-0.6B-unsloth-bnb-4bit")
     parser.add_argument("--output", default="engine/weights")
-    parser.add_argument("--mode", choices=["fp16", "nf4"], default="fp16")
+    parser.add_argument("--mode", choices=["fp16", "nf4", "q4l"], default="fp16")
     args = parser.parse_args()
 
     if args.mode == "nf4":
         convert_nf4(args)
+    elif args.mode == "q4l":
+        convert_q4l(args)
     else:
         convert_fp16(args)
 

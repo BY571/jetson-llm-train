@@ -66,6 +66,7 @@ struct TransformerLayerWeights {
     NF4Weight v_proj_nf4;   // if NF4
     NF4Weight o_proj_nf4;   // if NF4
     bool attn_is_nf4 = false;
+    bool attn_is_q4l = false;  // Q4 linear (no lookup table)
 
     // MLP: either fp16 (dequantized) or NF4 (native quantized)
     // Only one of these is non-null per layer
@@ -77,6 +78,7 @@ struct TransformerLayerWeights {
     NF4Weight up_proj_nf4;    // if NF4 mode
     NF4Weight down_proj_nf4;  // if NF4 mode
     bool mlp_is_nf4 = false;
+    bool mlp_is_q4l = false;
 
     // Norms (fp16, small)
     half* input_layernorm;  // (HIDDEN,)
@@ -117,6 +119,9 @@ struct ModelWeights {
 
     // Final norm
     half* final_layernorm;  // (HIDDEN,)
+
+    // Model-wide quantization format (set during loading)
+    bool is_q4l = false;  // true if weights are Q4 Linear (not NF4)
 };
 
 // Inference state (pre-allocated buffers)
