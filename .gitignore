@@ -9,3 +9,4 @@ CLAUDE.md
 engine/weights.bin
 engine/reference_logits.npz
 engine/build/
+knowledge_base/
