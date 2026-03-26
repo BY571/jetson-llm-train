@@ -1,12 +1,24 @@
-checkpoints/
-outputs/
-wandb/
+# Build artifacts
+engine/build/
+engine/build2/
 __pycache__/
 *.pyc
+
+# Weights (large binary files, not tracked)
+engine/weights.bin
+engine/weights_q4l*
+engine/reference_logits.npz
+
+# Training outputs
+checkpoints/
+checkpoints_*/
+outputs/
+wandb/
+
+# Environment / secrets
 .env
 *.log
+
+# Project-local docs
 CLAUDE.md
-engine/weights.bin
-engine/reference_logits.npz
-engine/build/
 knowledge_base/
