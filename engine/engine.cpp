@@ -230,6 +230,34 @@ InferenceEngine::~InferenceEngine() {
     cudaFree(state_.rope_cos);
     cudaFree(state_.rope_sin);
     cudaFree(state_.sample_result);
+    cudaFree(state_.lm_head_fp16_buf);
+    cudaFree(state_.q8_data);
+    cudaFree(state_.q8_scales);
+    cudaFree(state_.q8_sums);
+    cudaFree(state_.lora_scratch);
+    cudaFree(state_.d_token_id);
+    cudaFree(state_.d_pos);
+    if (h_token_id_pinned_) cudaFreeHost(h_token_id_pinned_);
+    if (h_pos_pinned_) cudaFreeHost(h_pos_pinned_);
+
+    // Free batch state if allocated
+    if (batch_) {
+        cudaFree(batch_->hidden); cudaFree(batch_->residual);
+        cudaFree(batch_->norm_buf); cudaFree(batch_->q_buf);
+        cudaFree(batch_->k_buf); cudaFree(batch_->v_buf);
+        cudaFree(batch_->attn_out); cudaFree(batch_->gate_buf);
+        cudaFree(batch_->up_buf); cudaFree(batch_->logits);
+        cudaFree(batch_->attn_scores); cudaFree(batch_->dequant_scratch);
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            cudaFree(batch_->kv_keys[i]);
+            cudaFree(batch_->kv_values[i]);
+        }
+        cudaFree(batch_->d_positions); cudaFree(batch_->d_tokens);
+        cudaFree(batch_->d_randoms);
+        delete[] batch_->h_positions; delete[] batch_->h_tokens;
+        delete[] batch_->h_finished; delete[] batch_->h_randoms;
+        delete batch_;
+    }
 }
 
 // ============================================================================

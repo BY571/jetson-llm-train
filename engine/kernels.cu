@@ -1119,12 +1119,21 @@ __global__ void qk_norm_batch_kernel(
         float v = __half2float(data[i]);
         sum_sq += v * v;
     }
+    // Full cross-warp reduction (was broken: only captured warp 0)
     for (int off = warpSize/2; off > 0; off /= 2)
         sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, off);
-    __shared__ float s_val;
-    if (threadIdx.x == 0) s_val = sum_sq;
+    __shared__ float s_reduce[32];
+    int wid = threadIdx.x / warpSize, lid = threadIdx.x % warpSize;
+    if (lid == 0) s_reduce[wid] = sum_sq;
     __syncthreads();
-    float rms = rsqrtf(s_val / head_dim + eps);
+    if (wid == 0) {
+        sum_sq = (lid < (blockDim.x + warpSize - 1) / warpSize) ? s_reduce[lid] : 0.0f;
+        for (int off = warpSize/2; off > 0; off /= 2)
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, off);
+        if (lid == 0) s_reduce[0] = sum_sq;
+    }
+    __syncthreads();
+    float rms = rsqrtf(s_reduce[0] / head_dim + eps);
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
         data[i] = __float2half(__half2float(data[i]) * rms * __half2float(w[i]));
 }
@@ -1399,7 +1408,7 @@ void launch_qk_norm_batch(half* q, half* k, const half* qw, const half* kw, int 
     qk_norm_batch_kernel<<<G * (nq + nkv), 128, 0, s>>>(q, k, qw, kw, nq, nkv, hd, G, eps);
 }
 void launch_rope_batch(half* q, half* k, const half* ct, const half* st, const int* pos, int msl, int G, cudaStream_t s) {
-    rope_batch_kernel<<<G, 64, 0, s>>>(q, k, ct, st, pos, msl, G);
+    rope_batch_kernel<<<G, 256, 0, s>>>(q, k, ct, st, pos, msl, G);
 }
 void launch_kv_cache_write_batch(half* ck, half* cv, const half* k, const half* v, const int* pos, int msl, int G, cudaStream_t s) {
     kv_cache_write_batch_kernel<<<G, 256, 0, s>>>(ck, cv, k, v, pos, msl, G);
