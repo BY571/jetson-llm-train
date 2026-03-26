@@ -496,49 +496,38 @@ void launch_q4l_dp4a_gemv(
 // Q4L dequantization: packed uint8 + scales -> fp16 (for batched GEMM path)
 // ============================================================================
 
-__global__ void dequant_q4l_kernel(
-    half* __restrict__ out,           // (out_dim, in_dim) fp16 row-major
-    const uint8_t* __restrict__ data, // packed Q4L (dp4a layout)
-    const float* __restrict__ scales, // (n_blocks,) per-64-element
+// Dequant to fp32 for precision (fp16 truncates the per-block scale)
+__global__ void dequant_q4l_fp32_kernel(
+    float* __restrict__ out,          // (out_dim, in_dim) fp32 row-major
+    const uint8_t* __restrict__ data,
+    const float* __restrict__ scales,
     int out_dim, int in_dim
 ) {
-    // Each thread dequantizes one byte (2 elements in dp4a packing)
     int bytes_total = out_dim * in_dim / 2;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= bytes_total) return;
 
     uint8_t packed = data[idx];
-    // dp4a packing: within each 4-byte group, lo nibbles = first 4 elems, hi = next 4
-    // But for dequant to row-major fp16, we need to map byte positions to element positions
-    // Byte position within a 4-byte group: idx % 4
-    // Group index: idx / 4
-    // Elements: group*8 + byte_in_group (lo nibble), group*8 + byte_in_group + 4 (hi nibble)
     int group = idx / 4;
     int byte_in_group = idx % 4;
     int elem_lo = group * 8 + byte_in_group;
     int elem_hi = elem_lo + 4;
 
-    // Scale: both elements are in the same 64-element block
-    int row = elem_lo / in_dim;
-    int col_lo = elem_lo % in_dim;
-    int block_idx = (row * in_dim + col_lo) / 64;
+    int block_idx = elem_lo / 64;
     float scale = scales[block_idx];
 
-    float val_lo = ((float)(packed & 0x0F) - 8.0f) * scale;
-    float val_hi = ((float)(packed >> 4) - 8.0f) * scale;
-
-    out[elem_lo] = __float2half(val_lo);
-    out[elem_hi] = __float2half(val_hi);
+    out[elem_lo] = ((float)(packed & 0x0F) - 8.0f) * scale;
+    out[elem_hi] = ((float)(packed >> 4) - 8.0f) * scale;
 }
 
 void launch_dequant_q4l(
-    half* out, const uint8_t* data, const float* scales,
+    float* out, const uint8_t* data, const float* scales,
     int out_dim, int in_dim, cudaStream_t stream
 ) {
     int bytes_total = out_dim * in_dim / 2;
     int threads = 256;
     int blocks = (bytes_total + threads - 1) / threads;
-    dequant_q4l_kernel<<<blocks, threads, 0, stream>>>(
+    dequant_q4l_fp32_kernel<<<blocks, threads, 0, stream>>>(
         out, data, scales, out_dim, in_dim);
 }
 

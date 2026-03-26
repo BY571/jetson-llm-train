@@ -193,8 +193,8 @@ struct BatchState {
     half* kv_keys[qwen3::NUM_LAYERS];
     half* kv_values[qwen3::NUM_LAYERS];
 
-    // Q4L dequant scratch (largest projection = INTERMEDIATE_SIZE * HIDDEN_SIZE)
-    half* dequant_scratch;
+    // Q4L dequant scratch in fp32 (largest projection = INTERMEDIATE_SIZE * HIDDEN_SIZE)
+    float* dequant_scratch;
 
     // Per-sequence state
     int* h_positions;   // host (G,)

@@ -105,7 +105,7 @@ extern "C" {
     void launch_q4l_fused_3(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const uint8_t* c_w, const float* c_abs, half* c_out, int c_dim, const half* input, int in_dim, cudaStream_t stream);
     void launch_quantize_input_q8(const half* input, int8_t* q8_data, float* q8_scales, float* q8_sums, int dim, cudaStream_t stream);
     void launch_q4l_dp4a_gemv(const uint8_t* w, const float* w_scales, const int8_t* q8, const float* q8_sc, const float* q8_sm, half* y, int out_dim, int in_dim, cudaStream_t stream);
-    void launch_dequant_q4l(half* out, const uint8_t* data, const float* scales, int out_dim, int in_dim, cudaStream_t stream);
+    void launch_dequant_q4l(float* out, const uint8_t* data, const float* scales, int out_dim, int in_dim, cudaStream_t stream);
 
     // Batched kernel launchers
     void launch_embed_batch(half* h, const half* et, const int* tok, int G, cudaStream_t s);
@@ -990,8 +990,8 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     cudaMalloc(&batch_->up_buf, INTERMEDIATE_SIZE * G * sizeof(half));
     cudaMalloc(&batch_->logits, VOCAB_SIZE * G * sizeof(float));
     cudaMalloc(&batch_->attn_scores, G * NUM_HEADS * max_seq_len * sizeof(float));
-    // Dequant scratch: largest projection
-    cudaMalloc(&batch_->dequant_scratch, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half));
+    // Dequant scratch in fp32 (largest projection)
+    cudaMalloc(&batch_->dequant_scratch, (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float));
     // KV caches
     for (int i = 0; i < NUM_LAYERS; i++) {
         cudaMalloc(&batch_->kv_keys[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half));
@@ -1025,11 +1025,18 @@ void InferenceEngine::batch_gemm(half* out, const half* weight, const half* in,
 
 void InferenceEngine::batch_gemm_q4l(half* out, const NF4Weight& w, const half* in,
                                       int N, cudaStream_t stream) {
+    // Dequant Q4L to fp32 (fp16 truncated per-block scale, causing quality loss)
     launch_dequant_q4l(batch_->dequant_scratch, w.data, w.absmax,
                        w.out_dim, w.in_dim, stream);
-    // Dequant produces row-major fp16, cuBLAS expects col-major = row-major transposed
-    // Weight was (out_dim, in_dim) row-major, dequant is same layout
-    batch_gemm(out, batch_->dequant_scratch, in, w.out_dim, N, w.in_dim, stream);
+    // GEMM: fp32 weight × fp16 input → fp16 output, fp32 accumulation
+    ensure_cublas();
+    float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                 w.out_dim, N, w.in_dim, &alpha,
+                 batch_->dequant_scratch, CUDA_R_32F, w.in_dim,
+                 in, CUDA_R_16F, w.in_dim,
+                 &beta, out, CUDA_R_16F, w.out_dim,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t stream) {
