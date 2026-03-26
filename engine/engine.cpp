@@ -208,6 +208,7 @@ InferenceEngine::InferenceEngine(int max_seq_len) {
     // Zero-init weights
     memset(&weights_, 0, sizeof(weights_));
     batch_ = nullptr;
+}
 
 InferenceEngine::~InferenceEngine() {
     for (int i = 0; i < NUM_LAYERS; i++) {
