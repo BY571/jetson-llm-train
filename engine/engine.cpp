@@ -300,6 +300,11 @@ void InferenceEngine::forward_layer(int layer_idx) {
                          state_.residual, norm_out,
                          HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
+    if (debug_mode && layer_idx == 0) {
+        cudaDeviceSynchronize();
+        fprintf(stderr, "[S] L0 norm: "); dump_half("n", norm_out, 8);
+    }
+
     // Quantize input to int8 for dp4a
     if (weights_.is_q4l) {
         launch_quantize_input_q8(norm_out, state_.q8_data, state_.q8_scales,
