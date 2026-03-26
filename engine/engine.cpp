@@ -158,6 +158,10 @@ InferenceEngine::InferenceEngine(int max_seq_len) {
     cudaMallocTyped(&state_.d_token_id, sizeof(int));
     cudaMallocTyped(&state_.d_pos, sizeof(int));
 
+    // Pinned host memory for async graph control updates
+    cudaHostAlloc(&h_token_id_pinned_, sizeof(int), cudaHostAllocDefault);
+    cudaHostAlloc(&h_pos_pinned_, sizeof(int), cudaHostAllocDefault);
+
     // Zero-init weights
     memset(&weights_, 0, sizeof(weights_));
 }
@@ -473,8 +477,9 @@ void InferenceEngine::enable_cuda_graph() {
     cudaStreamEndCapture(graph_stream_, &cuda_graph_);
     cudaGraphInstantiate(&cuda_graph_exec_, cuda_graph_, nullptr, nullptr, 0);
 
-    // Restore cuBLAS to default stream
-    cublasSetStream(cublas_handle, 0);
+    // Keep cuBLAS on graph_stream_ for replay (LM head + fp16 projections)
+    // This ensures cuBLAS operations are part of the graph replay
+    // (cuBLAS stream is NOT restored to 0 — all ops use graph_stream_ when graph is active)
 
     graph_captured_ = true;
     use_cuda_graph_ = true;
@@ -490,14 +495,19 @@ void InferenceEngine::decode_graph(int token_id) {
         enable_cuda_graph();
     }
 
-    // Update device-side control values
-    cudaMemcpy(state_.d_token_id, &token_id, sizeof(int), cudaMemcpyHostToDevice);
-    int pos = state_.current_pos;
-    cudaMemcpy(state_.d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice);
+    // Async update device-side control values via pinned memory
+    // (pinned memory ensures cudaMemcpyAsync is truly async)
+    *h_token_id_pinned_ = token_id;
+    *h_pos_pinned_ = state_.current_pos;
+    cudaMemcpyAsync(state_.d_token_id, h_token_id_pinned_, sizeof(int),
+                    cudaMemcpyHostToDevice, graph_stream_);
+    cudaMemcpyAsync(state_.d_pos, h_pos_pinned_, sizeof(int),
+                    cudaMemcpyHostToDevice, graph_stream_);
 
-    // Replay the captured graph
+    // Replay the captured graph (all on graph_stream_, fully pipelined)
     cudaGraphLaunch(cuda_graph_exec_, graph_stream_);
-    cudaStreamSynchronize(graph_stream_);
+    // NO sync here — let GPU run while CPU prepares next token
+    // Sync happens in sample_gpu() when reading the result
 
     state_.current_pos++;
 }
@@ -548,7 +558,11 @@ void InferenceEngine::update_lora_weight(
 }
 
 int InferenceEngine::sample_greedy_gpu() {
-    launch_argmax(state_.logits, state_.sample_result, VOCAB_SIZE, 0);
+    // Use graph_stream_ if CUDA graph is active, otherwise default stream
+    cudaStream_t s = use_cuda_graph_ ? graph_stream_ : 0;
+    launch_argmax(state_.logits, state_.sample_result, VOCAB_SIZE, s);
+    // Sync the specific stream and copy result
+    if (s) cudaStreamSynchronize(s);
     int result;
     cudaMemcpy(&result, state_.sample_result, sizeof(int), cudaMemcpyDeviceToHost);
     return result;
@@ -563,10 +577,15 @@ int InferenceEngine::sample_gpu(float temperature, float top_p) {
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     float r = dist(rng);
 
+    // Use graph_stream_ if CUDA graph is active, otherwise default stream
+    cudaStream_t s = use_cuda_graph_ ? graph_stream_ : 0;
+
     // GPU kernel: temperature + softmax + cumulative sample
     // NOTE: this modifies logits in-place (they become probabilities)
     launch_gpu_sample(state_.logits, state_.sample_result, VOCAB_SIZE,
-                      temperature, r, top_p, 0);
+                      temperature, r, top_p, s);
+    // Sync the specific stream and copy result
+    if (s) cudaStreamSynchronize(s);
     int result;
     cudaMemcpy(&result, state_.sample_result, sizeof(int), cudaMemcpyDeviceToHost);
     return result;
@@ -681,11 +700,10 @@ std::vector<int> InferenceEngine::generate(
     int token = sample_gpu(temperature, top_p);
     std::vector<int> output = {token};
 
-    // CUDA graph currently only works with fp16 weights (NF4+cuBLAS stream mismatch)
-    // TODO: fix graph capture for mixed NF4/cuBLAS layers
-    // if (!graph_captured_ && prompt.size() > 0) {
-    //     enable_cuda_graph();
-    // }
+    // Enable CUDA graph for fast decode replay (works with NF4+cuBLAS mixed layers)
+    if (!graph_captured_ && prompt.size() > 0) {
+        enable_cuda_graph();
+    }
 
     // Decode loop (CUDA graph replay, no Python, all GPU sampling)
     for (int i = 0; i < max_new_tokens - 1; i++) {

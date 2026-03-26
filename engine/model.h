@@ -213,6 +213,10 @@ private:
     bool graph_captured_ = false;
     cudaStream_t graph_stream_ = nullptr;
 
+    // Pinned host memory for async graph control updates
+    int* h_token_id_pinned_ = nullptr;
+    int* h_pos_pinned_ = nullptr;
+
     // Forward pass for one token through one layer
     void forward_layer(int layer_idx);
 
