@@ -999,9 +999,10 @@ void InferenceEngine::batch_gemm(half* out, const half* weight, const half* in,
 
 void InferenceEngine::batch_gemm_q4l(half* out, const NF4Weight& w, const half* in,
                                       int N, cudaStream_t stream) {
-    // Dequantize Q4L to fp16 scratch, then cuBLAS GEMM
     launch_dequant_q4l(batch_->dequant_scratch, w.data, w.absmax,
                        w.out_dim, w.in_dim, stream);
+    // Dequant produces row-major fp16, cuBLAS expects col-major = row-major transposed
+    // Weight was (out_dim, in_dim) row-major, dequant is same layout
     batch_gemm(out, batch_->dequant_scratch, in, w.out_dim, N, w.in_dim, stream);
 }
 
@@ -1015,13 +1016,13 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
                           HIDDEN_SIZE, G, RMS_NORM_EPS, stream);
 
     // 2. QKV projections (GEMM)
-    auto project = [&](half* out, half* fp16w, NF4Weight& nf4w, int out_dim, int in_dim) {
-        if (fp16w) batch_gemm(out, fp16w, B->norm_buf, out_dim, G, in_dim, stream);
-        else batch_gemm_q4l(out, nf4w, B->norm_buf, G, stream);
+    auto project = [&](half* out, half* fp16w, NF4Weight& nf4w, const half* input, int out_dim, int in_dim) {
+        if (fp16w) batch_gemm(out, fp16w, input, out_dim, G, in_dim, stream);
+        else batch_gemm_q4l(out, nf4w, input, G, stream);
     };
-    project(B->q_buf, L.q_proj_fp16, L.q_proj_nf4, Q_DIM, HIDDEN_SIZE);
-    project(B->k_buf, L.k_proj_fp16, L.k_proj_nf4, KV_DIM, HIDDEN_SIZE);
-    project(B->v_buf, L.v_proj_fp16, L.v_proj_nf4, KV_DIM, HIDDEN_SIZE);
+    project(B->q_buf, L.q_proj_fp16, L.q_proj_nf4, B->norm_buf, Q_DIM, HIDDEN_SIZE);
+    project(B->k_buf, L.k_proj_fp16, L.k_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
+    project(B->v_buf, L.v_proj_fp16, L.v_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
 
     // 3. QKNorm + RoPE
     launch_qk_norm_batch(B->q_buf, B->k_buf, L.q_norm, L.k_norm,
@@ -1038,8 +1039,8 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
                                 B->kv_keys[layer_idx], B->kv_values[layer_idx],
                                 B->attn_scores, B->d_positions, B->max_seq_len, G, stream);
 
-    // 6. Output projection
-    project(B->hidden, L.o_proj_fp16, L.o_proj_nf4, HIDDEN_SIZE, Q_DIM);
+    // 6. Output projection (input: attn_out, not norm_buf)
+    project(B->hidden, L.o_proj_fp16, L.o_proj_nf4, B->attn_out, HIDDEN_SIZE, Q_DIM);
 
     // 7. Residual add
     launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * G, stream);
@@ -1049,11 +1050,11 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
     launch_rms_norm_batch(B->norm_buf, B->residual, L.post_attn_layernorm,
                           HIDDEN_SIZE, G, RMS_NORM_EPS, stream);
 
-    // 9. FFN: gate, up, SiLU, down
-    project(B->gate_buf, L.gate_proj_fp16, L.gate_proj_nf4, INTERMEDIATE_SIZE, HIDDEN_SIZE);
-    project(B->up_buf, L.up_proj_fp16, L.up_proj_nf4, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+    // 9. FFN: gate, up (input: norm_buf), SiLU, down (input: gate_buf after SiLU)
+    project(B->gate_buf, L.gate_proj_fp16, L.gate_proj_nf4, B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+    project(B->up_buf, L.up_proj_fp16, L.up_proj_nf4, B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
     launch_silu_mul_batch(B->gate_buf, B->up_buf, INTERMEDIATE_SIZE * G, stream);
-    project(B->hidden, L.down_proj_fp16, L.down_proj_nf4, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+    project(B->hidden, L.down_proj_fp16, L.down_proj_nf4, B->gate_buf, HIDDEN_SIZE, INTERMEDIATE_SIZE);
 
     // 10. Residual add
     launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * G, stream);
