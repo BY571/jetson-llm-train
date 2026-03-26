@@ -35,9 +35,8 @@ __device__ __forceinline__ void nf4_gemv_block(
     const int bytes_per_row = in_dim / 2;
     const int blocks_per_row = in_dim >> 6;  // in_dim / 64
 
-    // Process 4 bytes (8 NF4 values) per iteration when possible
+    // Process 4 bytes (8 NF4 values) per iteration
     const int vec_per_row = bytes_per_row >> 2;  // bytes_per_row / 4
-    const int vec_remainder = bytes_per_row & 3;  // bytes_per_row % 4
 
     for (int r = 0; r < ROWS_PER_BLOCK; r++) {
         int row = first_row + r;
@@ -57,16 +56,9 @@ __device__ __forceinline__ void nf4_gemv_block(
             uint32_t packed4 = __ldg(&row_u32[vi]);
             int base_j = vi << 3;  // vi * 8 (first element index)
 
-            // Absmax: base_j..base_j+7 spans at most 2 blocks (block_size=64)
-            // For the common case (base_j % 64 < 56), all 8 elements share one absmax
-            int blk_idx = base_j >> 6;
-            float scale = __ldg(&absmax[absmax_row_start + blk_idx]);
-
-            // Check if we cross a block boundary (every 8th iteration when aligned)
-            // base_j+6 could be in the next block if base_j % 64 >= 58
-            // Since base_j = vi*8 and 64/8 = 8, boundary crossing happens when vi%8 >= 7
-            // For simplicity and to avoid branch, just use the same scale for all 8
-            // (error is tiny: only the last pair might use wrong scale, ~1/8 of elements)
+            // Absmax: all 8 elements share one absmax (exact, no approximation).
+            // block_size=64, chunk_size=8: 64/8=8 evenly, chunks never cross boundaries.
+            float scale = __ldg(&absmax[absmax_row_start + (base_j >> 6)]);
 
             // Process 4 bytes: extract nibbles, dequant, FMA
             // Byte 0

@@ -101,6 +101,7 @@ extern "C" {
     void launch_nf4_fused_2(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const half* input, int in_dim, cudaStream_t stream);
     void launch_nf4_fused_3(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const uint8_t* c_w, const float* c_abs, half* c_out, int c_dim, const half* input, int in_dim, cudaStream_t stream);
     void launch_rms_norm(const half* input, const half* weight, half* output, int dim, float eps, cudaStream_t stream);
+    void launch_copy_rms_norm(const half* input, const half* weight, half* residual, half* norm_out, int dim, float eps, cudaStream_t stream);
     void launch_qk_norm(half* q, half* k, const half* q_weight, const half* k_weight, int num_q_heads, int num_kv_heads, int head_dim, float eps, cudaStream_t stream);
     void launch_rope(half* q, half* k, const half* cos_table, const half* sin_table, int pos, int max_seq_len, cudaStream_t stream);
     void launch_gqa_attention(const half* q, const half* k_cache, const half* v_cache, half* output, float* attn_scratch, int pos, int max_seq_len, cudaStream_t stream);
@@ -238,22 +239,11 @@ void InferenceEngine::forward_layer(int layer_idx) {
     auto& kv = state_.kv_cache[layer_idx];
     cudaStream_t stream = 0; // default stream
 
-    // 1. Input LayerNorm
-    launch_rms_norm(state_.hidden, layer.input_layernorm, state_.residual,
-                    HIDDEN_SIZE, RMS_NORM_EPS, stream);
-    // After norm: residual = norm(hidden), hidden = original (for residual add later)
-    // Wait, we need to save hidden for residual. Let's swap:
-    // Actually: residual should store the original hidden for the add later.
-    // Let me restructure: norm writes to a temp, we use hidden as residual.
-
-    // Save hidden as residual
-    cudaMemcpyAsync(state_.residual, state_.hidden, HIDDEN_SIZE * sizeof(half),
-                     cudaMemcpyDeviceToDevice, stream);
-
-    // Norm into hidden (reuse buffer)
-    half* norm_out = state_.ffn_out; // temporary borrow
-    launch_rms_norm(state_.residual, layer.input_layernorm, norm_out,
-                    HIDDEN_SIZE, RMS_NORM_EPS, stream);
+    // 1. Input LayerNorm: copy hidden → residual AND normalize → norm_out (1 kernel)
+    half* norm_out = state_.ffn_out;
+    launch_copy_rms_norm(state_.hidden, layer.input_layernorm,
+                         state_.residual, norm_out,
+                         HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
     // 2. QKV projections — fused when all 3 are NF4 (1 launch instead of 3)
     if (!layer.q_proj_fp16 && !layer.k_proj_fp16 && !layer.v_proj_fp16) {
@@ -301,11 +291,10 @@ void InferenceEngine::forward_layer(int layer_idx) {
     // 7. Residual add (hidden += residual)
     launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
 
-    // 8. Post-attention LayerNorm
-    cudaMemcpyAsync(state_.residual, state_.hidden, HIDDEN_SIZE * sizeof(half),
-                     cudaMemcpyDeviceToDevice, stream);
-    launch_rms_norm(state_.residual, layer.post_attn_layernorm, norm_out,
-                    HIDDEN_SIZE, RMS_NORM_EPS, stream);
+    // 8. Post-attention LayerNorm: copy hidden → residual AND normalize → norm_out
+    launch_copy_rms_norm(state_.hidden, layer.post_attn_layernorm,
+                         state_.residual, norm_out,
+                         HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
     // 9. FFN: fused gate+up when both NF4 (1 launch instead of 2)
     if (!layer.gate_proj_fp16 && !layer.up_proj_fp16) {
@@ -407,8 +396,8 @@ std::vector<std::pair<std::string, float>> InferenceEngine::profile_decode(int t
 
         // Norm + residual save
         timed("norm+copy", [&]{
-            cudaMemcpyAsync(state_.residual, state_.hidden, HIDDEN_SIZE * sizeof(half), cudaMemcpyDeviceToDevice, stream);
-            launch_rms_norm(state_.residual, layer.input_layernorm, norm_out, HIDDEN_SIZE, RMS_NORM_EPS, stream);
+            launch_copy_rms_norm(state_.hidden, layer.input_layernorm,
+                                state_.residual, norm_out, HIDDEN_SIZE, RMS_NORM_EPS, stream);
         });
 
         // QKV
@@ -444,8 +433,8 @@ std::vector<std::pair<std::string, float>> InferenceEngine::profile_decode(int t
         // Residual + norm
         timed("res+norm2", [&]{
             launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
-            cudaMemcpyAsync(state_.residual, state_.hidden, HIDDEN_SIZE * sizeof(half), cudaMemcpyDeviceToDevice, stream);
-            launch_rms_norm(state_.residual, layer.post_attn_layernorm, norm_out, HIDDEN_SIZE, RMS_NORM_EPS, stream);
+            launch_copy_rms_norm(state_.hidden, layer.post_attn_layernorm,
+                                state_.residual, norm_out, HIDDEN_SIZE, RMS_NORM_EPS, stream);
         });
 
         // Gate+Up
@@ -518,12 +507,10 @@ void InferenceEngine::forward_layer_graph(int layer_idx, cudaStream_t stream) {
     auto& layer = weights_.layers[layer_idx];
     auto& kv = state_.kv_cache[layer_idx];
 
-    // Save hidden as residual
-    cudaMemcpyAsync(state_.residual, state_.hidden, HIDDEN_SIZE * sizeof(half),
-                     cudaMemcpyDeviceToDevice, stream);
+    // Fused: copy hidden → residual AND RMSNorm → norm_out
     half* norm_out = state_.ffn_out;
-    launch_rms_norm(state_.residual, layer.input_layernorm, norm_out,
-                    HIDDEN_SIZE, RMS_NORM_EPS, stream);
+    launch_copy_rms_norm(state_.hidden, layer.input_layernorm,
+                         state_.residual, norm_out, HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
     // QKV projections — fused when all 3 are NF4
     if (!layer.q_proj_fp16 && !layer.k_proj_fp16 && !layer.v_proj_fp16) {
@@ -566,11 +553,9 @@ void InferenceEngine::forward_layer_graph(int layer_idx, cudaStream_t stream) {
     // Residual add
     launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
 
-    // Post-attention norm + FFN
-    cudaMemcpyAsync(state_.residual, state_.hidden, HIDDEN_SIZE * sizeof(half),
-                     cudaMemcpyDeviceToDevice, stream);
-    launch_rms_norm(state_.residual, layer.post_attn_layernorm, norm_out,
-                    HIDDEN_SIZE, RMS_NORM_EPS, stream);
+    // Post-attention: copy hidden → residual AND RMSNorm → norm_out
+    launch_copy_rms_norm(state_.hidden, layer.post_attn_layernorm,
+                         state_.residual, norm_out, HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
     // Gate + Up — fused when both NF4
     if (!layer.gate_proj_fp16 && !layer.up_proj_fp16) {

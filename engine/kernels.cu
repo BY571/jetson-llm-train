@@ -225,6 +225,48 @@ __global__ void rms_norm_kernel(
     }
 }
 
+// Fused: copy input → residual AND RMSNorm(input) → norm_out in one kernel.
+// Replaces cudaMemcpyAsync + launch_rms_norm (2 ops → 1 kernel).
+__global__ void copy_rms_norm_kernel(
+    const half* __restrict__ input,    // read once: hidden state
+    const half* __restrict__ weight,   // norm weights
+    half* __restrict__ residual,       // output: copy of input (for residual add later)
+    half* __restrict__ norm_out,       // output: RMSNorm(input)
+    int dim, float eps
+) {
+    // Pass 1: copy input → residual AND compute sum of squares
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        half val_h = input[i];
+        residual[i] = val_h;  // copy
+        float val = __half2float(val_h);
+        sum_sq += val * val;
+    }
+
+    // Reduction (same as rms_norm_kernel)
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    __shared__ float shared[32];
+    int warp_id = threadIdx.x / warpSize;
+    int lane_id = threadIdx.x % warpSize;
+    if (lane_id == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+    if (warp_id == 0) {
+        sum_sq = (lane_id < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane_id] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset /= 2)
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+        if (lane_id == 0) shared[0] = sum_sq;
+    }
+    __syncthreads();
+    float rms = rsqrtf(shared[0] / dim + eps);
+
+    // Pass 2: normalize and scale
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float val = __half2float(input[i]) * rms;
+        norm_out[i] = __float2half(val * __half2float(weight[i]));
+    }
+}
+
 // ============================================================================
 // Kernel 2b: Fused QKNorm (RMSNorm applied per-head to Q and K)
 // ============================================================================
@@ -829,6 +871,14 @@ void launch_rms_norm(
     cudaStream_t stream
 ) {
     rms_norm_kernel<<<1, 256, 0, stream>>>(input, weight, output, dim, eps);
+}
+
+void launch_copy_rms_norm(
+    const half* input, const half* weight,
+    half* residual, half* norm_out,
+    int dim, float eps, cudaStream_t stream
+) {
+    copy_rms_norm_kernel<<<1, 256, 0, stream>>>(input, weight, residual, norm_out, dim, eps);
 }
 
 void launch_qk_norm(
