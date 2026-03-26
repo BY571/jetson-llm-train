@@ -985,16 +985,16 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
 void InferenceEngine::batch_gemm(half* out, const half* weight, const half* in,
                                   int M, int N, int K, cudaStream_t stream) {
     ensure_cublas();
-    // weight is (M, K) row-major = (K, M) col-major
-    // in is (K, N) col-major (already correct)
-    // out is (M, N) col-major
-    __half alpha = __float2half(1.0f), beta = __float2half(0.0f);
+    // weight is (M, K) row-major = (K, M) col-major for cuBLAS
+    // in is (K, N) col-major, out is (M, N) col-major
+    // Use fp32 accumulation for precision (fp16 loses accuracy for K=1024+)
+    float alpha = 1.0f, beta = 0.0f;
     cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
                  M, N, K, &alpha,
-                 weight, CUDA_R_16F, K,   // A^T: (K,M) -> (M,K)
-                 in, CUDA_R_16F, K,       // B: (K,N)
-                 &beta, out, CUDA_R_16F, M,  // C: (M,N)
-                 CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                 weight, CUDA_R_16F, K,
+                 in, CUDA_R_16F, K,
+                 &beta, out, CUDA_R_16F, M,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 void InferenceEngine::batch_gemm_q4l(half* out, const NF4Weight& w, const half* in,
