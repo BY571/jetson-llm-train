@@ -312,6 +312,12 @@ void InferenceEngine::forward_layer(int layer_idx) {
 // ============================================================================
 
 void InferenceEngine::decode(int token_id) {
+    // Use CUDA graph if captured (eliminates kernel launch overhead)
+    if (use_cuda_graph_ && graph_captured_) {
+        decode_graph(token_id);
+        return;
+    }
+
     cudaStream_t stream = 0;
 
     // Embedding lookup
