@@ -105,7 +105,7 @@ extern "C" {
     void launch_q4l_fused_3(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const uint8_t* c_w, const float* c_abs, half* c_out, int c_dim, const half* input, int in_dim, cudaStream_t stream);
     void launch_quantize_input_q8(const half* input, int8_t* q8_data, float* q8_scales, float* q8_sums, int dim, cudaStream_t stream);
     void launch_q4l_dp4a_gemv(const uint8_t* w, const float* w_scales, const int8_t* q8, const float* q8_sc, const float* q8_sm, half* y, int out_dim, int in_dim, cudaStream_t stream);
-    void launch_dequant_q4l(float* out, const uint8_t* data, const float* scales, int out_dim, int in_dim, cudaStream_t stream);
+    void launch_dequant_q4l(half* out, const uint8_t* data, const float* scales, int out_dim, int in_dim, cudaStream_t stream);
 
     // Batched kernel launchers
     void launch_embed_batch(half* h, const half* et, const int* tok, int G, cudaStream_t s);
@@ -990,8 +990,8 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     cudaMalloc(&batch_->up_buf, INTERMEDIATE_SIZE * G * sizeof(half));
     cudaMalloc(&batch_->logits, VOCAB_SIZE * G * sizeof(float));
     cudaMalloc(&batch_->attn_scores, G * NUM_HEADS * max_seq_len * sizeof(float));
-    // Dequant scratch in fp32 (largest projection)
-    cudaMalloc(&batch_->dequant_scratch, (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float));
+    // Dequant scratch fp16 (largest projection)
+    cudaMalloc(&batch_->dequant_scratch, (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half));
     // KV caches
     for (int i = 0; i < NUM_LAYERS; i++) {
         cudaMalloc(&batch_->kv_keys[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half));
@@ -1025,28 +1025,12 @@ void InferenceEngine::batch_gemm(half* out, const half* weight, const half* in,
 
 void InferenceEngine::batch_gemm_q4l(half* out, const NF4Weight& w, const half* in,
                                       int N, cudaStream_t stream) {
-    // Dequant Q4L to fp32, then convert to fp16 for batch_gemm
+    // Dequant Q4L to fp16 scratch, then use standard fp16 GEMM
+    // (fp32 mixed-type GEMM is CUBLAS_STATUS_NOT_SUPPORTED on Jetson Orin)
     launch_dequant_q4l(batch_->dequant_scratch, w.data, w.absmax,
                        w.out_dim, w.in_dim, stream);
-    // Convert fp32 → fp16 in-place (reinterpret buffer as half*)
-    // Use separate kernel since fp32 is 2x the size
-    launch_fp16_to_fp32(nullptr, nullptr, 0, stream); // dummy - need fp32_to_fp16
-    // Actually, just use the fp16 version of batch_gemm with cast
-    // For now: simple approach — use cuBLAS with all fp32
-    ensure_cublas();
-    float alpha = 1.0f, beta = 0.0f;
-    // Convert input fp16 to fp32 temporarily? No, too complex.
-    // Use the fp32-weight path with fp32 accumulation:
-    cublasStatus_t status = cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                 w.out_dim, N, w.in_dim, &alpha,
-                 batch_->dequant_scratch, CUDA_R_32F, w.in_dim,
-                 in, CUDA_R_16F, w.in_dim,
-                 &beta, out, CUDA_R_16F, w.out_dim,
-                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "cuBLAS GEMM error: %d (M=%d N=%d K=%d)\n",
-                (int)status, w.out_dim, N, w.in_dim);
-    }
+    batch_gemm(out, (const half*)batch_->dequant_scratch, in,
+               w.out_dim, N, w.in_dim, stream);
 }
 
 void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t stream) {

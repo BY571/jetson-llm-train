@@ -496,9 +496,9 @@ void launch_q4l_dp4a_gemv(
 // Q4L dequantization: packed uint8 + scales -> fp16 (for batched GEMM path)
 // ============================================================================
 
-// Dequant to fp32 for precision (fp16 truncates the per-block scale)
-__global__ void dequant_q4l_fp32_kernel(
-    float* __restrict__ out,          // (out_dim, in_dim) fp32 row-major
+// Dequant Q4L to fp16 for batched GEMM
+__global__ void dequant_q4l_kernel(
+    half* __restrict__ out,
     const uint8_t* __restrict__ data,
     const float* __restrict__ scales,
     int out_dim, int in_dim
@@ -516,18 +516,18 @@ __global__ void dequant_q4l_fp32_kernel(
     int block_idx = elem_lo / 64;
     float scale = scales[block_idx];
 
-    out[elem_lo] = ((float)(packed & 0x0F) - 8.0f) * scale;
-    out[elem_hi] = ((float)(packed >> 4) - 8.0f) * scale;
+    out[elem_lo] = __float2half(((float)(packed & 0x0F) - 8.0f) * scale);
+    out[elem_hi] = __float2half(((float)(packed >> 4) - 8.0f) * scale);
 }
 
 void launch_dequant_q4l(
-    float* out, const uint8_t* data, const float* scales,
+    half* out, const uint8_t* data, const float* scales,
     int out_dim, int in_dim, cudaStream_t stream
 ) {
     int bytes_total = out_dim * in_dim / 2;
     int threads = 256;
     int blocks = (bytes_total + threads - 1) / threads;
-    dequant_q4l_fp32_kernel<<<blocks, threads, 0, stream>>>(
+    dequant_q4l_kernel<<<blocks, threads, 0, stream>>>(
         out, data, scales, out_dim, in_dim);
 }
 
