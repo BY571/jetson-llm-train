@@ -245,4 +245,8 @@ private:
 
     // FFN: gate * silu(up) then down
     void ffn(int layer_idx);
+
+public:
+    // Profile one decode step: returns vector of (name, time_us) pairs
+    std::vector<std::pair<std::string, float>> profile_decode(int token_id);
 };

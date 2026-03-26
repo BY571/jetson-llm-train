@@ -79,5 +79,14 @@ PYBIND11_MODULE(jetson_engine, m) {
                 self.prefill(tokens.data(), tokens.size());
              },
              py::arg("token_ids"),
-             "Process prompt tokens (prefill phase)");
+             "Process prompt tokens (prefill phase)")
+
+        .def("profile_decode", [](InferenceEngine& self, int token_id) {
+                 auto result = self.profile_decode(token_id);
+                 py::dict d;
+                 for (auto& [name, us] : result) d[py::cast(name)] = us;
+                 return d;
+             },
+             py::arg("token_id"),
+             "Profile one decode step, returns dict of {operation: time_us}");
 }
