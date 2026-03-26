@@ -26,7 +26,7 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 
 # Build the CUDA kernels as a static library
-add_library(kernels STATIC kernels.cu)
+add_library(kernels STATIC kernels.cu nf4_gemv_fast.cu)
 target_include_directories(kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
 set_target_properties(kernels PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
