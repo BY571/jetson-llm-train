@@ -113,8 +113,8 @@ def main():
         mask_truncated_completions=MASK_TRUNCATED,
         fp16=True, bf16=False,
         gradient_checkpointing=GRADIENT_CHECKPOINTING,
-        # TRL speed optimizations (give TRL every advantage)
-        num_iterations=2,           # reuse generations for 2 gradient steps
+        # TRL speed optimizations (fair: same algorithm, just faster execution)
+        num_iterations=1,            # standard GRPO: generate once, train once
         log_completions=False,       # skip string processing overhead
         disable_dropout=True,        # fewer ops per forward pass
         logging_steps=1,
