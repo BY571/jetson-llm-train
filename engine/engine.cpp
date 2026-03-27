@@ -1086,32 +1086,32 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     batch_->G = G;
     batch_->max_seq_len = max_seq_len;
 
-    CUDA_CHECK(cudaMalloc(&batch_->hidden, HIDDEN_SIZE * G * sizeof(half));
-    CUDA_CHECK(cudaMalloc(&batch_->residual, HIDDEN_SIZE * G * sizeof(half));
-    CUDA_CHECK(cudaMalloc(&batch_->norm_buf, HIDDEN_SIZE * G * sizeof(half));
-    CUDA_CHECK(cudaMalloc(&batch_->q_buf, Q_DIM * G * sizeof(half));
-    CUDA_CHECK(cudaMalloc(&batch_->k_buf, KV_DIM * G * sizeof(half));
-    CUDA_CHECK(cudaMalloc(&batch_->v_buf, KV_DIM * G * sizeof(half));
-    CUDA_CHECK(cudaMalloc(&batch_->attn_out, Q_DIM * G * sizeof(half));
-    CUDA_CHECK(cudaMalloc(&batch_->gate_buf, INTERMEDIATE_SIZE * G * sizeof(half));
-    CUDA_CHECK(cudaMalloc(&batch_->up_buf, INTERMEDIATE_SIZE * G * sizeof(half));
-    CUDA_CHECK(cudaMalloc(&batch_->logits, VOCAB_SIZE * G * sizeof(float));
-    CUDA_CHECK(cudaMalloc(&batch_->attn_scores, G * NUM_HEADS * max_seq_len * sizeof(float));
+    CUDA_CHECK(cudaMalloc(&batch_->hidden, HIDDEN_SIZE * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->residual, HIDDEN_SIZE * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->norm_buf, HIDDEN_SIZE * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->q_buf, Q_DIM * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->k_buf, KV_DIM * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->v_buf, KV_DIM * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->attn_out, Q_DIM * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->gate_buf, INTERMEDIATE_SIZE * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->up_buf, INTERMEDIATE_SIZE * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->logits, VOCAB_SIZE * G * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&batch_->attn_scores, G * NUM_HEADS * max_seq_len * sizeof(float)));
     // Dequant scratch fp16 (largest projection)
-    CUDA_CHECK(cudaMalloc(&batch_->dequant_scratch, (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half));
+    CUDA_CHECK(cudaMalloc(&batch_->dequant_scratch, (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half)));
     // KV caches
     for (int i = 0; i < NUM_LAYERS; i++) {
-        CUDA_CHECK(cudaMalloc(&batch_->kv_keys[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half));
-        CUDA_CHECK(cudaMalloc(&batch_->kv_values[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half));
+        CUDA_CHECK(cudaMalloc(&batch_->kv_keys[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&batch_->kv_values[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half)));
     }
     // Per-sequence state
     batch_->h_positions = new int[G]();
-    CUDA_CHECK(cudaMalloc(&batch_->d_positions, G * sizeof(int));
+    CUDA_CHECK(cudaMalloc(&batch_->d_positions, G * sizeof(int)));
     batch_->h_tokens = new int[G]();
-    CUDA_CHECK(cudaMalloc(&batch_->d_tokens, G * sizeof(int));
+    CUDA_CHECK(cudaMalloc(&batch_->d_tokens, G * sizeof(int)));
     batch_->h_finished = new bool[G]();
     batch_->h_randoms = new float[G]();
-    CUDA_CHECK(cudaMalloc(&batch_->d_randoms, G * sizeof(float));
+    CUDA_CHECK(cudaMalloc(&batch_->d_randoms, G * sizeof(float)));
 
     std::cout << "  Batch allocated: G=" << G << " max_seq=" << max_seq_len
               << " KV=" << (G * max_seq_len * KV_DIM * 2 * NUM_LAYERS * 2 / 1e6) << "MB" << std::endl;
