@@ -774,10 +774,12 @@ __global__ void gpu_sample_kernel(
     }
     __syncthreads();
 
-    // Step 4: Top-p nucleus sampling (correct: sort by probability, not index)
+    // Step 4: Top-p nucleus sampling
+    // Strategy: collect top-K candidates by probability, sort them,
+    // then sample from the nucleus. K=512 covers any reasonable top_p.
     if (threadIdx.x == 0) {
         if (top_p >= 1.0f) {
-            // No top-p filtering, just sample from full distribution
+            // No filtering, sample from full distribution
             float cum = 0.0f;
             for (int i = 0; i < vocab_size; i++) {
                 cum += logits[i];
@@ -785,34 +787,59 @@ __global__ void gpu_sample_kernel(
             }
             *result = vocab_size - 1;
         } else {
-            // Top-p: find probability threshold via binary search,
-            // then sample only from tokens above threshold.
-            // Binary search: find min_prob such that sum(p >= min_prob) >= top_p
-            float lo = 0.0f, hi = 1.0f;
-            for (int iter = 0; iter < 20; iter++) {  // 20 iters = 1e-6 precision
-                float mid = (lo + hi) * 0.5f;
-                float mass = 0.0f;
-                for (int i = 0; i < vocab_size; i++)
-                    if (logits[i] >= mid) mass += logits[i];
-                if (mass >= top_p) lo = mid;
-                else hi = mid;
-            }
-            float min_prob = lo;
+            // Collect top-K by probability using a min-heap of size K
+            const int K = 512;
+            float top_probs[K];
+            int top_ids[K];
+            int n = 0;
 
-            // Compute nucleus mass and sample within it
+            for (int i = 0; i < vocab_size; i++) {
+                float p = logits[i];
+                if (n < K) {
+                    // Fill heap
+                    top_probs[n] = p; top_ids[n] = i; n++;
+                    // Bubble up (insertion sort since K is small)
+                    for (int j = n-1; j > 0 && top_probs[j] < top_probs[j-1]; j--) {
+                        float tp = top_probs[j]; top_probs[j] = top_probs[j-1]; top_probs[j-1] = tp;
+                        int ti = top_ids[j]; top_ids[j] = top_ids[j-1]; top_ids[j-1] = ti;
+                    }
+                } else if (p > top_probs[0]) {
+                    // Replace min element
+                    top_probs[0] = p; top_ids[0] = i;
+                    // Sift down
+                    for (int j = 0; j < n-1 && top_probs[j] < top_probs[j+1]; j++) {
+                        float tp = top_probs[j]; top_probs[j] = top_probs[j+1]; top_probs[j+1] = tp;
+                        int ti = top_ids[j]; top_ids[j] = top_ids[j+1]; top_ids[j+1] = ti;
+                    }
+                }
+            }
+
+            // Sort descending (insertion sort, K=512 is fast)
+            for (int i = 1; i < n; i++) {
+                float p = top_probs[i]; int id = top_ids[i];
+                int j = i - 1;
+                while (j >= 0 && top_probs[j] < p) {
+                    top_probs[j+1] = top_probs[j]; top_ids[j+1] = top_ids[j]; j--;
+                }
+                top_probs[j+1] = p; top_ids[j+1] = id;
+            }
+
+            // Accumulate until top_p, then sample within nucleus
             float nucleus_mass = 0.0f;
-            for (int i = 0; i < vocab_size; i++)
-                if (logits[i] >= min_prob) nucleus_mass += logits[i];
+            int nucleus_size = 0;
+            for (int i = 0; i < n; i++) {
+                nucleus_mass += top_probs[i];
+                nucleus_size++;
+                if (nucleus_mass >= top_p) break;
+            }
 
             float threshold = random_val * nucleus_mass;
             float cum = 0.0f;
-            for (int i = 0; i < vocab_size; i++) {
-                if (logits[i] >= min_prob) {
-                    cum += logits[i];
-                    if (cum >= threshold) { *result = i; return; }
-                }
+            for (int i = 0; i < nucleus_size; i++) {
+                cum += top_probs[i];
+                if (cum >= threshold) { *result = top_ids[i]; return; }
             }
-            *result = vocab_size - 1;
+            *result = top_ids[nucleus_size - 1];
         }
     }
 }
@@ -1361,7 +1388,7 @@ __global__ void sample_batch_kernel(
         col[i] *= inv_sum;
     __syncthreads();
 
-    // Step 4: Top-p nucleus sampling (correct: filter by probability, not index)
+    // Step 4: Top-p nucleus sampling (top-K collection + sort)
     if (threadIdx.x == 0) {
         float r = randoms[g];
         if (top_p >= 1.0f) {
@@ -1372,29 +1399,42 @@ __global__ void sample_batch_kernel(
             }
             tokens[g] = vocab - 1;
         } else {
-            // Binary search for min probability in the nucleus
-            float lo = 0.0f, hi = 1.0f;
-            for (int iter = 0; iter < 20; iter++) {
-                float mid = (lo + hi) * 0.5f;
-                float mass = 0.0f;
-                for (int i = 0; i < vocab; i++)
-                    if (col[i] >= mid) mass += col[i];
-                if (mass >= top_p) lo = mid;
-                else hi = mid;
-            }
-            float min_prob = lo;
-            float nucleus_mass = 0.0f;
-            for (int i = 0; i < vocab; i++)
-                if (col[i] >= min_prob) nucleus_mass += col[i];
-            float threshold = r * nucleus_mass;
-            float cum = 0.0f;
+            const int K = 512;
+            float top_probs[K]; int top_ids[K]; int n = 0;
             for (int i = 0; i < vocab; i++) {
-                if (col[i] >= min_prob) {
-                    cum += col[i];
-                    if (cum >= threshold) { tokens[g] = i; return; }
+                float p = col[i];
+                if (n < K) {
+                    top_probs[n] = p; top_ids[n] = i; n++;
+                    for (int j = n-1; j > 0 && top_probs[j] < top_probs[j-1]; j--) {
+                        float tp = top_probs[j]; top_probs[j] = top_probs[j-1]; top_probs[j-1] = tp;
+                        int ti = top_ids[j]; top_ids[j] = top_ids[j-1]; top_ids[j-1] = ti;
+                    }
+                } else if (p > top_probs[0]) {
+                    top_probs[0] = p; top_ids[0] = i;
+                    for (int j = 0; j < n-1 && top_probs[j] < top_probs[j+1]; j++) {
+                        float tp = top_probs[j]; top_probs[j] = top_probs[j+1]; top_probs[j+1] = tp;
+                        int ti = top_ids[j]; top_ids[j] = top_ids[j+1]; top_ids[j+1] = ti;
+                    }
                 }
             }
-            tokens[g] = vocab - 1;
+            for (int i = 1; i < n; i++) {
+                float p = top_probs[i]; int id = top_ids[i]; int j = i-1;
+                while (j >= 0 && top_probs[j] < p) {
+                    top_probs[j+1] = top_probs[j]; top_ids[j+1] = top_ids[j]; j--;
+                }
+                top_probs[j+1] = p; top_ids[j+1] = id;
+            }
+            float nucleus_mass = 0.0f; int ns = 0;
+            for (int i = 0; i < n; i++) {
+                nucleus_mass += top_probs[i]; ns++;
+                if (nucleus_mass >= top_p) break;
+            }
+            float threshold = r * nucleus_mass; float cum = 0.0f;
+            for (int i = 0; i < ns; i++) {
+                cum += top_probs[i];
+                if (cum >= threshold) { tokens[g] = top_ids[i]; return; }
+            }
+            tokens[g] = top_ids[ns - 1];
         }
     }
 }
