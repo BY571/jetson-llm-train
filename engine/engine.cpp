@@ -405,18 +405,16 @@ void InferenceEngine::forward_layer(int layer_idx) {
     auto& kv = state_.kv_cache[layer_idx];
     cudaStream_t stream = 0; // default stream
 
-    // 1. Input LayerNorm (fused with q8 quantization for dp4a path)
+    // 1. Input LayerNorm
     half* norm_out = state_.ffn_out;
+    launch_copy_rms_norm(state_.hidden, layer.input_layernorm,
+                         state_.residual, norm_out,
+                         HIDDEN_SIZE, RMS_NORM_EPS, stream);
+
+    // Quantize input to int8 for dp4a
     if (weights_.is_q4l) {
-        // Fused: copy + RMSNorm + q8 quantize in one kernel (saves 1 launch + 2KB round-trip)
-        launch_copy_rms_norm_q8(state_.hidden, layer.input_layernorm,
-                                state_.residual, norm_out,
-                                state_.q8_data, state_.q8_scales, state_.q8_sums,
-                                HIDDEN_SIZE, RMS_NORM_EPS, stream);
-    } else {
-        launch_copy_rms_norm(state_.hidden, layer.input_layernorm,
-                             state_.residual, norm_out,
-                             HIDDEN_SIZE, RMS_NORM_EPS, stream);
+        launch_quantize_input_q8(norm_out, state_.q8_data, state_.q8_scales,
+                                 state_.q8_sums, HIDDEN_SIZE, stream);
     }
 
     // 2. QKV projections
@@ -465,16 +463,15 @@ void InferenceEngine::forward_layer(int layer_idx) {
     // 7. Residual add (hidden += residual)
     launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
 
-    // 8. Post-attention LayerNorm (fused with q8 quantization for dp4a)
+    // 8. Post-attention LayerNorm
+    launch_copy_rms_norm(state_.hidden, layer.post_attn_layernorm,
+                         state_.residual, norm_out,
+                         HIDDEN_SIZE, RMS_NORM_EPS, stream);
+
+    // Quantize FFN input for dp4a
     if (weights_.is_q4l) {
-        launch_copy_rms_norm_q8(state_.hidden, layer.post_attn_layernorm,
-                                state_.residual, norm_out,
-                                state_.q8_data, state_.q8_scales, state_.q8_sums,
-                                HIDDEN_SIZE, RMS_NORM_EPS, stream);
-    } else {
-        launch_copy_rms_norm(state_.hidden, layer.post_attn_layernorm,
-                             state_.residual, norm_out,
-                             HIDDEN_SIZE, RMS_NORM_EPS, stream);
+        launch_quantize_input_q8(norm_out, state_.q8_data, state_.q8_scales,
+                                 state_.q8_sums, HIDDEN_SIZE, stream);
     }
 
     // 9. FFN: fused gate+up when both quantized (NF4 fused, Q4L individual dp4a)
