@@ -13,6 +13,26 @@
 #include <cstring>
 #include <random>
 #include <iostream>
+#include <stdexcept>
+
+// CUDA error checking macro — converts silent corruption into actionable errors
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error [%s:%d]: %s\n", \
+                __FILE__, __LINE__, cudaGetErrorString(err)); \
+        throw std::runtime_error(cudaGetErrorString(err)); \
+    } \
+} while(0)
+
+#define CUBLAS_CHECK(call) do { \
+    cublasStatus_t status = (call); \
+    if (status != CUBLAS_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuBLAS error [%s:%d]: status=%d\n", \
+                __FILE__, __LINE__, (int)status); \
+        throw std::runtime_error("cuBLAS error"); \
+    } \
+} while(0)
 
 // cuBLAS handle (created once, reused)
 static cublasHandle_t cublas_handle = nullptr;
