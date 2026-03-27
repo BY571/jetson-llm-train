@@ -410,9 +410,6 @@ void InferenceEngine::forward_layer(int layer_idx) {
                          state_.residual, norm_out,
                          HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
-        cudaDeviceSynchronize();
-    }
-
     // Quantize input to int8 for dp4a
     if (weights_.is_q4l) {
         launch_quantize_input_q8(norm_out, state_.q8_data, state_.q8_scales,
@@ -1162,9 +1159,6 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
     project(B->q_buf, L.q_proj_fp16, L.q_proj_nf4, B->norm_buf, Q_DIM, HIDDEN_SIZE);
     project(B->k_buf, L.k_proj_fp16, L.k_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
     project(B->v_buf, L.v_proj_fp16, L.v_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
-
-        cudaDeviceSynchronize();
-    }
 
     // 3. QKNorm + RoPE
     launch_qk_norm_batch(B->q_buf, B->k_buf, L.q_norm, L.k_norm,
