@@ -5,7 +5,7 @@ Apply these before training to work around Jetson-specific issues:
 - bitsandbytes bnb-4bit models default to bf16 compute dtype
 
 Usage:
-    from jetson_compat import patch_amp_for_jetson, load_model_for_jetson
+    from jetson_compat import patch_amp_for_jetson, cast_model_to_fp16
 """
 import torch
 
@@ -49,35 +49,3 @@ def cast_model_to_fp16(model):
     if count:
         print(f"[jetson_compat] Cast {count} bf16 tensors to fp16")
     return model
-
-
-def load_model_for_jetson(model_name, max_seq_length=4096, lora_rank=16):
-    """Load a quantized model optimized for Jetson Orin.
-
-    Uses fp16 compute dtype instead of bf16, which is the key difference
-    from standard unsloth/cloud loading.
-    """
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16,  # NOT bf16 (Jetson compat)
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-    )
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=bnb_config,
-        device_map="auto",
-        torch_dtype=torch.float16,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    model = cast_model_to_fp16(model)
-
-    # Speed optimizations
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-    return model, tokenizer

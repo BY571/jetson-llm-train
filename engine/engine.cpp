@@ -82,31 +82,6 @@ static void cublas_hgemv_lora(const half* weight, const half* input, half* outpu
     }
 }
 
-// cuBLAS fp16 GEMV: y = weight * x
-// Use cublasGemmEx: treat x as (in_dim, 1) matrix, W as (out_dim, in_dim) row-major
-// y(out_dim,1) = W(out_dim,in_dim) @ x(in_dim,1)
-// In cublas col-major: y = W^T(in_dim,out_dim) transposed @ x
-static void cublas_hgemv(const half* weight, const half* input, half* output,
-                          int out_dim, int in_dim) {
-    ensure_cublas();
-    __half alpha = __float2half(1.0f);
-    __half beta = __float2half(0.0f);
-    // W is (out_dim, in_dim) row-major = (in_dim, out_dim) col-major
-    // y = op(W) @ x where op(W) = W^T in col-major = W in row-major
-    // cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, out_dim, 1, in_dim,
-    //              alpha, W, in_dim, x, in_dim, beta, y, out_dim)
-    cublasGemmEx(cublas_handle,
-                 CUBLAS_OP_T, CUBLAS_OP_N,
-                 out_dim, 1, in_dim,  // M, N, K
-                 &alpha,
-                 weight, CUDA_R_16F, in_dim,   // A (in_dim x out_dim col-major), lda=in_dim
-                 input, CUDA_R_16F, in_dim,    // B (in_dim x 1), ldb=in_dim
-                 &beta,
-                 output, CUDA_R_16F, out_dim,  // C (out_dim x 1), ldc=out_dim
-                 CUDA_R_16F,                   // compute type
-                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-}
-
 // Helper to avoid void** casts everywhere
 template<typename T>
 inline void cudaMallocChecked(T** ptr, size_t size) {
@@ -269,9 +244,6 @@ void InferenceEngine::allocate_buffers() {
     // GPU-side sampling
     cudaMallocChecked(&state_.sample_result, sizeof(int));
 
-    // NF4 LM head temp buffer (allocated upfront, ~304KB)
-    cudaMallocChecked(&state_.lm_head_fp16_buf, VOCAB_SIZE * sizeof(half));
-
     // dp4a input quantization buffers
     int max_q8_dim = INTERMEDIATE_SIZE; // largest input dimension
     int max_q8_blocks = max_q8_dim / 64;
@@ -305,7 +277,6 @@ InferenceEngine::~InferenceEngine() {
     cudaFree(state_.rope_cos);
     cudaFree(state_.rope_sin);
     cudaFree(state_.sample_result);
-    cudaFree(state_.lm_head_fp16_buf);
     cudaFree(state_.q8_data);
     cudaFree(state_.q8_scales);
     cudaFree(state_.q8_sums);
@@ -516,140 +487,6 @@ void InferenceEngine::decode(int token_id) {
 }
 
 // ============================================================================
-// Profiled decode: measure each operation category with CUDA events
-// ============================================================================
-
-std::vector<std::pair<std::string, float>> InferenceEngine::profile_decode(int token_id) {
-    cudaStream_t stream = 0;
-    std::vector<std::pair<std::string, float>> timings;
-
-    auto timed = [&](const char* name, auto fn) {
-        cudaEvent_t start, stop;
-        cudaEventCreate(&start); cudaEventCreate(&stop);
-        cudaEventRecord(start, stream);
-        fn();
-        cudaEventRecord(stop, stream);
-        cudaEventSynchronize(stop);
-        float ms; cudaEventElapsedTime(&ms, start, stop);
-        timings.push_back({name, ms * 1000.0f}); // microseconds
-        cudaEventDestroy(start); cudaEventDestroy(stop);
-    };
-
-    timed("embedding", [&]{ launch_embedding(weights_.embed_tokens, token_id, state_.hidden, HIDDEN_SIZE, stream); });
-
-    float total_nf4_gemv = 0, total_attention = 0, total_other = 0;
-
-    for (int i = 0; i < NUM_LAYERS; i++) {
-        auto& layer = weights_.layers[i];
-        auto& kv = state_.kv_cache[i];
-        half* norm_out = state_.ffn_out;
-
-        // Norm + residual save
-        timed("norm+copy", [&]{
-            launch_copy_rms_norm(state_.hidden, layer.input_layernorm,
-                                state_.residual, norm_out, HIDDEN_SIZE, RMS_NORM_EPS, stream);
-        });
-
-        // QKV
-        timed("qkv_gemv", [&]{
-            if (!layer.q_proj_fp16 && !layer.k_proj_fp16 && !layer.v_proj_fp16) {
-                auto& q = layer.q_proj_nf4; auto& k = layer.k_proj_nf4; auto& v = layer.v_proj_nf4;
-                launch_nf4_fused_3(q.data, q.absmax, state_.q_buf, q.out_dim, k.data, k.absmax, state_.k_buf, k.out_dim, v.data, v.absmax, state_.v_buf, v.out_dim, norm_out, q.in_dim, stream);
-            } else {
-                if (layer.q_proj_fp16) cublas_hgemv_lora(layer.q_proj_fp16, norm_out, state_.q_buf, Q_DIM, HIDDEN_SIZE, layer.lora_q, state_.lora_scratch);
-                else { auto& w = layer.q_proj_nf4; launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.q_buf, w.out_dim, w.in_dim, w.block_size, stream); }
-                if (layer.k_proj_fp16) cublas_hgemv_lora(layer.k_proj_fp16, norm_out, state_.k_buf, KV_DIM, HIDDEN_SIZE, layer.lora_k, state_.lora_scratch);
-                else { auto& w = layer.k_proj_nf4; launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.k_buf, w.out_dim, w.in_dim, w.block_size, stream); }
-                if (layer.v_proj_fp16) cublas_hgemv_lora(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE, layer.lora_v, state_.lora_scratch);
-                else { auto& w = layer.v_proj_nf4; launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.v_buf, w.out_dim, w.in_dim, w.block_size, stream); }
-            }
-        });
-
-        // QKNorm + RoPE + KV cache + Attention
-        timed("attn_ops", [&]{
-            launch_qk_norm(state_.q_buf, state_.k_buf, layer.q_norm, layer.k_norm, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, RMS_NORM_EPS, stream);
-            launch_rope(state_.q_buf, state_.k_buf, state_.rope_cos, state_.rope_sin, state_.current_pos, state_.max_seq_len, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, stream);
-            cudaMemcpyAsync(kv.key + state_.current_pos * KV_DIM, state_.k_buf, KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(kv.value + state_.current_pos * KV_DIM, state_.v_buf, KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
-            launch_gqa_attention(state_.q_buf, kv.key, kv.value, state_.attn_out, state_.attn_scores, state_.current_pos, state_.max_seq_len, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, stream);
-        });
-
-        // O proj
-        timed("o_gemv", [&]{
-            if (layer.o_proj_fp16) cublas_hgemv_lora(layer.o_proj_fp16, state_.attn_out, state_.hidden, HIDDEN_SIZE, Q_DIM, layer.lora_o, state_.lora_scratch);
-            else { auto& w = layer.o_proj_nf4; launch_nf4_gemv_fast(w.data, w.absmax, state_.attn_out, state_.hidden, w.out_dim, w.in_dim, w.block_size, stream); }
-        });
-
-        // Residual + norm
-        timed("res+norm2", [&]{
-            launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
-            launch_copy_rms_norm(state_.hidden, layer.post_attn_layernorm,
-                                state_.residual, norm_out, HIDDEN_SIZE, RMS_NORM_EPS, stream);
-        });
-
-        // Gate+Up
-        timed("gate_up_gemv", [&]{
-            if (!layer.gate_proj_fp16 && !layer.up_proj_fp16) {
-                auto& g = layer.gate_proj_nf4; auto& u = layer.up_proj_nf4;
-                launch_nf4_fused_2(g.data, g.absmax, state_.gate_buf, g.out_dim, u.data, u.absmax, state_.up_buf, u.out_dim, norm_out, g.in_dim, stream);
-            } else {
-                if (layer.gate_proj_fp16) cublas_hgemv_lora(layer.gate_proj_fp16, norm_out, state_.gate_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, layer.lora_gate, state_.lora_scratch);
-                else { auto& w = layer.gate_proj_nf4; launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.gate_buf, w.out_dim, w.in_dim, w.block_size, stream); }
-                if (layer.up_proj_fp16) cublas_hgemv_lora(layer.up_proj_fp16, norm_out, state_.up_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, layer.lora_up, state_.lora_scratch);
-                else { auto& w = layer.up_proj_nf4; launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.up_buf, w.out_dim, w.in_dim, w.block_size, stream); }
-            }
-        });
-
-        // SiLU + down
-        timed("silu+down", [&]{
-            launch_silu_gate_mul(state_.gate_buf, state_.up_buf, state_.gate_buf, INTERMEDIATE_SIZE, stream);
-            if (layer.down_proj_fp16) cublas_hgemv_lora(layer.down_proj_fp16, state_.gate_buf, state_.hidden, HIDDEN_SIZE, INTERMEDIATE_SIZE, layer.lora_down, state_.lora_scratch);
-            else { auto& w = layer.down_proj_nf4; launch_nf4_gemv_fast(w.data, w.absmax, state_.gate_buf, state_.hidden, w.out_dim, w.in_dim, w.block_size, stream); }
-            launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
-        });
-    }
-
-    // Final norm + LM head
-    half* norm_out = state_.ffn_out;
-    timed("final_norm", [&]{ launch_rms_norm(state_.hidden, weights_.final_layernorm, norm_out, HIDDEN_SIZE, RMS_NORM_EPS, stream); });
-
-    timed("lm_head", [&]{
-        ensure_cublas();
-        float alpha = 1.0f, beta = 0.0f;
-        cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, VOCAB_SIZE, 1, HIDDEN_SIZE, &alpha,
-                     weights_.embed_tokens, CUDA_R_16F, HIDDEN_SIZE, norm_out, CUDA_R_16F, HIDDEN_SIZE,
-                     &beta, state_.logits, CUDA_R_32F, VOCAB_SIZE, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    });
-
-    state_.current_pos++;
-
-    // Aggregate per-layer timings
-    float agg_norm = 0, agg_qkv = 0, agg_attn = 0, agg_o = 0, agg_res_norm = 0, agg_gate_up = 0, agg_silu_down = 0;
-    for (auto& [name, us] : timings) {
-        if (name == "norm+copy") agg_norm += us;
-        else if (name == "qkv_gemv") agg_qkv += us;
-        else if (name == "attn_ops") agg_attn += us;
-        else if (name == "o_gemv") agg_o += us;
-        else if (name == "res+norm2") agg_res_norm += us;
-        else if (name == "gate_up_gemv") agg_gate_up += us;
-        else if (name == "silu+down") agg_silu_down += us;
-    }
-
-    std::vector<std::pair<std::string, float>> summary;
-    summary.push_back({"embedding", timings[0].second});
-    summary.push_back({"norm+copy (28L)", agg_norm});
-    summary.push_back({"QKV GEMV (28L)", agg_qkv});
-    summary.push_back({"attn_ops (28L)", agg_attn});
-    summary.push_back({"O GEMV (28L)", agg_o});
-    summary.push_back({"res+norm2 (28L)", agg_res_norm});
-    summary.push_back({"gate+up GEMV (28L)", agg_gate_up});
-    summary.push_back({"silu+down (28L)", agg_silu_down});
-    summary.push_back({"final_norm", timings[timings.size()-2].second});
-    summary.push_back({"lm_head", timings[timings.size()-1].second});
-    return summary;
-}
-
-// ============================================================================
 // LoRA weight sync from PyTorch
 // ============================================================================
 
@@ -725,82 +562,6 @@ void InferenceEngine::prefill(const int* token_ids, int n_tokens) {
     for (int i = 0; i < n_tokens; i++) {
         decode(token_ids[i]);
     }
-}
-
-// ============================================================================
-// Sampling
-// ============================================================================
-
-int InferenceEngine::sample(float temperature, float top_p) {
-    cudaError_t err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        std::cerr << "CUDA error before sample: " << cudaGetErrorString(err) << std::endl;
-        return 0;
-    }
-
-    std::vector<float> logits_host(VOCAB_SIZE);
-    err = cudaMemcpy(logits_host.data(), state_.logits, VOCAB_SIZE * sizeof(float), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        std::cerr << "CUDA memcpy error in sample: " << cudaGetErrorString(err) << std::endl;
-        return 0;
-    }
-
-    // Temperature
-    if (temperature != 1.0f) {
-        for (auto& l : logits_host) l /= temperature;
-    }
-
-    // Softmax
-    float max_val = *std::max_element(logits_host.begin(), logits_host.end());
-    float sum = 0.0f;
-    for (auto& l : logits_host) {
-        l = expf(l - max_val);
-        sum += l;
-    }
-    for (auto& l : logits_host) l /= sum;
-
-    // Top-p (nucleus) sampling
-    if (top_p < 1.0f) {
-        // Create index array and sort by probability (descending)
-        std::vector<int> indices(VOCAB_SIZE);
-        for (int i = 0; i < VOCAB_SIZE; i++) indices[i] = i;
-        std::partial_sort(indices.begin(), indices.begin() + std::min(1000, VOCAB_SIZE),
-                          indices.end(),
-                          [&](int a, int b) { return logits_host[a] > logits_host[b]; });
-
-        // Find nucleus (top-p cumulative probability)
-        float cumsum = 0.0f;
-        int nucleus_end = 0;
-        for (int i = 0; i < std::min(1000, VOCAB_SIZE); i++) {
-            cumsum += logits_host[indices[i]];
-            nucleus_end = i + 1;
-            if (cumsum >= top_p) break;
-        }
-
-        // Sample from nucleus
-        static std::mt19937 rng(42);
-        std::uniform_real_distribution<float> dist(0.0f, cumsum);
-        float r = dist(rng);
-
-        float running = 0.0f;
-        for (int i = 0; i < nucleus_end; i++) {
-            running += logits_host[indices[i]];
-            if (running >= r) return indices[i];
-        }
-        return indices[nucleus_end - 1];
-    }
-
-    // Multinomial sampling (no top-p)
-    static std::mt19937 rng(42);
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    float r = dist(rng);
-
-    float running = 0.0f;
-    for (int i = 0; i < VOCAB_SIZE; i++) {
-        running += logits_host[i];
-        if (running >= r) return i;
-    }
-    return VOCAB_SIZE - 1;
 }
 
 // ============================================================================

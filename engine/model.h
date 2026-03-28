@@ -62,13 +62,6 @@ struct NF4Weight {
     size_t data_bytes() const { return (size_t)total_params() / 2; }
 };
 
-// FP16 weight (for embedding, norms, LoRA)
-struct FP16Weight {
-    half* data;
-    int rows;
-    int cols;
-};
-
 // LoRA adapter weights for one linear layer
 struct LoRAAdapter {
     half* A;    // (rank, in_features) - stored row-major
@@ -133,13 +126,8 @@ struct KVCache {
 
 // Full model weights
 struct ModelWeights {
-    // Embedding (fp16, used for token lookup)
+    // Embedding (fp16, used for both token lookup and LM head via cuBLAS)
     half* embed_tokens;     // (VOCAB_SIZE, HIDDEN)
-
-    // LM head: NF4 quantized copy of embed_tokens for fast GEMV
-    // (saves 220MB vs fp16, similar speed due to memory-bound LM head)
-    NF4Weight lm_head_nf4;  // (VOCAB_SIZE, HIDDEN) in NF4
-    bool has_nf4_lm_head = false;
 
     // Transformer layers (dynamic count, up to MAX_LAYERS)
     TransformerLayerWeights layers[MAX_LAYERS];
@@ -179,9 +167,6 @@ struct InferenceState {
 
     // GPU-side sampling result
     int* sample_result; // single int on GPU
-
-    // NF4 LM head temp buffer (fp16 output before fp32 conversion)
-    half* lm_head_fp16_buf; // (VOCAB_SIZE,) — allocated if NF4 LM head loaded
 
     // dp4a input quantization buffers (for Q4L dp4a GEMV)
     int8_t* q8_data;        // (INTERMEDIATE_SIZE,) quantized input
@@ -265,13 +250,10 @@ public:
     // Get logits (after prefill or decode)
     float* get_logits() const { return state_.logits; }
 
-    // Sample from logits (CPU-side, full top-p support)
-    int sample(float temperature = 1.0f, float top_p = 0.9f);
-
     // Fast greedy sampling on GPU (only copies 4 bytes instead of 600KB)
     int sample_greedy_gpu();
 
-    // Fast GPU sampling with temperature + top-p (only copies 4 bytes)
+    // GPU sampling with temperature + top-p (only copies 4 bytes)
     int sample_gpu(float temperature = 1.0f, float top_p = 0.9f);
 
     // Full generation: prefill + decode loop
@@ -306,15 +288,6 @@ private:
     // Precompute RoPE cos/sin tables
     void precompute_rope();
 
-    // Apply RoPE to Q and K
-    void apply_rope(half* q, half* k, int pos);
-
-    // GQA attention
-    void attention(int layer_idx, int pos);
-
-    // FFN: gate * silu(up) then down
-    void ffn(int layer_idx);
-
     // Batch generation internals
     BatchState* batch_;  // allocated on first generate_batch call
     void alloc_batch(int G, int max_seq_len);
@@ -328,7 +301,4 @@ private:
     void batch_gemm_q4l(half* out, const NF4Weight& w, const half* in,
                         int N, cudaStream_t stream);
 
-public:
-    // Profile one decode step: returns vector of (name, time_us) pairs
-    std::vector<std::pair<std::string, float>> profile_decode(int token_id);
 };

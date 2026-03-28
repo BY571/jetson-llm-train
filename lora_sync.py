@@ -59,13 +59,3 @@ class LoRASyncer:
             a_np = a_param.data.to(torch.float16).detach().cpu().contiguous().numpy()
             b_np = b_param.data.to(torch.float16).detach().cpu().contiguous().numpy()
             self.engine.update_lora(layer_idx, proj_key, a_np, b_np, self.scale)
-
-
-# Convenience function (creates syncer on first call, caches it)
-_syncer_cache = {}
-
-def sync_lora_to_engine(model, engine, lora_alpha=16, lora_rank=16):
-    key = id(engine)
-    if key not in _syncer_cache:
-        _syncer_cache[key] = LoRASyncer(model, engine, lora_alpha, lora_rank)
-    _syncer_cache[key].sync()

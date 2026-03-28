@@ -4,12 +4,12 @@ Fast GRPO fine-tuning for LLMs on NVIDIA Jetson and other GPUs. Custom C++/CUDA 
 
 ## What this does
 
-GRPO (Group Relative Policy Optimization) trains language models using reinforcement learning: generate multiple completions, score them with reward functions, update the model to produce better outputs. The bottleneck is generation — our C++ engine makes it **12x faster** than HuggingFace generate on Jetson Orin.
+GRPO (Group Relative Policy Optimization) trains language models using reinforcement learning: generate multiple completions, score them with reward functions, update the model to produce better outputs. The bottleneck is generation — our C++ engine makes it **3.6x faster** end-to-end than TRL on Jetson Orin.
 
-| Setup | Device | Generation speed | Step time |
+| Setup | Device | Step time | 300 steps |
 |---|---|---|---|
-| TRL + HF generate | Jetson Orin 8GB | ~7 tok/s | ~135s/step |
-| **Ours (C++ engine)** | **Jetson Orin 8GB** | **~83 tok/s** | **~30s/step** |
+| TRL + HF generate | Jetson Orin 8GB | ~131s/step | ~11h |
+| **Ours (C++ engine)** | **Jetson Orin 8GB** | **~36s/step** | **~3h** |
 | TRL + vLLM | Jetson Orin 8GB | OOM | -- |
 
 Output: standard HuggingFace PEFT LoRA adapters. Load with `PeftModel.from_pretrained()`, deploy anywhere.
@@ -111,24 +111,27 @@ The engine reads model dimensions from a JSON config file at runtime — no reco
 
 ```
 train.py                  # Standalone GRPO trainer (no TRL dependency)
-train_gsm8k.py            # TRL baseline (for comparison benchmarks)
-train_gsm8k_trl_engine.py # TRL + C++ engine hybrid
 engine/                   # C++/CUDA inference engine
   model.h                 #   Model config + weight structs
   engine.cpp              #   Forward pass, generation loop
-  kernels.cu              #   CUDA kernels (NF4/Q4L GEMV, attention, RoPE)
+  kernels.cu              #   CUDA kernels (Q4L dp4a GEMV, attention, RoPE, sampling)
+  nf4_gemv_fast.cu        #   Optimized GEMV kernels (dp4a, NF4, fused variants)
   weights.cpp             #   Weight loader
-  convert_weights.py      #   HF model -> engine weight format
+  engine_py.cpp           #   Python bindings (pybind11)
+  convert_weights.py      #   HF model -> Q4L weight format
+  test_all.py             #   Engine test suite
+  bench_nf4.py            #   Generation speed benchmark
+  bench_gemv.cu           #   GEMV microbenchmark
+benchmark/                # TRL comparison benchmark
+  config.py               #   Shared hyperparameters (both scripts use this)
+  bench_trl.py            #   TRL GRPOTrainer baseline
+  bench_ours.py           #   Our engine benchmark
+  compare.py              #   Print comparison table
 examples/                 # Usage examples
   gsm8k.py                #   GSM8K math reasoning
   custom_reward.py        #   Custom reward function
-engine_rollout.py         # Engine rollout wrapper for TRL
 lora_sync.py              # LoRA weight sync (PyTorch <-> engine)
 jetson_compat.py          # Jetson AMP/dtype patches
-test_grpo.py              # GRPO loss unit tests
-improvements/             # Profiling history and optimization reports
-media/                    # Plots and visualizations
-archive/                  # Old experiment scripts
 ```
 
 ## Jetson setup

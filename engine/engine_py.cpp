@@ -48,10 +48,6 @@ PYBIND11_MODULE(jetson_engine, m) {
              py::arg("stop_token_ids") = std::vector<int>{},
              "Generate tokens from prompt. Returns list of generated token IDs.")
 
-        .def("sample", &InferenceEngine::sample,
-             py::arg("temperature") = 1.0f, py::arg("top_p") = 0.9f,
-             "Sample from current logits (CPU-side, full top-p)")
-
         .def("sample_greedy_gpu", &InferenceEngine::sample_greedy_gpu,
              "Greedy sample on GPU (4 bytes copy instead of 600KB)")
 
@@ -91,15 +87,6 @@ PYBIND11_MODULE(jetson_engine, m) {
              py::arg("top_p") = 0.9f,
              py::arg("eos_token_id") = -1,
              "Generate from G prompts in parallel (GEMM, tensor cores).")
-
-        .def("profile_decode", [](InferenceEngine& self, int token_id) {
-                 auto result = self.profile_decode(token_id);
-                 py::dict d;
-                 for (auto& [name, us] : result) d[py::cast(name)] = us;
-                 return d;
-             },
-             py::arg("token_id"),
-             "Profile one decode step, returns dict of {operation: time_us}")
 
         .def("model_config", [](InferenceEngine& self) {
                  const auto& c = self.config();

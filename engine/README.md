@@ -1,61 +1,38 @@
-# Jetson LLM Inference Engine
+# C++/CUDA Inference Engine
 
-Custom C++/CUDA inference engine for small transformer models on Jetson Orin.
-Designed to replace HuggingFace + bitsandbytes for the generation phase of GRPO training.
+Custom inference engine for Qwen3 models. Replaces HuggingFace generate for the generation phase of GRPO training.
 
-## Target: Qwen3-0.6B
+## Performance
 
-```
-hidden_size:         1024
-intermediate_size:   3072
-num_hidden_layers:   28
-num_attention_heads: 16  (GQA: 2 Q heads per KV head)
-num_key_value_heads: 8
-head_dim:            128
-vocab_size:          151936
-rope_theta:          1000000
-rms_norm_eps:        1e-6
-activation:          SiLU (gate * silu(up))
-lm_head:             tied to embedding
-```
+- **60 tok/s** single sequence (dp4a, Q4L 4-bit)
+- **83 tok/s** batched G=4 (cuBLAS GEMM with tensor cores)
+- Validated on Jetson Orin Nano 8GB (sm_87)
 
-## Architecture
+## Key features
 
-```
-Python (GRPO training loop)
-  |
-  v
-engine.generate(token_ids, max_tokens) -> list[int]  (pybind11)
-  |
-  v
-C++ decode loop (no Python per token)
-  |
-  v
-CUDA kernels:
-  - nf4_dequant_gemv: fused NF4 dequant + matmul (replaces 196 bitsandbytes calls)
-  - rms_norm: fused RMSNorm
-  - rope_attention: RoPE + GQA attention + KV cache update
-  - silu_gate_mul: fused SiLU(gate) * up
-  - embedding_lookup: vocab embedding
-  - top_p_sampling: temperature + top-p + multinomial
+- Q4L quantization with dp4a integer dot product (4 MACs/clock vs 1 for fp32)
+- Batched generation with cuBLAS GEMM for parallel completions
+- LoRA adapter support with live weight sync from PyTorch (~2ms)
+- Top-p nucleus sampling (parallel 256-thread max extraction)
+- Shared embedding with PyTorch (saves 311MB on unified memory)
+- Runtime model config from JSON (no recompilation for different model sizes)
+
+## Building
+
+```bash
+mkdir -p engine/build2 && cd engine/build2
+cmake .. -DCMAKE_CUDA_ARCHITECTURES=87  # 87 for Jetson Orin, 89 for RTX 4060
+make -j$(nproc)
 ```
 
 ## Files
 
 ```
-model.h          - Model structure, weight layout, KV cache
-kernels.cu       - All CUDA kernels
-engine.cpp       - C++ inference engine (prefill + decode loop)
-engine_py.cpp    - pybind11 Python bindings
-weights.cpp      - Load weights from safetensors (HF format)
-CMakeLists.txt   - Build configuration
-test_correctness.py - Verify output matches HuggingFace
+engine.cpp          Forward pass, generation loop, batched GEMM
+kernels.cu          Attention, RoPE, RMSNorm, sampling, embedding
+nf4_gemv_fast.cu    Optimized GEMV (dp4a, NF4, fused 2-proj/3-proj variants)
+model.h             Model config, weight structs, buffer management
+weights.cpp         Weight loader (binary format with index)
+engine_py.cpp       Python bindings (pybind11)
+convert_weights.py  HuggingFace model -> Q4L weight format
 ```
-
-## Key Design Decisions
-
-1. **Single monolithic forward pass**: One C++ function call per token, not 1400 kernel launches
-2. **Pre-allocated everything**: KV cache, scratch buffers, all allocated at init
-3. **NF4 weights loaded directly**: Read safetensors, store as uint8 + lookup table
-4. **LoRA support**: Load A/B matrices, apply during matmul (dequant + base + lora_B @ lora_A)
-5. **Jetson sm_87 specific**: Hardcoded for Ampere tensor cores, unified memory

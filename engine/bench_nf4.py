@@ -18,7 +18,7 @@ for weights_path, label in [("engine/weights", "fp16 (1.2GB)"), ("engine/weights
 
     # Warmup
     engine.decode_token(0)
-    engine.sample(1.0, 1.0)
+    engine.sample_gpu(1.0, 1.0)
     engine.reset()
 
     # Generate

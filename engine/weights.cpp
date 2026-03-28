@@ -116,11 +116,10 @@ void InferenceEngine::load_weights(const std::string& prefix) {
                     if (p) cudaMemcpy(p, base + it_q->second.offset, it_q->second.nbytes, cudaMemcpyHostToDevice);
                     w.quant_map = (float*)p;
                 }
-        if (!w.data || !w.absmax || !w.quant_map) {
-            std::cerr << "  NF4 MISSING: " << prefix
+        if (!w.data || !w.absmax) {
+            std::cerr << "  WEIGHT MISSING: " << prefix
                       << " data=" << (void*)w.data
-                      << " absmax=" << (void*)w.absmax
-                      << " qmap=" << (void*)w.quant_map << std::endl;
+                      << " absmax=" << (void*)w.absmax << std::endl;
         }
         return w;
     };
@@ -208,16 +207,6 @@ void InferenceEngine::load_weights(const std::string& prefix) {
     if (weights_.is_q4l) std::cout << "  Weights: Q4 Linear (no lookup table)" << std::endl;
     std::cout << "  All " << NUM_LAYERS << " layers loaded" << std::endl;
 
-    // Load NF4 LM head if available (quantized copy of embed_tokens for fast GEMV)
-    if (index.find("lm_head_nf4.weight") != index.end()) {
-        weights_.lm_head_nf4 = load_nf4("lm_head_nf4", VOCAB_SIZE, HIDDEN_SIZE);
-        weights_.has_nf4_lm_head = (weights_.lm_head_nf4.data != nullptr);
-        if (weights_.has_nf4_lm_head) {
-            std::cout << "  NF4 LM head loaded (saves "
-                      << (VOCAB_SIZE * HIDDEN_SIZE * 2 - VOCAB_SIZE * HIDDEN_SIZE / 2) / 1e6
-                      << "MB)" << std::endl;
-        }
-    }
 }
 
 void InferenceEngine::load_lora(const std::string& prefix, float scale) {

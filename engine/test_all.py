@@ -21,7 +21,7 @@ def check(name, condition):
 # Load engine
 engine = jetson_engine.Engine(512)
 engine.load_weights("engine/weights_q4l")
-engine.decode_token(0); engine.sample(1.0, 1.0); engine.reset()
+engine.decode_token(0); engine.sample_gpu(1.0, 1.0); engine.reset()
 
 # 1. Single-sequence generation
 print("=== Single-sequence ===")
@@ -73,7 +73,7 @@ try:
     engine2 = jetson_engine.Engine(256)
     engine2.load_weights("engine/weights_q4l")
     engine2.share_embedding(embed.data_ptr())
-    engine2.decode_token(0); engine2.sample(1.0, 1.0); engine2.reset()
+    engine2.decode_token(0); engine2.sample_gpu(1.0, 1.0); engine2.reset()
     tokens2 = engine2.generate(prompt, max_new_tokens=20, temperature=0.001, eos_token_id=-1)
     text2 = tok.decode(tokens2)
     check("shared embed generates", len(tokens2) > 5)
