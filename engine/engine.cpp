@@ -982,11 +982,10 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
 
     // Phase 2: Decode (generate new tokens)
     for (int step = 0; step < max_new_tokens; step++) {
-        // Sample from logits (temperature + top-p, or greedy)
+        decode_batch(G);
         if (temperature < 0.01f) {
             launch_argmax_batch(B->logits, B->d_tokens, VOCAB_SIZE, G, 0);
         } else {
-            // Generate G random values on CPU (fast enough for small G)
             static std::mt19937 batch_rng(42);
             std::uniform_real_distribution<float> dist(0.0f, 1.0f);
             for (int g = 0; g < G; g++) B->h_randoms[g] = dist(batch_rng);

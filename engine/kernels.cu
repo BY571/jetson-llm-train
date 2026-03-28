@@ -1106,6 +1106,7 @@ __global__ void sample_batch_kernel(
     float* col = logits + (size_t)g * vocab;
     int wid = threadIdx.x / warpSize, lid = threadIdx.x % warpSize;
     int n_warps = (blockDim.x + warpSize - 1) / warpSize;
+    float my_random = randoms[g];
 
     // Step 1: temperature + find max
     float local_max = -1e30f;
@@ -1159,7 +1160,7 @@ __global__ void sample_batch_kernel(
             float cum = 0.0f;
             for (int i = 0; i < vocab; i++) {
                 cum += col[i];
-                if (cum >= randoms[g]) { tokens[g] = i; return; }
+                if (cum >= my_random) { tokens[g] = i; return; }
             }
             tokens[g] = vocab - 1;
         }
@@ -1202,7 +1203,7 @@ __global__ void sample_batch_kernel(
         }
 
         if (threadIdx.x == 0) {
-            float threshold = randoms[g] * s_nuc_mass;
+            float threshold = my_random * s_nuc_mass;
             float cum = 0.0f;
             for (int i = 0; i < vocab; i++) {
                 if (col[i] < 0.0f) {

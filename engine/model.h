@@ -233,7 +233,7 @@ struct BatchState {
     int* h_tokens;      // host (G,) sampled tokens
     int* d_tokens;      // device (G,)
     bool* h_finished;   // host (G,)
-    float* h_randoms;   // host (G,) for stochastic sampling
+    float* h_randoms;   // host (G,)
     float* d_randoms;   // device (G,)
 };
 
@@ -307,7 +307,7 @@ public:
 
 private:
     bool weights_cached_ = false;
-    GpuArena batch_arena_;  // single allocation for all batch GPU buffers
+    GpuArena batch_arena_;
     ModelConfig config_;
     ModelWeights weights_;
     InferenceState state_;
