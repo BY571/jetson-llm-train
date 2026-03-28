@@ -280,6 +280,10 @@ public:
     // Pre-dequant Q4L weights to fp16 for fast batched GEMM
     void cache_weights();
 
+    // Sleep/wake: free GPU buffers during training, re-allocate for generation
+    void sleep();
+    void wake();
+
     const ModelConfig& config() const { return config_; }
 
 private:

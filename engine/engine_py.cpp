@@ -42,6 +42,12 @@ PYBIND11_MODULE(jetson_engine, m) {
         .def("cache_weights", &InferenceEngine::cache_weights,
              "Pre-dequant Q4L weights to fp16 for fast batched GEMM")
 
+        .def("sleep", &InferenceEngine::sleep,
+             "Free GPU buffers (call before PyTorch training phase)")
+
+        .def("wake", &InferenceEngine::wake,
+             "Re-allocate GPU buffers (call before generation phase)")
+
         .def("generate", &InferenceEngine::generate,
              py::arg("prompt"),
              py::arg("max_new_tokens") = 512,

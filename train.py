@@ -384,15 +384,22 @@ def train(args):
         else:
             print(f"  Warning: cannot share embedding (dtype={embed_weight.dtype}, cuda={embed_weight.is_cuda})")
 
-        # Pre-dequant weights for fast batched GEMM (trades ~830MB VRAM for no per-step dequant)
-        # Only enable on GPUs with enough VRAM headroom (>= 12GB)
-        free_mem = torch.cuda.mem_get_info()[0]
-        if free_mem > 2e9:  # 2GB+ free after model loading
-            engine.cache_weights()
+        # Pre-dequant weights for fast batched GEMM
+        # Eliminates per-step dequant scratch allocation that causes VRAM contention
+        engine.cache_weights()
 
         from lora_sync import LoRASyncer
         syncer = LoRASyncer(model, engine,
                             lora_alpha=args.lora_rank, lora_rank=args.lora_rank)
+
+        # Pre-allocate batch buffers at max size to avoid mid-training realloc
+        warmup_ids = [0] * 10  # dummy prompt
+        engine.generate_batch(
+            [warmup_ids] * args.num_generations,
+            max_new_tokens=args.max_completion_tokens,
+            temperature=0.001, top_p=1.0, eos_token_id=0,
+        )
+        print(f"  Engine warmup complete (batch pre-allocated)")
 
     # ── Optimizer + scaler ──
     trainable_params = [p for p in model.parameters() if p.requires_grad]

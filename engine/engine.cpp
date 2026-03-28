@@ -349,6 +349,104 @@ void InferenceEngine::reset() {
 }
 
 // ============================================================================
+// Sleep/wake: free GPU buffers during training, re-allocate for generation
+// ============================================================================
+
+void InferenceEngine::sleep() {
+    // Free batch state (biggest savings: KV cache + dequant scratch)
+    if (batch_) {
+        cudaFree(batch_->hidden); cudaFree(batch_->residual);
+        cudaFree(batch_->norm_buf); cudaFree(batch_->q_buf);
+        cudaFree(batch_->k_buf); cudaFree(batch_->v_buf);
+        cudaFree(batch_->attn_out); cudaFree(batch_->gate_buf);
+        cudaFree(batch_->up_buf); cudaFree(batch_->logits);
+        cudaFree(batch_->attn_scores); cudaFree(batch_->dequant_scratch);
+        cudaFree(batch_->lora_scratch);
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            cudaFree(batch_->kv_keys[i]);
+            cudaFree(batch_->kv_values[i]);
+        }
+        cudaFree(batch_->d_positions); cudaFree(batch_->d_tokens);
+        cudaFree(batch_->d_randoms);
+        delete[] batch_->h_positions; delete[] batch_->h_tokens;
+        delete[] batch_->h_finished; delete[] batch_->h_randoms;
+        delete batch_;
+        batch_ = nullptr;
+    }
+
+    // Free single-sequence KV caches
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        cudaFree(state_.kv_cache[i].key); state_.kv_cache[i].key = nullptr;
+        cudaFree(state_.kv_cache[i].value); state_.kv_cache[i].value = nullptr;
+    }
+
+    // Free single-sequence scratch buffers
+    cudaFree(state_.hidden); state_.hidden = nullptr;
+    cudaFree(state_.residual); state_.residual = nullptr;
+    cudaFree(state_.q_buf); state_.q_buf = nullptr;
+    cudaFree(state_.k_buf); state_.k_buf = nullptr;
+    cudaFree(state_.v_buf); state_.v_buf = nullptr;
+    cudaFree(state_.attn_out); state_.attn_out = nullptr;
+    cudaFree(state_.gate_buf); state_.gate_buf = nullptr;
+    cudaFree(state_.up_buf); state_.up_buf = nullptr;
+    cudaFree(state_.ffn_out); state_.ffn_out = nullptr;
+    cudaFree(state_.logits); state_.logits = nullptr;
+    cudaFree(state_.attn_scores); state_.attn_scores = nullptr;
+    cudaFree(state_.sample_result); state_.sample_result = nullptr;
+    cudaFree(state_.q8_data); state_.q8_data = nullptr;
+    cudaFree(state_.q8_scales); state_.q8_scales = nullptr;
+    cudaFree(state_.q8_sums); state_.q8_sums = nullptr;
+    cudaFree(state_.lora_scratch); state_.lora_scratch = nullptr;
+    // Keep rope_cos/rope_sin (small, reused across wake cycles)
+
+    // Free cached fp16 weights
+    if (weights_cached_) {
+        auto free_cache = [](NF4Weight& w) {
+            if (w.fp16_cache) { cudaFree(w.fp16_cache); w.fp16_cache = nullptr; }
+        };
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            auto& L = weights_.layers[i];
+            free_cache(L.q_proj_nf4); free_cache(L.k_proj_nf4);
+            free_cache(L.v_proj_nf4); free_cache(L.o_proj_nf4);
+            free_cache(L.gate_proj_nf4); free_cache(L.up_proj_nf4);
+            free_cache(L.down_proj_nf4);
+        }
+        weights_cached_ = false;
+    }
+
+    cudaDeviceSynchronize();
+}
+
+void InferenceEngine::wake() {
+    // Re-allocate single-sequence buffers (if they were freed)
+    if (!state_.hidden) {
+        int max_seq_len = state_.max_seq_len;
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            cudaMallocChecked(&state_.kv_cache[i].key, max_seq_len * KV_DIM * sizeof(half));
+            cudaMallocChecked(&state_.kv_cache[i].value, max_seq_len * KV_DIM * sizeof(half));
+        }
+        cudaMallocChecked(&state_.hidden, HIDDEN_SIZE * sizeof(half));
+        cudaMallocChecked(&state_.residual, HIDDEN_SIZE * sizeof(half));
+        cudaMallocChecked(&state_.q_buf, Q_DIM * sizeof(half));
+        cudaMallocChecked(&state_.k_buf, KV_DIM * sizeof(half));
+        cudaMallocChecked(&state_.v_buf, KV_DIM * sizeof(half));
+        cudaMallocChecked(&state_.attn_out, Q_DIM * sizeof(half));
+        cudaMallocChecked(&state_.gate_buf, INTERMEDIATE_SIZE * sizeof(half));
+        cudaMallocChecked(&state_.up_buf, INTERMEDIATE_SIZE * sizeof(half));
+        cudaMallocChecked(&state_.ffn_out, HIDDEN_SIZE * sizeof(half));
+        cudaMallocChecked(&state_.logits, VOCAB_SIZE * sizeof(float));
+        cudaMallocChecked(&state_.attn_scores, NUM_HEADS * max_seq_len * sizeof(float));
+        cudaMallocChecked(&state_.sample_result, sizeof(int));
+        int max_q8_dim = INTERMEDIATE_SIZE;
+        cudaMallocChecked(&state_.q8_data, max_q8_dim * sizeof(int8_t));
+        cudaMallocChecked(&state_.q8_scales, (max_q8_dim / 64) * sizeof(float));
+        cudaMallocChecked(&state_.q8_sums, (max_q8_dim / 64) * sizeof(float));
+        cudaMallocChecked(&state_.lora_scratch, 64 * sizeof(half));
+    }
+    // Batch state is re-allocated lazily by alloc_batch() on next generate_batch() call
+}
+
+// ============================================================================
 // Forward pass through one transformer layer
 // ============================================================================
 
@@ -652,8 +750,12 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     CUDA_CHECK(cudaMalloc(&batch_->up_buf, INTERMEDIATE_SIZE * G * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&batch_->logits, VOCAB_SIZE * G * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&batch_->attn_scores, G * NUM_HEADS * max_seq_len * sizeof(float)));
-    // Dequant scratch fp16 (largest projection)
-    CUDA_CHECK(cudaMalloc(&batch_->dequant_scratch, (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half)));
+    // Dequant scratch fp16 (only needed if weights are NOT cached)
+    if (!weights_cached_) {
+        CUDA_CHECK(cudaMalloc(&batch_->dequant_scratch, (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half)));
+    } else {
+        batch_->dequant_scratch = nullptr;
+    }
     // KV caches
     for (int i = 0; i < NUM_LAYERS; i++) {
         CUDA_CHECK(cudaMalloc(&batch_->kv_keys[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half)));
