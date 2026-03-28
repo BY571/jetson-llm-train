@@ -238,7 +238,7 @@ def grpo_step(model, optimizer, scaler, samples, config):
 
 def generate_with_engine(engine, tokenizer, prompt, num_generations,
                          max_tokens, temperature, top_p, stop_ids):
-    """Generate G completions for a single prompt using C++ engine."""
+    """Generate G completions in parallel using C++ engine batch generation."""
     if isinstance(prompt, list):
         text = tokenizer.apply_chat_template(
             prompt, tokenize=False, add_generation_prompt=True
@@ -248,25 +248,26 @@ def generate_with_engine(engine, tokenizer, prompt, num_generations,
 
     prompt_ids = tokenizer(text).input_ids
     eos_id = tokenizer.eos_token_id
-    completions = []
 
-    for _ in range(num_generations):
-        engine.reset()
-        comp_ids = engine.generate(
-            prompt_ids,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            eos_token_id=eos_id,
-            stop_token_ids=stop_ids,
-        )
+    # Batch: generate all G completions in parallel (GEMM, tensor cores)
+    all_prompts = [prompt_ids] * num_generations
+    batch_results = engine.generate_batch(
+        all_prompts,
+        max_new_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        eos_token_id=eos_id,
+    )
+
+    completions = []
+    for comp_ids in batch_results:
         truncated = (
             len(comp_ids) >= max_tokens
             and (len(comp_ids) == 0 or comp_ids[-1] != eos_id)
         )
         completions.append({
             "prompt_ids": prompt_ids,
-            "completion_ids": comp_ids,
+            "completion_ids": list(comp_ids),
             "truncated": truncated,
         })
 
