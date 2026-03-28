@@ -383,6 +383,15 @@ def train(args):
         else:
             print(f"  Warning: cannot share embedding (dtype={embed_weight.dtype}, cuda={embed_weight.is_cuda})")
 
+        # Pre-allocate batch KV cache once (avoids per-step reallocation + OOM)
+        max_prompt_len = 200  # typical GSM8K prompt ~100-200 tokens
+        batch_seq_len = max_prompt_len + args.max_completion_tokens
+        engine.generate_batch(
+            [[0]] * args.num_generations,  # dummy prompts to trigger allocation
+            max_new_tokens=1, temperature=0.001, eos_token_id=0,
+        )
+        print(f"  Batch KV cache pre-allocated: G={args.num_generations}, seq={batch_seq_len}")
+
         from lora_sync import LoRASyncer
         syncer = LoRASyncer(model, engine,
                             lora_alpha=args.lora_rank, lora_rank=args.lora_rank)

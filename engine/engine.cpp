@@ -1081,7 +1081,24 @@ std::vector<int> InferenceEngine::generate(
 
 void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     if (batch_ && batch_->G >= G && batch_->max_seq_len >= max_seq_len) return;
-    if (batch_) { /* TODO: free old */ }
+    if (batch_) {
+        // Free old batch state before reallocating
+        cudaFree(batch_->hidden); cudaFree(batch_->residual);
+        cudaFree(batch_->norm_buf); cudaFree(batch_->q_buf);
+        cudaFree(batch_->k_buf); cudaFree(batch_->v_buf);
+        cudaFree(batch_->attn_out); cudaFree(batch_->gate_buf);
+        cudaFree(batch_->up_buf); cudaFree(batch_->logits);
+        cudaFree(batch_->attn_scores); cudaFree(batch_->dequant_scratch);
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            cudaFree(batch_->kv_keys[i]);
+            cudaFree(batch_->kv_values[i]);
+        }
+        cudaFree(batch_->d_positions); cudaFree(batch_->d_tokens);
+        cudaFree(batch_->d_randoms);
+        delete[] batch_->h_positions; delete[] batch_->h_tokens;
+        delete[] batch_->h_finished; delete[] batch_->h_randoms;
+        delete batch_;
+    }
     batch_ = new BatchState();
     batch_->G = G;
     batch_->max_seq_len = max_seq_len;
