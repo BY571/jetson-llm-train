@@ -244,6 +244,12 @@ struct BatchState {
     // Pre-generated random values for all tokens (max_new_tokens * G)
     float* d_all_randoms;   // device (max_tokens * G)
     int all_randoms_size;   // number of floats allocated
+
+    // Pointer indirection for CUDA graph-compatible sampling
+    // d_randoms_ptr is a device-side pointer TO d_all_randoms + step*G.
+    // Updated via 8-byte cudaMemcpyAsync before each graph launch.
+    // The graph's sampling kernel reads *d_randoms_ptr (stable address).
+    float** d_randoms_ptr;  // device: points to current step's randoms slice
 };
 
 // Top-level engine

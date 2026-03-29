@@ -1097,12 +1097,13 @@ __global__ void argmax_batch_kernel(const float* logits, int* tokens, int vocab,
 __global__ void sample_batch_kernel(
     float* __restrict__ logits,   // (VOCAB_SIZE, G) column-major, modified in-place
     int* __restrict__ tokens,     // (G,) output token ids
-    const float* __restrict__ randoms, // (G,) uniform random values [0,1)
+    const float* const* __restrict__ randoms_ptr, // pointer to (G,) randoms (indirection for CUDA graphs)
     int vocab, int G,
     float temperature, float top_p
 ) {
     int g = blockIdx.x;
     if (g >= G) return;
+    const float* randoms = *randoms_ptr;  // dereference outer pointer
     float* col = logits + (size_t)g * vocab;
     int wid = threadIdx.x / warpSize, lid = threadIdx.x % warpSize;
     int n_warps = (blockDim.x + warpSize - 1) / warpSize;
@@ -1216,9 +1217,9 @@ __global__ void sample_batch_kernel(
     }
 }
 
-void launch_sample_batch(float* logits, int* tokens, const float* randoms,
+void launch_sample_batch(float* logits, int* tokens, const float* const* randoms_ptr,
                          int vocab, int G, float temperature, float top_p, cudaStream_t s) {
-    sample_batch_kernel<<<G, 256, 0, s>>>(logits, tokens, randoms, vocab, G, temperature, top_p);
+    sample_batch_kernel<<<G, 256, 0, s>>>(logits, tokens, randoms_ptr, vocab, G, temperature, top_p);
 }
 
 // Launch wrappers for batch kernels

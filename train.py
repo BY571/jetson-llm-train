@@ -391,14 +391,7 @@ def train(args):
         engine.load_weights(weights_path)
         engine.cache_weights()
 
-        # Pre-allocate batch arena at max size
-        dummy_prompt = list(range(200))
-        engine.generate_batch(
-            [dummy_prompt] * args.num_generations,
-            max_new_tokens=args.max_completion_tokens,
-            temperature=0.001, top_p=1.0, eos_token_id=dummy_prompt[0],
-        )
-        print(f"  Engine loaded + arena pre-allocated")
+        print(f"  Engine weights loaded + cached")
 
     # ── Load PyTorch model (gets remaining contiguous VRAM) ──
     print(f"\nLoading {args.model} (4-bit NF4, fp16)...")
@@ -450,6 +443,16 @@ def train(args):
         from lora_sync import LoRASyncer
         syncer = LoRASyncer(model, engine,
                             lora_alpha=args.lora_rank, lora_rank=args.lora_rank)
+
+        # Pre-allocate arena + capture CUDA graph (AFTER share_embedding so pointers are final)
+        dummy_prompt = list(range(200))
+        engine.generate_batch(
+            [dummy_prompt] * args.num_generations,
+            max_new_tokens=args.max_completion_tokens,
+            temperature=args.temperature, top_p=args.top_p,
+            eos_token_id=dummy_prompt[0],
+        )
+        print(f"  Arena pre-allocated + CUDA graph captured")
 
     # ── Optimizer + scaler ──
     trainable_params = [p for p in model.parameters() if p.requires_grad]
