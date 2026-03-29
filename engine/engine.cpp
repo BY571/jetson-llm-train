@@ -121,6 +121,7 @@ extern "C" {
     void launch_rope_batch(half* q, half* k, const half* ct, const half* st, const int* pos, int msl, int G, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, cudaStream_t s);
     void launch_kv_cache_write_batch(half* ck, half* cv, const half* k, const half* v, const int* pos, int msl, int G, int kv_dim, cudaStream_t s);
     void launch_gqa_attention_batch(half* out, const half* q, const half* ck, const half* cv, float* as, const int* pos, int msl, int G, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, cudaStream_t s);
+    void launch_gqa_prefill_attention(half* out, const half* q, const half* ck, const half* cv, float* as, int T, int msl, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, cudaStream_t s);
     void launch_silu_mul_batch(half* gate, const half* up, int total, cudaStream_t s);
     void launch_argmax_batch(const float* logits, int* tokens, int vocab, int G, cudaStream_t s);
     void launch_increment_positions(int* positions, int G, cudaStream_t s);
@@ -309,8 +310,6 @@ InferenceEngine::~InferenceEngine() {
     if (batch_arena_.base) cudaFree(batch_arena_.base);
     if (decode_graph_exec_) cudaGraphExecDestroy(decode_graph_exec_);
     if (decode_graph_) cudaGraphDestroy(decode_graph_);
-    if (prefill_graph_exec_) cudaGraphExecDestroy(prefill_graph_exec_);
-    if (prefill_graph_) cudaGraphDestroy(prefill_graph_);
     if (engine_stream_) cudaStreamDestroy(engine_stream_);
 }
 
@@ -731,28 +730,34 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
         delete batch_;
     }
 
+    // Activation buffers sized for max(G, prefill_tokens) to support chunked prefill.
+    // During prefill: process T prompt tokens in one GEMM (N=T).
+    // During decode: process G sequences in parallel (N=G).
+    // Prompt is at most max_seq_len tokens, but typically < 256.
+    int N = std::max(G, std::min(max_seq_len, 256));
+
     // Calculate total GPU memory needed
     size_t need = 0;
     auto add = [&](size_t bytes) { need = (need + 255) & ~(size_t)255; need += bytes; };
-    add(HIDDEN_SIZE * G * sizeof(half));          // hidden
-    add(HIDDEN_SIZE * G * sizeof(half));          // residual
-    add(HIDDEN_SIZE * G * sizeof(half));          // norm_buf
-    add(Q_DIM * G * sizeof(half));                // q_buf
-    add(KV_DIM * G * sizeof(half));               // k_buf
-    add(KV_DIM * G * sizeof(half));               // v_buf
-    add(Q_DIM * G * sizeof(half));                // attn_out
-    add(INTERMEDIATE_SIZE * G * sizeof(half));     // gate_buf
-    add(INTERMEDIATE_SIZE * G * sizeof(half));     // up_buf
-    add(VOCAB_SIZE * G * sizeof(float));           // logits
-    add(G * NUM_HEADS * max_seq_len * sizeof(float)); // attn_scores
+    add(HIDDEN_SIZE * N * sizeof(half));          // hidden
+    add(HIDDEN_SIZE * N * sizeof(half));          // residual
+    add(HIDDEN_SIZE * N * sizeof(half));          // norm_buf
+    add(Q_DIM * N * sizeof(half));                // q_buf
+    add(KV_DIM * N * sizeof(half));               // k_buf
+    add(KV_DIM * N * sizeof(half));               // v_buf
+    add(Q_DIM * N * sizeof(half));                // attn_out
+    add(INTERMEDIATE_SIZE * N * sizeof(half));     // gate_buf
+    add(INTERMEDIATE_SIZE * N * sizeof(half));     // up_buf
+    add(VOCAB_SIZE * G * sizeof(float));           // logits (decode only, stays at G)
+    add(std::max((size_t)G, (size_t)N) * NUM_HEADS * max_seq_len * sizeof(float)); // attn_scores
     if (!weights_cached_)
         add((size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half)); // dequant_scratch
     for (int i = 0; i < NUM_LAYERS; i++) {
         add((size_t)G * max_seq_len * KV_DIM * sizeof(half));  // kv_keys
         add((size_t)G * max_seq_len * KV_DIM * sizeof(half));  // kv_values
     }
-    add(G * sizeof(int));   // d_positions
-    add(G * sizeof(int));   // d_tokens
+    add(N * sizeof(int));   // d_positions (max(G, T))
+    add(N * sizeof(int));   // d_tokens (max(G, T))
     add(G * sizeof(float)); // d_randoms
     add(64 * G * sizeof(half)); // lora_scratch
 
@@ -764,8 +769,6 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
         batch_arena_.capacity = need;
         if (decode_graph_exec_) { cudaGraphExecDestroy(decode_graph_exec_); decode_graph_exec_ = nullptr; }
         if (decode_graph_) { cudaGraphDestroy(decode_graph_); decode_graph_ = nullptr; }
-        if (prefill_graph_exec_) { cudaGraphExecDestroy(prefill_graph_exec_); prefill_graph_exec_ = nullptr; }
-        if (prefill_graph_) { cudaGraphDestroy(prefill_graph_); prefill_graph_ = nullptr; }
         graph_G_ = 0;
     }
     batch_arena_.reset();
@@ -781,17 +784,17 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     batch_->h_token_history = nullptr;
     batch_->token_history_size = 0;
 
-    batch_->hidden    = (half*)batch_arena_.alloc(HIDDEN_SIZE * G * sizeof(half));
-    batch_->residual  = (half*)batch_arena_.alloc(HIDDEN_SIZE * G * sizeof(half));
-    batch_->norm_buf  = (half*)batch_arena_.alloc(HIDDEN_SIZE * G * sizeof(half));
-    batch_->q_buf     = (half*)batch_arena_.alloc(Q_DIM * G * sizeof(half));
-    batch_->k_buf     = (half*)batch_arena_.alloc(KV_DIM * G * sizeof(half));
-    batch_->v_buf     = (half*)batch_arena_.alloc(KV_DIM * G * sizeof(half));
-    batch_->attn_out  = (half*)batch_arena_.alloc(Q_DIM * G * sizeof(half));
-    batch_->gate_buf  = (half*)batch_arena_.alloc(INTERMEDIATE_SIZE * G * sizeof(half));
-    batch_->up_buf    = (half*)batch_arena_.alloc(INTERMEDIATE_SIZE * G * sizeof(half));
+    batch_->hidden    = (half*)batch_arena_.alloc(HIDDEN_SIZE * N * sizeof(half));
+    batch_->residual  = (half*)batch_arena_.alloc(HIDDEN_SIZE * N * sizeof(half));
+    batch_->norm_buf  = (half*)batch_arena_.alloc(HIDDEN_SIZE * N * sizeof(half));
+    batch_->q_buf     = (half*)batch_arena_.alloc(Q_DIM * N * sizeof(half));
+    batch_->k_buf     = (half*)batch_arena_.alloc(KV_DIM * N * sizeof(half));
+    batch_->v_buf     = (half*)batch_arena_.alloc(KV_DIM * N * sizeof(half));
+    batch_->attn_out  = (half*)batch_arena_.alloc(Q_DIM * N * sizeof(half));
+    batch_->gate_buf  = (half*)batch_arena_.alloc(INTERMEDIATE_SIZE * N * sizeof(half));
+    batch_->up_buf    = (half*)batch_arena_.alloc(INTERMEDIATE_SIZE * N * sizeof(half));
     batch_->logits    = (float*)batch_arena_.alloc(VOCAB_SIZE * G * sizeof(float));
-    batch_->attn_scores = (float*)batch_arena_.alloc(G * NUM_HEADS * max_seq_len * sizeof(float));
+    batch_->attn_scores = (float*)batch_arena_.alloc(std::max((size_t)G, (size_t)N) * NUM_HEADS * max_seq_len * sizeof(float));
     if (!weights_cached_) {
         batch_->dequant_scratch = (half*)batch_arena_.alloc((size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half));
     } else {
@@ -801,8 +804,8 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
         batch_->kv_keys[i]   = (half*)batch_arena_.alloc((size_t)G * max_seq_len * KV_DIM * sizeof(half));
         batch_->kv_values[i] = (half*)batch_arena_.alloc((size_t)G * max_seq_len * KV_DIM * sizeof(half));
     }
-    batch_->d_positions  = (int*)batch_arena_.alloc(G * sizeof(int));
-    batch_->d_tokens     = (int*)batch_arena_.alloc(G * sizeof(int));
+    batch_->d_positions  = (int*)batch_arena_.alloc(N * sizeof(int));
+    batch_->d_tokens     = (int*)batch_arena_.alloc(N * sizeof(int));
     batch_->d_randoms    = (float*)batch_arena_.alloc(G * sizeof(float));
     batch_->lora_scratch = (half*)batch_arena_.alloc(64 * G * sizeof(half));
 
@@ -989,6 +992,94 @@ void InferenceEngine::decode_batch(int G, cudaStream_t stream) {
     }
 }
 
+// ============================================================================
+// Chunked prefill: process T prompt tokens in one forward pass per layer
+// All G sequences share the same prompt (GRPO), so we prefill 1 sequence
+// and broadcast the KV cache to all G sequences.
+// ============================================================================
+
+void InferenceEngine::prefill_chunked(int T, int G, cudaStream_t stream) {
+    auto* B = batch_;
+    ensure_cublas(stream);
+
+    // Embed all T tokens at once: (HIDDEN_SIZE, T)
+    launch_embed_batch(B->hidden, weights_.embed_tokens, B->d_tokens, T, HIDDEN_SIZE, stream);
+
+    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+        auto& L = weights_.layers[layer];
+
+        // 1. Copy + RMSNorm (treat T as batch dim)
+        launch_copy_batch(B->residual, B->hidden, HIDDEN_SIZE * T, stream);
+        launch_rms_norm_batch(B->norm_buf, B->residual, L.input_layernorm,
+                              HIDDEN_SIZE, T, RMS_NORM_EPS, stream);
+
+        // 2. QKV projections: GEMM with N=T
+        auto project = [&](half* out, half* fp16w, NF4Weight& nf4w, const half* input,
+                           int out_dim, int in_dim) {
+            if (fp16w) batch_gemm(out, fp16w, input, out_dim, T, in_dim, stream);
+            else batch_gemm_q4l(out, nf4w, input, T, stream);
+            // No LoRA during prefill (LoRA not synced yet at this point)
+        };
+        project(B->q_buf, L.q_proj_fp16, L.q_proj_nf4, B->norm_buf, Q_DIM, HIDDEN_SIZE);
+        project(B->k_buf, L.k_proj_fp16, L.k_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
+        project(B->v_buf, L.v_proj_fp16, L.v_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
+
+        // 3. QKNorm + RoPE (pass T as "G", d_positions = [0,1,...,T-1])
+        launch_qk_norm_batch(B->q_buf, B->k_buf, L.q_norm, L.k_norm,
+                             NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, T, RMS_NORM_EPS,
+                             Q_DIM, KV_DIM, stream);
+        launch_rope_batch(B->q_buf, B->k_buf, state_.rope_cos, state_.rope_sin,
+                          B->d_positions, B->max_seq_len, T,
+                          NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, stream);
+
+        // 4. Write K,V to cache for sequence 0 (contiguous memcpy, no kernel needed)
+        // k_buf is (KV_DIM, T) col-major -> cache is (max_seq_len, KV_DIM) row-major
+        // k_buf[t] = col t = k_buf + t * KV_DIM, cache[t] = cache + t * KV_DIM -> same layout
+        cudaMemcpyAsync(B->kv_keys[layer], B->k_buf,
+                        T * KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(B->kv_values[layer], B->v_buf,
+                        T * KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+
+        // 5. Causal self-attention (T queries against T KV entries in seq 0 cache)
+        launch_gqa_prefill_attention(B->attn_out, B->q_buf,
+                                      B->kv_keys[layer], B->kv_values[layer],
+                                      B->attn_scores, T, B->max_seq_len,
+                                      NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, stream);
+
+        // 6. Output projection + residual
+        project(B->hidden, L.o_proj_fp16, L.o_proj_nf4, B->attn_out, HIDDEN_SIZE, Q_DIM);
+        launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * T, stream);
+
+        // 7. Post-attention norm
+        launch_copy_batch(B->residual, B->hidden, HIDDEN_SIZE * T, stream);
+        launch_rms_norm_batch(B->norm_buf, B->residual, L.post_attn_layernorm,
+                              HIDDEN_SIZE, T, RMS_NORM_EPS, stream);
+
+        // 8. FFN
+        project(B->gate_buf, L.gate_proj_fp16, L.gate_proj_nf4, B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+        project(B->up_buf, L.up_proj_fp16, L.up_proj_nf4, B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+        launch_silu_mul_batch(B->gate_buf, B->up_buf, INTERMEDIATE_SIZE * T, stream);
+        project(B->hidden, L.down_proj_fp16, L.down_proj_nf4, B->gate_buf, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+
+        // 9. Residual add
+        launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * T, stream);
+    }
+
+    // Broadcast KV cache from seq 0 to seqs 1..G-1
+    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+        for (int g = 1; g < G; g++) {
+            cudaMemcpyAsync(B->kv_keys[layer] + (size_t)g * B->max_seq_len * KV_DIM,
+                            B->kv_keys[layer],
+                            T * KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(B->kv_values[layer] + (size_t)g * B->max_seq_len * KV_DIM,
+                            B->kv_values[layer],
+                            T * KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+        }
+    }
+
+    // No logits/sampling needed -- prefill just fills the KV cache
+}
+
 std::vector<std::vector<int>> InferenceEngine::generate_batch(
     const std::vector<std::vector<int>>& prompts,
     int max_new_tokens, float temperature, float top_p, int eos_token_id,
@@ -1011,46 +1102,40 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
 
     std::vector<std::vector<int>> outputs(G);
 
-    // Phase 1: Prefill on engine_stream_
+    // Phase 1: Chunked prefill -- all T prompt tokens in one forward pass.
+    // All G sequences share the same prompt (GRPO), so prefill 1 sequence
+    // and broadcast the KV cache.
     cudaStream_t gen_stream = engine_stream_;
-    ensure_cublas(gen_stream);
+    {
+        // Upload all prompt tokens and positions [0..T-1] at once
+        std::vector<int> h_tokens(max_prompt_len);
+        std::vector<int> h_positions(max_prompt_len);
+        for (int t = 0; t < max_prompt_len; t++) {
+            h_tokens[t] = (t < (int)prompts[0].size()) ? prompts[0][t] : 0;
+            h_positions[t] = t;
+        }
+        cudaMemcpyAsync(B->d_tokens, h_tokens.data(), max_prompt_len * sizeof(int),
+                        cudaMemcpyHostToDevice, gen_stream);
+        cudaMemcpyAsync(B->d_positions, h_positions.data(), max_prompt_len * sizeof(int),
+                        cudaMemcpyHostToDevice, gen_stream);
 
-    // Capture prefill graph (decode_batch only, no sampling) if not yet captured
-    if (G > 1 && max_prompt_len > 1 && !prefill_graph_exec_) {
-        // Warmup
+        // Run chunked prefill (one forward pass, fills KV cache for all G seqs)
+        prefill_chunked(max_prompt_len, G, gen_stream);
+        cudaStreamSynchronize(gen_stream);
+
+        // Prepare d_tokens/d_positions for the first decode step:
+        // All G sequences start from the last prompt token at position T-1
+        for (int g = 0; g < G; g++) {
+            B->h_tokens[g] = prompts[0].back();
+            B->h_positions[g] = max_prompt_len - 1;
+        }
+        cudaMemcpy(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice);
+        // Run one decode_batch to get logits for sampling the first token
         decode_batch(G, gen_stream);
         cudaStreamSynchronize(gen_stream);
-        // Capture
-        cublas_capture_mode = true;
-        cudaError_t err = cudaStreamBeginCapture(gen_stream, cudaStreamCaptureModeRelaxed);
-        if (err == cudaSuccess) {
-            decode_batch(G, gen_stream);
-            cudaGraph_t graph = nullptr;
-            err = cudaStreamEndCapture(gen_stream, &graph);
-            if (err == cudaSuccess && graph) {
-                err = cudaGraphInstantiate(&prefill_graph_exec_, graph, 0);
-                if (err == cudaSuccess) {
-                    prefill_graph_ = graph;
-                } else { cudaGraphDestroy(graph); prefill_graph_exec_ = nullptr; }
-            }
-            if (!prefill_graph_exec_) cudaGetLastError();
-        }
-        cublas_capture_mode = false;
+        for (int g = 0; g < G; g++) B->h_positions[g] = max_prompt_len;
     }
-
-    for (int t = 0; t < max_prompt_len; t++) {
-        for (int g = 0; g < G; g++)
-            B->h_tokens[g] = (t < (int)prompts[g].size()) ? prompts[g][t] : 0;
-        cudaMemcpyAsync(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
-        cudaMemcpyAsync(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
-        if (prefill_graph_exec_)
-            cudaGraphLaunch(prefill_graph_exec_, gen_stream);
-        else
-            decode_batch(G, gen_stream);
-        for (int g = 0; g < G; g++)
-            if (t < (int)prompts[g].size()) B->h_positions[g]++;
-    }
-    cudaStreamSynchronize(gen_stream);
 
     // Pre-generate ALL random values for decode phase (enables CUDA graph)
     // Upload once to GPU, then index by step during decode.
@@ -1134,23 +1219,22 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
         }
         cublas_capture_mode = false;
 
-        // Re-prefill (warmup corrupted KV cache)
+        // Re-prefill (warmup corrupted KV cache) using chunked prefill
         for (int i = 0; i < NUM_LAYERS; i++) {
             cudaMemset(B->kv_keys[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
             cudaMemset(B->kv_values[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
         }
-        for (int g = 0; g < G; g++) B->h_positions[g] = 0;
-        for (int t = 0; t < max_prompt_len; t++) {
-            for (int g = 0; g < G; g++)
-                B->h_tokens[g] = (t < (int)prompts[g].size()) ? prompts[g][t] : 0;
-            cudaMemcpyAsync(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
-            cudaMemcpyAsync(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
-            if (prefill_graph_exec_)
-                cudaGraphLaunch(prefill_graph_exec_, gen_stream);
-            else
-                decode_batch(G, gen_stream);
-            for (int g = 0; g < G; g++)
-                if (t < (int)prompts[g].size()) B->h_positions[g]++;
+        {
+            std::vector<int> h_tok(max_prompt_len), h_pos(max_prompt_len);
+            for (int t = 0; t < max_prompt_len; t++) {
+                h_tok[t] = (t < (int)prompts[0].size()) ? prompts[0][t] : 0;
+                h_pos[t] = t;
+            }
+            cudaMemcpyAsync(B->d_tokens, h_tok.data(), max_prompt_len * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
+            cudaMemcpyAsync(B->d_positions, h_pos.data(), max_prompt_len * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
+            prefill_chunked(max_prompt_len, G, gen_stream);
+            cudaStreamSynchronize(gen_stream);
+            for (int g = 0; g < G; g++) B->h_positions[g] = max_prompt_len;
         }
         cudaStreamSynchronize(gen_stream);
         cudaMemcpy(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice);

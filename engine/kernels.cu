@@ -1050,6 +1050,98 @@ __global__ void gqa_attention_batch_kernel(
     }
 }
 
+// Causal self-attention for chunked prefill (single sequence, T query tokens)
+// Grid: dim3(num_heads, T) -- one block per (head, query_position)
+// All queries attend to seq 0's KV cache. Causal: query tq attends to 0..tq.
+__global__ void gqa_prefill_attention_kernel(
+    half* out, const half* q, const half* cache_k, const half* cache_v,
+    float* attn_scratch,
+    int T, int max_seq_len,
+    int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim
+) {
+    int head = blockIdx.x;
+    int tq = blockIdx.y;  // query position
+    if (head >= num_heads || tq >= T) return;
+
+    int gqa_groups = num_heads / num_kv_heads;
+    int kv_head = head / gqa_groups;
+    float scale = rsqrtf((float)head_dim);
+
+    // Query at position tq (column-major: q_buf is (q_dim, T))
+    const half* qh = q + tq * q_dim + head * head_dim;
+    // Scratch: one row per (tq, head), length tq+1
+    float* scores = attn_scratch + (tq * num_heads + head) * T;
+
+    // Score: dot product with cached K at positions 0..tq (causal mask)
+    // KV cache for seq 0: cache_k[p * kv_dim + kv_head * head_dim]
+    float max_score = -1e30f;
+    for (int p = threadIdx.x; p <= tq; p += blockDim.x) {
+        const half* kp = cache_k + p * kv_dim + kv_head * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += __half2float(qh[d]) * __half2float(kp[d]);
+        dot *= scale;
+        scores[p] = dot;
+        max_score = fmaxf(max_score, dot);
+    }
+
+    // Reduce max (same pattern as decode attention)
+    for (int off = warpSize/2; off > 0; off /= 2)
+        max_score = fmaxf(max_score, __shfl_down_sync(0xFFFFFFFF, max_score, off));
+    __shared__ float s_max[32];
+    int wid = threadIdx.x / warpSize, lid = threadIdx.x % warpSize;
+    if (lid == 0) s_max[wid] = max_score;
+    __syncthreads();
+    if (wid == 0) {
+        max_score = (lid < (blockDim.x+31)/32) ? s_max[lid] : -1e30f;
+        for (int off = warpSize/2; off > 0; off /= 2)
+            max_score = fmaxf(max_score, __shfl_down_sync(0xFFFFFFFF, max_score, off));
+        if (lid == 0) s_max[0] = max_score;
+    }
+    __syncthreads();
+    max_score = s_max[0];
+
+    // Softmax
+    float sum_exp = 0.0f;
+    for (int p = threadIdx.x; p <= tq; p += blockDim.x) {
+        float v = expf(scores[p] - max_score);
+        scores[p] = v;
+        sum_exp += v;
+    }
+    for (int off = warpSize/2; off > 0; off /= 2)
+        sum_exp += __shfl_down_sync(0xFFFFFFFF, sum_exp, off);
+    __shared__ float s_sum[32];
+    if (lid == 0) s_sum[wid] = sum_exp;
+    __syncthreads();
+    if (wid == 0) {
+        sum_exp = (lid < (blockDim.x+31)/32) ? s_sum[lid] : 0.0f;
+        for (int off = warpSize/2; off > 0; off /= 2)
+            sum_exp += __shfl_down_sync(0xFFFFFFFF, sum_exp, off);
+        if (lid == 0) s_sum[0] = sum_exp;
+    }
+    __syncthreads();
+    float inv_sum = 1.0f / (s_sum[0] + 1e-8f);
+    for (int p = threadIdx.x; p <= tq; p += blockDim.x)
+        scores[p] *= inv_sum;
+    __syncthreads();
+
+    // Weighted V sum (column-major output: out is (q_dim, T))
+    half* oh = out + tq * q_dim + head * head_dim;
+    int half_dim = head_dim / 2;
+    for (int d2 = threadIdx.x; d2 < half_dim; d2 += blockDim.x) {
+        float val0 = 0.0f, val1 = 0.0f;
+        for (int p = 0; p <= tq; p++) {
+            half2 v2 = reinterpret_cast<const half2*>(
+                &cache_v[p * kv_dim + kv_head * head_dim])[d2];
+            float s = scores[p];
+            val0 += s * __half2float(v2.x);
+            val1 += s * __half2float(v2.y);
+        }
+        reinterpret_cast<half2*>(oh)[d2] = __halves2half2(
+            __float2half(val0), __float2half(val1));
+    }
+}
+
 // Batched SiLU gate mul: gate (dim, G) = SiLU(gate) * up
 __global__ void silu_mul_batch_kernel(half* gate, const half* up, int total) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1247,6 +1339,11 @@ void launch_kv_cache_write_batch(half* ck, half* cv, const half* k, const half* 
 void launch_gqa_attention_batch(half* out, const half* q, const half* ck, const half* cv, float* as, const int* pos, int msl, int G, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, cudaStream_t s) {
     dim3 grid(G, num_heads);
     gqa_attention_batch_kernel<<<grid, 128, 0, s>>>(out, q, ck, cv, as, pos, msl, G, num_heads, num_kv_heads, head_dim, q_dim, kv_dim);
+}
+
+void launch_gqa_prefill_attention(half* out, const half* q, const half* ck, const half* cv, float* as, int T, int msl, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, cudaStream_t s) {
+    dim3 grid(num_heads, T);
+    gqa_prefill_attention_kernel<<<grid, 128, 0, s>>>(out, q, ck, cv, as, T, msl, num_heads, num_kv_heads, head_dim, q_dim, kv_dim);
 }
 void launch_silu_mul_batch(half* gate, const half* up, int total, cudaStream_t s) {
     silu_mul_batch_kernel<<<(total+255)/256, 256, 0, s>>>(gate, up, total);

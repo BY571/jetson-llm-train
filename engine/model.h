@@ -330,11 +330,9 @@ private:
     // Dedicated stream for batched decode (isolated from PyTorch's default stream)
     cudaStream_t engine_stream_ = nullptr;
 
-    // CUDA graphs for batched decode
+    // CUDA graph for batched decode (prefill uses chunked forward, no graph needed)
     cudaGraph_t decode_graph_ = nullptr;
     cudaGraphExec_t decode_graph_exec_ = nullptr;
-    cudaGraph_t prefill_graph_ = nullptr;       // decode_batch only (no sampling)
-    cudaGraphExec_t prefill_graph_exec_ = nullptr;
     int graph_G_ = 0;
     ModelConfig config_;
     ModelWeights weights_;
@@ -353,6 +351,7 @@ private:
     BatchState* batch_;  // allocated on first generate_batch call
     void alloc_batch(int G, int max_seq_len);
     void decode_batch(int G, cudaStream_t stream = 0);
+    void prefill_chunked(int T, int G, cudaStream_t stream);
     void forward_layer_batch(int layer_idx, int G, cudaStream_t stream);
 
     // Batched GEMM: (M,K) @ (K,N) -> (M,N) where N=G
