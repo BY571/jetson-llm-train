@@ -236,6 +236,11 @@ struct BatchState {
     float* h_randoms;   // host (G,)
     float* d_randoms;   // device (G,)
 
+    // Device-side token history (for amortized stop checking)
+    int* d_token_history;   // device (max_new_tokens * G)
+    int* h_token_history;   // host (max_new_tokens * G) -- bulk read on sync
+    int token_history_size; // allocated size
+
     // Pre-generated random values for all tokens (max_new_tokens * G)
     float* d_all_randoms;   // device (max_tokens * G)
     int all_randoms_size;   // number of floats allocated

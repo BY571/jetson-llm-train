@@ -296,6 +296,8 @@ InferenceEngine::~InferenceEngine() {
     // Free batch state
     if (batch_) {
         if (batch_->d_all_randoms) cudaFree(batch_->d_all_randoms);
+        if (batch_->d_token_history) cudaFree(batch_->d_token_history);
+        delete[] batch_->h_token_history;
         delete[] batch_->h_positions; delete[] batch_->h_tokens;
         delete[] batch_->h_finished; delete[] batch_->h_randoms;
         delete batch_;
@@ -766,6 +768,9 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     batch_->max_seq_len = max_seq_len;
     batch_->d_all_randoms = nullptr;
     batch_->all_randoms_size = 0;
+    batch_->d_token_history = nullptr;
+    batch_->h_token_history = nullptr;
+    batch_->token_history_size = 0;
 
     batch_->hidden    = (half*)batch_arena_.alloc(HIDDEN_SIZE * G * sizeof(half));
     batch_->residual  = (half*)batch_arena_.alloc(HIDDEN_SIZE * G * sizeof(half));
@@ -1080,36 +1085,73 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
         use_graph = true;
     }
 
-    // Phase 2: Decode (generate new tokens)
+    // Phase 2: Decode with amortized stop checking.
+    // Run CHECK_INTERVAL tokens on GPU without host sync, then check for stops.
+    const int CHECK_INTERVAL = 32;
+
+    // Allocate token history for bulk stop checking
+    int hist_size = max_new_tokens * G;
+    if (!B->d_token_history || B->token_history_size < hist_size) {
+        if (B->d_token_history) cudaFree(B->d_token_history);
+        CUDA_CHECK(cudaMalloc(&B->d_token_history, hist_size * sizeof(int)));
+        delete[] B->h_token_history;
+        B->h_token_history = new int[hist_size]();
+        B->token_history_size = hist_size;
+    }
+
+    // Ensure d_positions is up to date before decode loop
+    cudaMemcpy(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice);
+
     for (int step = 0; step < max_new_tokens; step++) {
-        // Forward pass (graph or eager, on engine_stream_)
+        // Forward pass
         if (use_graph) {
             cudaGraphLaunch(decode_graph_exec_, gen_stream);
         } else {
             decode_batch(G, gen_stream);
         }
 
-        // Sampling (always eager, on engine_stream_ after decode completes)
+        // Sampling
         if (temperature < 0.01f) {
             launch_argmax_batch(B->logits, B->d_tokens, VOCAB_SIZE, G, gen_stream);
         } else {
-            // Point to this step's pre-generated randoms
             launch_sample_batch(B->logits, B->d_tokens,
                                 B->d_all_randoms + step * G,
                                 VOCAB_SIZE, G, temperature, top_p, gen_stream);
         }
 
-        // Sync engine_stream_ then read tokens
-        cudaStreamSynchronize(gen_stream);
-        cudaMemcpy(B->h_tokens, B->d_tokens, G * sizeof(int), cudaMemcpyDeviceToHost);
+        // Store sampled token in history (D2D on gen_stream, no sync)
+        cudaMemcpyAsync(B->d_token_history + step * G, B->d_tokens,
+                        G * sizeof(int), cudaMemcpyDeviceToDevice, gen_stream);
 
-        // Check stopping (eos + stop sequences)
+        // Advance positions for next step
+        for (int g = 0; g < G; g++) B->h_positions[g]++;
+        cudaMemcpyAsync(B->d_positions, B->h_positions, G * sizeof(int),
+                        cudaMemcpyHostToDevice, gen_stream);
+
+        // Check stop tokens every CHECK_INTERVAL steps (or at the end)
+        bool should_check = ((step + 1) % CHECK_INTERVAL == 0) || (step + 1 == max_new_tokens);
+        if (!should_check) continue;
+
+        // Sync and bulk-read all unchecked tokens
+        cudaStreamSynchronize(gen_stream);
+
+        // Find the first unchecked step
+        int check_start = (step + 1 > CHECK_INTERVAL) ? step + 1 - CHECK_INTERVAL : 0;
+        // But we only need to check from where we last checked
+        // Simple approach: check all tokens since last check
+        int total_unchecked = (step + 1 - check_start) * G;
+        cudaMemcpy(B->h_token_history + check_start * G,
+                   B->d_token_history + check_start * G,
+                   total_unchecked * sizeof(int), cudaMemcpyDeviceToHost);
+
         bool all_done = true;
         int stop_len = stop_token_ids.size();
-        for (int g = 0; g < G; g++) {
-            if (!B->h_finished[g]) {
-                outputs[g].push_back(B->h_tokens[g]);
-                if (B->h_tokens[g] == eos_token_id) {
+        for (int s = check_start; s <= step; s++) {
+            for (int g = 0; g < G; g++) {
+                if (B->h_finished[g]) continue;
+                int tok = B->h_token_history[s * G + g];
+                outputs[g].push_back(tok);
+                if (tok == eos_token_id) {
                     B->h_finished[g] = true;
                 } else if (stop_len > 0 && (int)outputs[g].size() >= stop_len) {
                     bool match = true;
@@ -1124,14 +1166,6 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
             }
         }
         if (all_done) break;
-
-        // Update tokens + positions on engine_stream_ for next decode step
-        cudaMemcpyAsync(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
-        cudaMemcpyAsync(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
-
-        // Advance positions
-        for (int g = 0; g < G; g++)
-            if (!B->h_finished[g]) B->h_positions[g]++;
     }
 
     // Restore cuBLAS to stream 0 for PyTorch compatibility
