@@ -1006,16 +1006,19 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
 
     std::vector<std::vector<int>> outputs(G);
 
-    // Phase 1: Prefill (token by token, all G sequences in parallel)
+    // Phase 1: Prefill on engine_stream_ (async memcpy + decode, pipelined)
+    cudaStream_t gen_stream = engine_stream_;
+    ensure_cublas(gen_stream);
     for (int t = 0; t < max_prompt_len; t++) {
         for (int g = 0; g < G; g++)
             B->h_tokens[g] = (t < (int)prompts[g].size()) ? prompts[g][t] : 0;
-        cudaMemcpy(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice);
-        decode_batch(G);
+        cudaMemcpyAsync(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
+        cudaMemcpyAsync(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
+        decode_batch(G, gen_stream);
         for (int g = 0; g < G; g++)
             if (t < (int)prompts[g].size()) B->h_positions[g]++;
     }
+    cudaStreamSynchronize(gen_stream);
 
     // Pre-generate ALL random values for decode phase (enables CUDA graph)
     // Upload once to GPU, then index by step during decode.
@@ -1034,10 +1037,9 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
     }
 
     bool use_graph = false;
-    cudaStream_t gen_stream = engine_stream_;
 
     // Allocate token history + randoms indirection for amortized stop checking
-    const int CHECK_INTERVAL = 32;
+    const int CHECK_INTERVAL = 8;
     int hist_size = max_new_tokens * G;
     if (!B->d_token_history || B->token_history_size < hist_size) {
         if (B->d_token_history) cudaFree(B->d_token_history);
@@ -1109,13 +1111,13 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
         for (int t = 0; t < max_prompt_len; t++) {
             for (int g = 0; g < G; g++)
                 B->h_tokens[g] = (t < (int)prompts[g].size()) ? prompts[g][t] : 0;
-            cudaMemcpy(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice);
-            cudaMemcpy(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpyAsync(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
+            cudaMemcpyAsync(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
             decode_batch(G, gen_stream);
-            cudaStreamSynchronize(gen_stream);
             for (int g = 0; g < G; g++)
                 if (t < (int)prompts[g].size()) B->h_positions[g]++;
         }
+        cudaStreamSynchronize(gen_stream);
         cudaMemcpy(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice);
     } else if (graph_G_ == G && decode_graph_exec_) {
         use_graph = true;
