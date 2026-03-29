@@ -1,0 +1,13 @@
+engine/weights*.bin
+engine/weights*.idx
+engine/weights*.config.json
+engine/build*/
+engine/build_local/
+engine/reference_logits.npz
+__pycache__/
+*.pyc
+checkpoints*/
+outputs/
+.git/
+unsloth_compiled_cache/
+grpo_trainer_lora_model/
