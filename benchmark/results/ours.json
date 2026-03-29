@@ -1,8 +1,8 @@
 {
   "engine": "ours_dp4a",
   "steps": 20,
-  "total_time_s": 185.04063367843628,
-  "avg_step_time_s": 9.252031683921814,
+  "total_time_s": 179.82286858558655,
+  "avg_step_time_s": 8.991143429279328,
   "config": {
     "model": "Qwen/Qwen3-0.6B",
     "G": 4,

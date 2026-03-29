@@ -121,6 +121,7 @@ extern "C" {
     void launch_gqa_attention_batch(half* out, const half* q, const half* ck, const half* cv, float* as, const int* pos, int msl, int G, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, cudaStream_t s);
     void launch_silu_mul_batch(half* gate, const half* up, int total, cudaStream_t s);
     void launch_argmax_batch(const float* logits, int* tokens, int vocab, int G, cudaStream_t s);
+    void launch_increment_positions(int* positions, int G, cudaStream_t s);
     void launch_sample_batch(float* logits, int* tokens, const float* randoms, int vocab, int G, float temperature, float top_p, cudaStream_t s);
     void launch_rms_norm(const half* input, const half* weight, half* output, int dim, float eps, cudaStream_t stream);
     void launch_copy_rms_norm(const half* input, const half* weight, half* residual, half* norm_out, int dim, float eps, cudaStream_t stream);
@@ -1123,17 +1124,16 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
         cudaMemcpyAsync(B->d_token_history + step * G, B->d_tokens,
                         G * sizeof(int), cudaMemcpyDeviceToDevice, gen_stream);
 
-        // Advance positions for next step
-        for (int g = 0; g < G; g++) B->h_positions[g]++;
-        cudaMemcpyAsync(B->d_positions, B->h_positions, G * sizeof(int),
-                        cudaMemcpyHostToDevice, gen_stream);
+        // Advance positions on GPU (no host involvement = no sync point)
+        launch_increment_positions(B->d_positions, G, gen_stream);
 
         // Check stop tokens every CHECK_INTERVAL steps (or at the end)
         bool should_check = ((step + 1) % CHECK_INTERVAL == 0) || (step + 1 == max_new_tokens);
         if (!should_check) continue;
 
-        // Sync and bulk-read all unchecked tokens
+        // Sync and bulk-read tokens + positions
         cudaStreamSynchronize(gen_stream);
+        cudaMemcpy(B->h_positions, B->d_positions, G * sizeof(int), cudaMemcpyDeviceToHost);
 
         // Find the first unchecked step
         int check_start = (step + 1 > CHECK_INTERVAL) ? step + 1 - CHECK_INTERVAL : 0;

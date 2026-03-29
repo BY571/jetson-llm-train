@@ -1254,6 +1254,16 @@ void launch_argmax_batch(const float* logits, int* tokens, int vocab, int G, cud
     argmax_batch_kernel<<<G, 256, 0, s>>>(logits, tokens, vocab, G);
 }
 
+// Increment all positions by 1 (avoids host-device sync per token)
+__global__ void increment_positions_kernel(int* positions, int G) {
+    int g = threadIdx.x;
+    if (g < G) positions[g]++;
+}
+
+void launch_increment_positions(int* positions, int G, cudaStream_t s) {
+    increment_positions_kernel<<<1, G, 0, s>>>(positions, G);
+}
+
 // Convert fp16 array to fp32 (for NF4 LM head → fp32 logits)
 __global__ void fp16_to_fp32_kernel(const half* input, float* output, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
