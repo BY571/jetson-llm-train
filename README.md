@@ -9,8 +9,8 @@ Fast LoRA fine-tuning engine for LLMs. Custom C++/CUDA inference engine with CUD
 | TRL + HF generate | RTX 4060 | 68.3s | ~15 |
 | TRL + HF generate | Jetson Orin 8GB | 130.6s | ~7 |
 | vLLM | RTX 4060 | 5.2s | ~375 |
-| **Triebwerk** | **RTX 4060** | **6.9s** | **240-360** |
-| **Triebwerk** | **Jetson Orin 8GB** | **36s** | **60** |
+| **Triebwerk** | **RTX 4060** | **5.8s** | **~300** |
+| **Triebwerk** | **Jetson Orin 8GB** | *benchmarking...* | *~60* |
 
 Output: standard HuggingFace PEFT LoRA adapters. Load with `PeftModel.from_pretrained()`, deploy anywhere.
 
@@ -39,21 +39,22 @@ grpo_train(
 
 ## What makes it fast
 
-- **C++/CUDA inference engine**: no Python per token, no kernel launch overhead from PyTorch dispatch
-- **CUDA graphs**: entire decode step (28 layers + sampling) replayed with ~1us overhead
-- **Q4L 4-bit with dp4a**: integer dot product, 4 MACs per instruction
+- **Chunked prefill**: all prompt tokens in one forward pass per layer (weights read once, not T times)
+- **CUDA graphs**: decode + sampling captured as a single graph, ~1us launch overhead per token
+- **Pointer-indirection sampling**: device-side `float**` lets the graph read different random values each step
+- **Q4L 4-bit with dp4a**: integer dot product, 4 MACs per instruction on Jetson
 - **Batched generation**: all G completions in parallel via cuBLAS GEMM with tensor cores
 - **Arena allocator**: single cudaMalloc for all batch buffers, zero fragmentation with PyTorch
-- **GPU-side sampling**: temperature + top-p nucleus sampling on GPU, pointer indirection for graph compatibility
-- **Amortized stop checking**: sync every 8 tokens instead of every token
+- **Amortized stop checking**: sync every 8 tokens instead of every token, GPU-side position increment
+- **GPU-GPU LoRA sync**: direct device-to-device memcpy, no CPU roundtrip
 
 ## Architecture
 
 ```
 Training step:
-  1. Triebwerk generates G completions (CUDA graph, 240-360 tok/s)
+  1. Triebwerk generates G completions (chunked prefill + CUDA graph decode, ~300 tok/s)
   2. Reward functions score completions (Python)
-  3. PyTorch forward pass computes log-probs (batched)
+  3. PyTorch forward pass computes log-probs (batched, one call for all G)
   4. GRPO loss: clipped surrogate with per-group advantage normalization
   5. PyTorch backward + optimizer step
   6. LoRA weights synced to engine via GPU-GPU memcpy (~0.02ms)
