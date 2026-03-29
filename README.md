@@ -1,22 +1,20 @@
-# jetson-llm-train
+# Triebwerk
 
-Fast GRPO fine-tuning for LLMs on NVIDIA Jetson and other GPUs. Custom C++/CUDA inference engine for generation, PyTorch for training.
+Fast LoRA fine-tuning engine for LLMs. Custom C++/CUDA inference engine with CUDA graphs, dp4a 4-bit quantization, and zero-overhead batched generation. PyTorch handles gradients, Triebwerk handles speed.
 
-## What this does
+## Performance
 
-GRPO (Group Relative Policy Optimization) trains language models using reinforcement learning: generate multiple completions, score them with reward functions, update the model to produce better outputs. The bottleneck is generation — our C++ engine makes it **3.6x faster** end-to-end than TRL on Jetson Orin.
-
-| Setup | Device | Step time | 300 steps |
+| Setup | Device | Step time | tok/s |
 |---|---|---|---|
-| TRL + HF generate | Jetson Orin 8GB | ~131s/step | ~11h |
-| **Ours (C++ engine)** | **Jetson Orin 8GB** | **~36s/step** | **~3h** |
-| TRL + vLLM | Jetson Orin 8GB | OOM | -- |
+| TRL + HF generate | RTX 4060 | 68.3s | ~15 |
+| TRL + HF generate | Jetson Orin 8GB | 130.6s | ~7 |
+| vLLM | RTX 4060 | 5.2s | ~375 |
+| **Triebwerk** | **RTX 4060** | **6.9s** | **240-360** |
+| **Triebwerk** | **Jetson Orin 8GB** | **36s** | **60** |
 
 Output: standard HuggingFace PEFT LoRA adapters. Load with `PeftModel.from_pretrained()`, deploy anywhere.
 
 ## Quick start
-
-Define a reward function, call `grpo_train()`:
 
 ```python
 from train import grpo_train
@@ -39,121 +37,79 @@ grpo_train(
 )
 ```
 
-See `examples/` for complete working examples:
-- `examples/gsm8k.py` — math reasoning with structured output
-- `examples/custom_reward.py` — custom reward functions
+## What makes it fast
 
-## Running on Jetson
-
-```bash
-# Build Docker image
-docker build --network=host -t jetson-llm-train .
-
-# Convert weights (one-time)
-docker run --runtime nvidia --network=host \
-  -v $(pwd):/workspace \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  jetson-llm-train \
-  python3 engine/convert_weights.py --model Qwen/Qwen3-0.6B --output engine/weights_q4l --mode q4l
-
-# Train
-docker run --runtime nvidia --network=host \
-  -v $(pwd):/workspace \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  jetson-llm-train \
-  bash -c 'PYTHONPATH=engine/build2 python3 train.py --max-steps 300'
-```
-
-## Running without a Jetson (dry run)
-
-Test the full training loop on any machine using HuggingFace generate:
-
-```bash
-pip install torch transformers peft datasets bitsandbytes
-python3 train.py --max-steps 5 --dry-run
-python3 examples/gsm8k.py --dry-run --max-steps 5
-```
+- **C++/CUDA inference engine**: no Python per token, no kernel launch overhead from PyTorch dispatch
+- **CUDA graphs**: entire decode step (28 layers + sampling) replayed with ~1us overhead
+- **Q4L 4-bit with dp4a**: integer dot product, 4 MACs per instruction
+- **Batched generation**: all G completions in parallel via cuBLAS GEMM with tensor cores
+- **Arena allocator**: single cudaMalloc for all batch buffers, zero fragmentation with PyTorch
+- **GPU-side sampling**: temperature + top-p nucleus sampling on GPU, pointer indirection for graph compatibility
+- **Amortized stop checking**: sync every 8 tokens instead of every token
 
 ## Architecture
 
 ```
 Training step:
-  1. C++ engine generates G completions per prompt (Q4L dp4a, 83 tok/s)
+  1. Triebwerk generates G completions (CUDA graph, 240-360 tok/s)
   2. Reward functions score completions (Python)
-  3. PyTorch forward pass computes log-probs
+  3. PyTorch forward pass computes log-probs (batched)
   4. GRPO loss: clipped surrogate with per-group advantage normalization
   5. PyTorch backward + optimizer step
-  6. LoRA weights synced back to C++ engine (~2ms)
+  6. LoRA weights synced to engine via GPU-GPU memcpy (~0.02ms)
 ```
 
-The C++ engine handles generation (the bottleneck). PyTorch handles loss computation and gradient updates (cheap, <1s per step). LoRA adapters are synced bidirectionally between PyTorch and the engine after each step.
+## Running
+
+```bash
+# Build the engine (one-time)
+cd engine && mkdir -p build_local && cd build_local
+cmake .. -DCMAKE_CUDA_ARCHITECTURES=89  # 87 for Jetson, 89 for RTX 4060
+make -j$(nproc)
+
+# Convert weights (one-time)
+python3 engine/convert_weights.py --model Qwen/Qwen3-0.6B --output engine/weights_q4l --mode q4l
+
+# Train
+PYTHONPATH=engine/build_local python3 train.py --max-steps 300
+
+# Quick test (3 steps)
+PYTHONPATH=engine/build_local python3 train.py --max-steps 3
+
+# Dry run (no C++ engine needed)
+python3 train.py --max-steps 5 --dry-run
+```
 
 ## Supported models
 
-All Qwen3 variants (same architecture, runtime config):
+All Qwen3 variants (runtime config, no recompilation):
 
 | Model | Validated | Notes |
 |---|---|---|
-| Qwen3-0.6B | Yes | Fits on Jetson Orin 8GB |
+| Qwen3-0.6B | Yes | Fits on 8GB |
 | Qwen3-1.7B | Config ready | Needs 16GB+ |
 | Qwen3-4B | Config ready | Needs 16GB+ |
 | Qwen3-8B | Config ready | Needs 24GB+ |
 
-The engine reads model dimensions from a JSON config file at runtime — no recompilation needed.
-
 ## Supported hardware
 
-- **Validated**: NVIDIA Jetson Orin Nano 8GB (sm_87)
+- **Validated**: RTX 4060 Laptop 8GB (sm_89), Jetson Orin Nano 8GB (sm_87)
 - **Target**: Any NVIDIA GPU with sm_61+ (Pascal and later)
-- JetPack 6.x (CUDA 12.6) on Jetson
 
 ## Repo structure
 
 ```
-train.py                  # Standalone GRPO trainer (no TRL dependency)
+train.py                  # GRPO trainer (no TRL dependency)
 engine/                   # C++/CUDA inference engine
-  model.h                 #   Model config + weight structs
-  engine.cpp              #   Forward pass, generation loop
-  kernels.cu              #   CUDA kernels (Q4L dp4a GEMV, attention, RoPE, sampling)
-  nf4_gemv_fast.cu        #   Optimized GEMV kernels (dp4a, NF4, fused variants)
+  engine.cpp              #   Forward pass, CUDA graphs, generation loop
+  kernels.cu              #   CUDA kernels (attention, RoPE, sampling, norms)
+  nf4_gemv_fast.cu        #   4-bit GEMV/GEMM kernels (dp4a, fused variants)
+  model.h                 #   Model config, weight structs, arena allocator
   weights.cpp             #   Weight loader
   engine_py.cpp           #   Python bindings (pybind11)
   convert_weights.py      #   HF model -> Q4L weight format
-  test_all.py             #   Engine test suite
-  bench_nf4.py            #   Generation speed benchmark
-  bench_gemv.cu           #   GEMV microbenchmark
-benchmark/                # TRL comparison benchmark
-  config.py               #   Shared hyperparameters (both scripts use this)
-  bench_trl.py            #   TRL GRPOTrainer baseline
-  bench_ours.py           #   Our engine benchmark
-  compare.py              #   Print comparison table
-examples/                 # Usage examples
-  gsm8k.py                #   GSM8K math reasoning
-  custom_reward.py        #   Custom reward function
+benchmark/                # Speed comparison (vs TRL, vLLM)
+examples/                 # Usage examples (GSM8K, custom rewards)
 lora_sync.py              # LoRA weight sync (PyTorch <-> engine)
 jetson_compat.py          # Jetson AMP/dtype patches
 ```
-
-## Jetson setup
-
-On 8GB Jetson, every MB counts. Free ~1GB RAM before training:
-
-```bash
-# Disable desktop GUI (~800MB saved)
-sudo systemctl set-default multi-user.target
-
-# Add 16GB NVMe swap
-sudo fallocate -l 16G /home/$USER/16GB.swap
-sudo chmod 600 /home/$USER/16GB.swap
-sudo mkswap /home/$USER/16GB.swap
-sudo swapon /home/$USER/16GB.swap
-```
-
-See [Jetson AI Lab RAM optimization guide](https://www.jetson-ai-lab.com/tutorials/ram-optimization/).
-
-## Key constraints
-
-- **No vLLM on Jetson** (ARM, not supported) — our C++ engine replaces it
-- **No bf16 on Jetson** — `jetson_compat.py` patches AMP for fp16
-- **8GB unified memory** — CPU and GPU share RAM, 4-bit quantization is essential
-- **PyTorch from Jetson AI Lab index** — `pip install` with `--no-deps` to avoid overwriting with x86 builds
