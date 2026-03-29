@@ -137,6 +137,53 @@ def compute_token_logprobs(model, prompt_ids, completion_ids, device):
     return comp_lp
 
 
+def compute_batch_token_logprobs(model, completions, device):
+    """Batched forward pass for all G completions at once.
+
+    Much faster than G sequential calls: one GEMM instead of G GEMVs.
+    Returns list of (completion_len_i,) tensors.
+    """
+    # Build padded batch (left-pad so completion tokens align at the right)
+    seqs = [c["prompt_ids"] + c["completion_ids"] for c in completions]
+    max_len = max(len(s) for s in seqs)
+    prompt_lens = [len(c["prompt_ids"]) for c in completions]
+    comp_lens = [len(c["completion_ids"]) for c in completions]
+
+    # Pad sequences and create attention mask
+    pad_id = 0
+    padded = []
+    masks = []
+    for s in seqs:
+        pad_len = max_len - len(s)
+        padded.append([pad_id] * pad_len + s)
+        masks.append([0] * pad_len + [1] * len(s))
+
+    input_ids = torch.tensor(padded, device=device)
+    attention_mask = torch.tensor(masks, device=device)
+
+    with torch.amp.autocast("cuda", dtype=torch.float16):
+        outputs = model(input_ids, attention_mask=attention_mask)
+
+    # Compute log-probs per-sequence to avoid OOM on full vocab softmax
+    # (4 × 600 × 151936 × 4 bytes = 1.4GB in fp32)
+    result = []
+    for i in range(len(completions)):
+        seq_logits = outputs.logits[i, :-1, :]  # (seq_len-1, vocab)
+        seq_targets = input_ids[i, 1:]
+        # fp32 softmax for stability, but only one sequence at a time
+        lp = F.log_softmax(seq_logits.float(), dim=-1)
+        tok_lp = lp.gather(1, seq_targets.unsqueeze(1)).squeeze(1)
+        # Extract completion portion
+        pad_len = max_len - len(seqs[i])
+        start = pad_len + prompt_lens[i] - 1
+        end = start + comp_lens[i]
+        result.append(tok_lp[start:end].detach())
+        del seq_logits, lp, tok_lp
+
+    del outputs, input_ids, attention_mask
+    return result
+
+
 def grpo_step(model, optimizer, scaler, samples, config):
     """One GRPO gradient step.
 
@@ -498,16 +545,9 @@ def train(args):
         # 4. Compute advantages
         advantages = compute_advantages(rewards, args.num_generations)
 
-        # 5. Compute reference log-probs (old policy, no grad, one at a time)
-        old_logprobs = []
+        # 5. Compute reference log-probs (batched: one forward pass for all G completions)
         with torch.no_grad():
-            for c in completions:
-                lp = compute_token_logprobs(
-                    model, c["prompt_ids"], c["completion_ids"], device
-                ).detach()
-                old_logprobs.append(lp)
-                # No .cpu() on Jetson unified memory (CPU=GPU RAM, copy wastes memory)
-                # No empty_cache() — allocator reuses blocks for next forward pass
+            old_logprobs = compute_batch_token_logprobs(model, completions, device)
 
         # 6. Build samples for the gradient step
         samples = []

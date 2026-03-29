@@ -613,9 +613,12 @@ void InferenceEngine::update_lora_weight(
         cudaMallocChecked(&(*target)->B, B_rows * B_cols * sizeof(half));
     }
 
-    // Copy weights to GPU
-    cudaMemcpy((*target)->A, A_data, A_rows * A_cols * sizeof(half), cudaMemcpyHostToDevice);
-    cudaMemcpy((*target)->B, B_data, B_rows * B_cols * sizeof(half), cudaMemcpyHostToDevice);
+    // Copy weights (auto-detect host vs device source)
+    cudaPointerAttributes attr;
+    cudaPointerGetAttributes(&attr, A_data);
+    auto kind = (attr.type == cudaMemoryTypeDevice) ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice;
+    cudaMemcpy((*target)->A, A_data, A_rows * A_cols * sizeof(half), kind);
+    cudaMemcpy((*target)->B, B_data, B_rows * B_cols * sizeof(half), kind);
     (*target)->rank = A_rows;
     (*target)->in_features = A_cols;
     (*target)->out_features = B_rows;

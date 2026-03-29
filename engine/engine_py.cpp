@@ -85,6 +85,22 @@ PYBIND11_MODULE(jetson_engine, m) {
              py::arg("A"), py::arg("B"), py::arg("scale") = 1.0f,
              "Update a single LoRA adapter (pass numpy fp16 arrays)")
 
+        .def("update_lora_gpu", [](InferenceEngine& self,
+                                    int layer_idx, const std::string& proj_name,
+                                    size_t A_ptr, int A_rows, int A_cols,
+                                    size_t B_ptr, int B_rows, int B_cols, float scale) {
+                 self.update_lora_weight(
+                     layer_idx, proj_name.c_str(),
+                     reinterpret_cast<const half*>(A_ptr), A_rows, A_cols,
+                     reinterpret_cast<const half*>(B_ptr), B_rows, B_cols,
+                     scale);
+             },
+             py::arg("layer_idx"), py::arg("proj_name"),
+             py::arg("A_ptr"), py::arg("A_rows"), py::arg("A_cols"),
+             py::arg("B_ptr"), py::arg("B_rows"), py::arg("B_cols"),
+             py::arg("scale") = 1.0f,
+             "Update LoRA from GPU pointers (pass tensor.data_ptr(), avoids CPU roundtrip)")
+
         .def("decode_token", &InferenceEngine::decode,
              py::arg("token_id"),
              "Process one token through the model")
