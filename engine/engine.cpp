@@ -308,6 +308,8 @@ InferenceEngine::~InferenceEngine() {
     if (batch_arena_.base) cudaFree(batch_arena_.base);
     if (decode_graph_exec_) cudaGraphExecDestroy(decode_graph_exec_);
     if (decode_graph_) cudaGraphDestroy(decode_graph_);
+    if (prefill_graph_exec_) cudaGraphExecDestroy(prefill_graph_exec_);
+    if (prefill_graph_) cudaGraphDestroy(prefill_graph_);
     if (engine_stream_) cudaStreamDestroy(engine_stream_);
 }
 
@@ -761,6 +763,8 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
         batch_arena_.capacity = need;
         if (decode_graph_exec_) { cudaGraphExecDestroy(decode_graph_exec_); decode_graph_exec_ = nullptr; }
         if (decode_graph_) { cudaGraphDestroy(decode_graph_); decode_graph_ = nullptr; }
+        if (prefill_graph_exec_) { cudaGraphExecDestroy(prefill_graph_exec_); prefill_graph_exec_ = nullptr; }
+        if (prefill_graph_) { cudaGraphDestroy(prefill_graph_); prefill_graph_ = nullptr; }
         graph_G_ = 0;
     }
     batch_arena_.reset();
@@ -1006,15 +1010,42 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
 
     std::vector<std::vector<int>> outputs(G);
 
-    // Phase 1: Prefill on engine_stream_ (async memcpy + decode, pipelined)
+    // Phase 1: Prefill on engine_stream_
     cudaStream_t gen_stream = engine_stream_;
     ensure_cublas(gen_stream);
+
+    // Capture prefill graph (decode_batch only, no sampling) if not yet captured
+    if (G > 1 && max_prompt_len > 1 && !prefill_graph_exec_) {
+        // Warmup
+        decode_batch(G, gen_stream);
+        cudaStreamSynchronize(gen_stream);
+        // Capture
+        cublas_capture_mode = true;
+        cudaError_t err = cudaStreamBeginCapture(gen_stream, cudaStreamCaptureModeRelaxed);
+        if (err == cudaSuccess) {
+            decode_batch(G, gen_stream);
+            cudaGraph_t graph = nullptr;
+            err = cudaStreamEndCapture(gen_stream, &graph);
+            if (err == cudaSuccess && graph) {
+                err = cudaGraphInstantiate(&prefill_graph_exec_, graph, 0);
+                if (err == cudaSuccess) {
+                    prefill_graph_ = graph;
+                } else { cudaGraphDestroy(graph); prefill_graph_exec_ = nullptr; }
+            }
+            if (!prefill_graph_exec_) cudaGetLastError();
+        }
+        cublas_capture_mode = false;
+    }
+
     for (int t = 0; t < max_prompt_len; t++) {
         for (int g = 0; g < G; g++)
             B->h_tokens[g] = (t < (int)prompts[g].size()) ? prompts[g][t] : 0;
         cudaMemcpyAsync(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
         cudaMemcpyAsync(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
-        decode_batch(G, gen_stream);
+        if (prefill_graph_exec_)
+            cudaGraphLaunch(prefill_graph_exec_, gen_stream);
+        else
+            decode_batch(G, gen_stream);
         for (int g = 0; g < G; g++)
             if (t < (int)prompts[g].size()) B->h_positions[g]++;
     }
@@ -1113,7 +1144,10 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
                 B->h_tokens[g] = (t < (int)prompts[g].size()) ? prompts[g][t] : 0;
             cudaMemcpyAsync(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
             cudaMemcpyAsync(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice, gen_stream);
-            decode_batch(G, gen_stream);
+            if (prefill_graph_exec_)
+                cudaGraphLaunch(prefill_graph_exec_, gen_stream);
+            else
+                decode_batch(G, gen_stream);
             for (int g = 0; g < G; g++)
                 if (t < (int)prompts[g].size()) B->h_positions[g]++;
         }

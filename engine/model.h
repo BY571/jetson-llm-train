@@ -330,9 +330,11 @@ private:
     // Dedicated stream for batched decode (isolated from PyTorch's default stream)
     cudaStream_t engine_stream_ = nullptr;
 
-    // CUDA graph for batched decode + sampling
+    // CUDA graphs for batched decode
     cudaGraph_t decode_graph_ = nullptr;
     cudaGraphExec_t decode_graph_exec_ = nullptr;
+    cudaGraph_t prefill_graph_ = nullptr;       // decode_batch only (no sampling)
+    cudaGraphExec_t prefill_graph_exec_ = nullptr;
     int graph_G_ = 0;
     ModelConfig config_;
     ModelWeights weights_;
