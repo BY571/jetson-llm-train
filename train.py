@@ -667,13 +667,19 @@ def train(args):
     with open(f"{run_dir}/summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"\n{'=' * 60}")
-    print(f"Training complete!")
-    print(f"  Time: {total_time/3600:.1f}h ({total_time/args.max_steps:.1f}s/step)")
-    print(f"  Final reward: {summary['final_mean_reward']:.2f}")
-    print(f"  LoRA: {final_path}")
-    print(f"  Metrics: {run_dir}/metrics.json")
-    print(f"{'=' * 60}")
+    total_gen_tokens = sum(m["gen_tokens"] for m in all_metrics)
+    total_gen_time = sum(m["gen_time"] for m in all_metrics)
+    avg_tok_s = total_gen_tokens / total_gen_time if total_gen_time > 0 else 0
+
+    print(f"\n   \033[90m{'=' * 62}\033[0m")
+    print(f"   \033[1m{'Training complete!':^62}\033[0m")
+    print(f"   \033[90m{'-' * 62}\033[0m")
+    print(f"   \033[1m Zeit:\033[0m       {total_time/3600:.1f}h ({total_time/args.max_steps:.1f}s/step)")
+    print(f"   \033[1m Tokens:\033[0m     {total_gen_tokens:,} in {total_gen_time:.1f}s ({avg_tok_s:.0f} tok/s)")
+    print(f"   \033[1m Belohnung:\033[0m  {summary['final_mean_reward']:.2f}")
+    print(f"   \033[1m LoRA:\033[0m       {final_path}")
+    print(f"   \033[1m Metriken:\033[0m   {run_dir}/metrics.json")
+    print(f"   \033[90m{'=' * 62}\033[0m")
 
 
 def grpo_train(
