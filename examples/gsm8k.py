@@ -1,12 +1,12 @@
 """Train Qwen3-0.6B to solve GSM8K math problems with GRPO.
 
-This is the standard benchmark: the model learns to output structured
-reasoning in <reasoning>...</reasoning><answer>...</answer> format.
+Uses granular reward functions (format, integer check, correctness) that
+provide learning signal even when the model can't solve the math yet.
+Based on Will Bieniek's GRPO recipe and SimpleRL-Zoo.
 
-On Jetson (with C++ engine):
-    PYTHONPATH=engine/build2 python3 examples/gsm8k.py
-
-Dry run (any machine, HF generate):
+Usage:
+    PYTHONPATH=engine/build_local python3 examples/gsm8k.py
+    PYTHONPATH=engine/build_local python3 examples/gsm8k.py --max-steps 500
     python3 examples/gsm8k.py --dry-run --max-steps 5
 """
 import re
@@ -16,8 +16,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datasets import load_dataset
 from train import grpo_train
-
-# ── Dataset ──
 
 SYSTEM_PROMPT = """Respond in the following format:
 <reasoning>
@@ -39,34 +37,71 @@ def get_gsm8k():
     })
 
 
-# ── Reward functions ──
+# ── Granular reward functions ──
+# Multiple small rewards > one big binary reward. The model learns
+# format first (easy), then integer extraction, then correctness.
 
-def correctness_reward(completions, answer, **kwargs):
-    """2.0 if extracted answer matches, -1.0 otherwise."""
+def xmlcount_reward(completions, **kwargs):
+    """Granular XML tag reward (0-0.5). Each correct tag placement = 0.125."""
     rewards = []
-    for completion, ans in zip(completions, answer):
-        match = re.search(r"<answer>(.*?)</answer>", completion, re.DOTALL)
-        extracted = match.group(1).strip() if match else ""
-        rewards.append(2.0 if extracted == ans else -1.0)
+    for text in completions:
+        score = 0.0
+        if text.count("<reasoning>") == 1: score += 0.125
+        if text.count("</reasoning>") == 1: score += 0.125
+        if text.count("<answer>") == 1: score += 0.125
+        if text.count("</answer>") == 1: score += 0.125
+        # Penalize trailing content after </answer>
+        parts = text.split("</answer>")
+        if len(parts) > 1:
+            trailing = parts[-1].strip()
+            score -= len(trailing) * 0.001
+        rewards.append(max(0.0, score))
     return rewards
 
 
 def format_reward(completions, **kwargs):
-    """1.0 for correct XML format, 0.5 for answer only, 0.0 otherwise."""
+    """Full structure reward (0 or 0.5). Requires both tags in correct order."""
     rewards = []
-    for completion in completions:
-        has_reasoning = bool(re.search(r"<reasoning>.*?</reasoning>", completion, re.DOTALL))
-        has_answer = bool(re.search(r"<answer>.*?</answer>", completion, re.DOTALL))
-        if has_reasoning and has_answer:
-            rewards.append(1.0)
-        elif has_answer:
+    for text in completions:
+        if re.search(r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>", text, re.DOTALL):
             rewards.append(0.5)
         else:
             rewards.append(0.0)
     return rewards
 
 
-# ── Train ──
+def integer_reward(completions, **kwargs):
+    """Is the extracted answer a valid integer? (0 or 0.5)."""
+    rewards = []
+    for text in completions:
+        match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
+        if match:
+            answer_text = match.group(1).strip()
+            # Remove commas, dollar signs, etc.
+            cleaned = re.sub(r'[,$%\s]', '', answer_text)
+            try:
+                int(cleaned)
+                rewards.append(0.5)
+            except ValueError:
+                rewards.append(0.0)
+        else:
+            rewards.append(0.0)
+    return rewards
+
+
+def correctness_reward(completions, answer, **kwargs):
+    """Exact match with ground truth (0 or 2.0)."""
+    rewards = []
+    for text, target in zip(completions, answer):
+        match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
+        if match:
+            extracted = re.sub(r'[,$%\s]', '', match.group(1).strip())
+            target_clean = re.sub(r'[,$%\s]', '', target.strip())
+            rewards.append(2.0 if extracted == target_clean else 0.0)
+        else:
+            rewards.append(0.0)
+    return rewards
+
 
 if __name__ == "__main__":
     import argparse
@@ -77,7 +112,7 @@ if __name__ == "__main__":
 
     grpo_train(
         dataset=get_gsm8k(),
-        reward_funcs=[format_reward, correctness_reward],
+        reward_funcs=[xmlcount_reward, format_reward, integer_reward, correctness_reward],
         model="Qwen/Qwen3-0.6B",
         max_steps=args.max_steps,
         num_generations=4,

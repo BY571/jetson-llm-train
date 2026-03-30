@@ -43,6 +43,7 @@ grpo_train(
 - **CUDA graphs**: decode + sampling captured as a single graph, ~1us launch overhead per token
 - **Pointer-indirection sampling**: device-side `float**` lets the graph read different random values each step
 - **Q4L 4-bit with dp4a**: integer dot product, 4 MACs per instruction on Jetson
+- **TurboQuant KV cache**: 4x-8x KV cache compression via random rotation + Lloyd-Max quantization ([paper](https://arxiv.org/abs/2504.19874))
 - **Batched generation**: all G completions in parallel via cuBLAS GEMM with tensor cores
 - **Arena allocator**: single cudaMalloc for all batch buffers, zero fragmentation with PyTorch
 - **Amortized stop checking**: sync every 8 tokens instead of every token, GPU-side position increment
@@ -81,6 +82,40 @@ PYTHONPATH=engine/build_local python3 train.py --max-steps 3
 python3 train.py --max-steps 5 --dry-run
 ```
 
+## TurboQuant: compressed KV cache
+
+Compresses the KV cache using random rotation + optimal scalar quantization ([Zandieh et al. 2025](https://arxiv.org/abs/2504.19874)). The rotation decorrelates coordinates so each can be quantized independently with Lloyd-Max centroids. Only 32 KB of overhead for the shared rotation matrix.
+
+| Mode | KV bits | Memory reduction | Quality (0.6B) |
+|---|---|---|---|
+| `kv_bits=0` | 16 (fp16) | 1x (baseline) | Perfect |
+| `kv_bits=4` | 4 | **4x** | Good — coherent, slight accuracy loss |
+| `kv_bits=2` | 2 | **8x** | Needs 8B+ models (too aggressive for 0.6B) |
+
+### Max context length (Qwen3-0.6B, G=4 GRPO training)
+
+| Device | fp16 | TurboQuant 4-bit | Gain |
+|---|---|---|---|
+| Jetson Orin 8GB | ~7K tokens | ~24K tokens | 3.4x |
+| RTX 4060 8GB | ~7K tokens | ~24K tokens | 3.4x |
+| RTX 4090 24GB | ~20K tokens | ~65K tokens | 3.3x |
+
+### Usage
+
+```bash
+# Enable 4-bit KV cache (recommended for Qwen3-0.6B)
+PYTHONPATH=engine/build_local python3 train.py --max-steps 300 --kv-bits 4
+
+# 2-bit for larger models (8B+)
+PYTHONPATH=engine/build_local python3 train.py --max-steps 300 --kv-bits 2
+```
+
+```python
+# Python API
+engine = jetson_engine.Engine(max_seq_len=8192, kv_bits=4)
+engine.load_weights("engine/weights_q4l")
+```
+
 ## Supported models
 
 All Qwen3 variants (runtime config, no recompilation):
@@ -110,7 +145,11 @@ engine/                   # C++/CUDA inference engine
   engine_py.cpp           #   Python bindings (pybind11)
   convert_weights.py      #   HF model -> Q4L weight format
 benchmark/                # Speed comparison (vs TRL, vLLM)
-examples/                 # Usage examples (GSM8K, custom rewards)
+examples/                 # Training examples
+  countdown.py            #   Countdown numbers game (recommended for validation)
+  letter_counting.py      #   Letter counting (continuous reward signal)
+  gsm8k.py                #   GSM8K math (granular format + correctness rewards)
+  custom_reward.py        #   Custom reward function template
 lora_sync.py              # LoRA weight sync (PyTorch <-> engine)
 jetson_compat.py          # Jetson AMP/dtype patches
 ```
