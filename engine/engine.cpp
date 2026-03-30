@@ -126,6 +126,13 @@ extern "C" {
     void launch_argmax_batch(const float* logits, int* tokens, int vocab, int G, cudaStream_t s);
     void launch_increment_positions(int* positions, int G, cudaStream_t s);
     void launch_sample_batch(float* logits, int* tokens, const float* const* randoms_ptr, int vocab, int G, float temperature, float top_p, cudaStream_t s);
+    // TurboQuant kernel launchers
+    void launch_turbo_kv_quantize(uint8_t* cache_q, half* cache_norms, const half* kv_buf, const half* rotation, const int* positions, int max_seq_len, int num_tokens, int num_kv_heads, int head_dim, int kv_dim, int bits, cudaStream_t s);
+    void launch_turbo_kv_quantize_batch(uint8_t* cache_q, half* cache_norms, const half* kv_buf, const half* rotation, const int* positions, int max_seq_len, int G, int num_kv_heads, int head_dim, int kv_dim, int bits, cudaStream_t s);
+    void launch_turbo_gqa_attention_batch(half* out, const half* q, const uint8_t* ck_q, const uint8_t* cv_q, const half* k_norms, const half* v_norms, const half* rotation, float* as, const int* pos, int msl, int G, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, int bits, cudaStream_t s);
+    void launch_turbo_gqa_attention(const half* q, const uint8_t* ck_q, const uint8_t* cv_q, const half* k_norms, const half* v_norms, const half* rotation, half* output, float* as, int pos, int msl, int num_heads, int num_kv_heads, int head_dim, int bits, cudaStream_t s);
+    void launch_turbo_gqa_prefill_attention(half* out, const half* q, const uint8_t* ck_q, const uint8_t* cv_q, const half* k_norms, const half* v_norms, const half* rotation, float* as, int T, int msl, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, int bits, cudaStream_t s);
+
     void launch_rms_norm(const half* input, const half* weight, half* output, int dim, float eps, cudaStream_t stream);
     void launch_copy_rms_norm(const half* input, const half* weight, half* residual, half* norm_out, int dim, float eps, cudaStream_t stream);
     void launch_qk_norm(half* q, half* k, const half* q_weight, const half* k_weight, int num_q_heads, int num_kv_heads, int head_dim, float eps, cudaStream_t stream);
@@ -213,29 +220,45 @@ ModelConfig ModelConfig::from_json(const std::string& path) {
 #define RMS_NORM_EPS config_.rms_norm_eps
 #define ROPE_THETA config_.rope_theta
 #define GQA_GROUPS config_.gqa_groups()
+// TurboQuant: packed KV dimension (bytes per position per all heads)
+// 2-bit: 4 values per byte → kv_dim/4. 4-bit: 2 values per byte → kv_dim/2.
+#define KV_DIM_PACKED (kv_bits_ == 4 ? KV_DIM / 2 : KV_DIM / 4)
 
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
 
-InferenceEngine::InferenceEngine(int max_seq_len) {
+InferenceEngine::InferenceEngine(int max_seq_len, int kv_bits) {
     // Config and buffers are allocated in load_weights() when we know the model dims.
     // Here we just store max_seq_len and zero-init pointers.
     config_ = ModelConfig::qwen3_0_6b(); // default, overwritten by load_weights
     state_ = {};
     state_.max_seq_len = max_seq_len;
     state_.current_pos = 0;
+    kv_bits_ = kv_bits;
     batch_ = nullptr;
     cudaStreamCreate(&engine_stream_);
+    if (kv_bits_ != 0 && kv_bits_ != 2 && kv_bits_ != 4) {
+        std::cerr << "WARNING: kv_bits=" << kv_bits_ << " not supported, using 0 (fp16)" << std::endl;
+        kv_bits_ = 0;
+    }
+    if (kv_bits_ > 0)
+        std::cout << "  TurboQuant: " << kv_bits_ << "-bit KV cache enabled ("
+                  << (16 / kv_bits_) << "x memory reduction)" << std::endl;
 }
 
 void InferenceEngine::allocate_buffers() {
     int max_seq_len = state_.max_seq_len;
 
-    // Allocate KV caches
+    // Allocate KV caches (fp16 when kv_bits_==0; quantized caches allocated later)
     for (int i = 0; i < NUM_LAYERS; i++) {
-        cudaMallocChecked(&state_.kv_cache[i].key, max_seq_len * KV_DIM * sizeof(half));
-        cudaMallocChecked(&state_.kv_cache[i].value, max_seq_len * KV_DIM * sizeof(half));
+        if (kv_bits_ == 0) {
+            cudaMallocChecked(&state_.kv_cache[i].key, max_seq_len * KV_DIM * sizeof(half));
+            cudaMallocChecked(&state_.kv_cache[i].value, max_seq_len * KV_DIM * sizeof(half));
+        } else {
+            state_.kv_cache[i].key = nullptr;
+            state_.kv_cache[i].value = nullptr;
+        }
     }
 
     // Allocate scratch buffers
@@ -269,6 +292,49 @@ void InferenceEngine::allocate_buffers() {
     // LoRA scratch
     cudaMallocChecked(&state_.lora_scratch, 64 * sizeof(half)); // max rank 64
 
+    // TurboQuant: generate rotation matrix and allocate quantized KV caches
+    state_.turbo_rotation = nullptr;
+    if (kv_bits_ > 0) {
+        // Generate random orthogonal matrix via Gram-Schmidt on CPU, upload to GPU
+        int d = HEAD_DIM;
+        std::mt19937 gen(42); // fixed seed for reproducibility
+        std::normal_distribution<float> dist(0.0f, 1.0f);
+        std::vector<float> mat(d * d);
+        for (int i = 0; i < d * d; i++) mat[i] = dist(gen);
+        // Gram-Schmidt orthogonalization
+        for (int i = 0; i < d; i++) {
+            for (int j = 0; j < i; j++) {
+                float dot = 0;
+                for (int k = 0; k < d; k++) dot += mat[i * d + k] * mat[j * d + k];
+                for (int k = 0; k < d; k++) mat[i * d + k] -= dot * mat[j * d + k];
+            }
+            float norm = 0;
+            for (int k = 0; k < d; k++) norm += mat[i * d + k] * mat[i * d + k];
+            norm = 1.0f / sqrtf(norm);
+            for (int k = 0; k < d; k++) mat[i * d + k] *= norm;
+        }
+        // Upload as fp16
+        cudaMallocChecked(&state_.turbo_rotation, d * d * sizeof(half));
+        std::vector<half> fp16_mat(d * d);
+        for (int i = 0; i < d * d; i++) fp16_mat[i] = __float2half(mat[i]);
+        CUDA_CHECK(cudaMemcpy(state_.turbo_rotation, fp16_mat.data(),
+                              d * d * sizeof(half), cudaMemcpyHostToDevice));
+        std::cout << "  TurboQuant rotation matrix: " << d << "x" << d
+                  << " (" << d * d * 2 / 1024 << " KB)" << std::endl;
+
+        // Allocate quantized single-sequence KV caches
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            cudaMallocChecked(&state_.kv_cache[i].key_quant,
+                              max_seq_len * (KV_DIM_PACKED) * sizeof(uint8_t));
+            cudaMallocChecked(&state_.kv_cache[i].value_quant,
+                              max_seq_len * (KV_DIM_PACKED) * sizeof(uint8_t));
+            cudaMallocChecked(&state_.kv_cache[i].key_norms,
+                              max_seq_len * NUM_KV_HEADS * sizeof(half));
+            cudaMallocChecked(&state_.kv_cache[i].value_norms,
+                              max_seq_len * NUM_KV_HEADS * sizeof(half));
+        }
+    }
+
     // Zero-init weights
     memset(&weights_, 0, sizeof(weights_));
 }
@@ -277,7 +343,12 @@ InferenceEngine::~InferenceEngine() {
     for (int i = 0; i < NUM_LAYERS; i++) {
         cudaFree(state_.kv_cache[i].key);
         cudaFree(state_.kv_cache[i].value);
+        cudaFree(state_.kv_cache[i].key_quant);
+        cudaFree(state_.kv_cache[i].value_quant);
+        cudaFree(state_.kv_cache[i].key_norms);
+        cudaFree(state_.kv_cache[i].value_norms);
     }
+    cudaFree(state_.turbo_rotation);
     cudaFree(state_.hidden);
     cudaFree(state_.residual);
     cudaFree(state_.q_buf);
@@ -353,8 +424,15 @@ void InferenceEngine::share_embedding(void* external_embed_ptr) {
 void InferenceEngine::reset() {
     state_.current_pos = 0;
     for (int i = 0; i < NUM_LAYERS; i++) {
-        cudaMemset(state_.kv_cache[i].key, 0, state_.max_seq_len * KV_DIM * sizeof(half));
-        cudaMemset(state_.kv_cache[i].value, 0, state_.max_seq_len * KV_DIM * sizeof(half));
+        if (kv_bits_ == 0) {
+            cudaMemset(state_.kv_cache[i].key, 0, state_.max_seq_len * KV_DIM * sizeof(half));
+            cudaMemset(state_.kv_cache[i].value, 0, state_.max_seq_len * KV_DIM * sizeof(half));
+        } else {
+            cudaMemset(state_.kv_cache[i].key_quant, 0, state_.max_seq_len * (KV_DIM_PACKED));
+            cudaMemset(state_.kv_cache[i].value_quant, 0, state_.max_seq_len * (KV_DIM_PACKED));
+            cudaMemset(state_.kv_cache[i].key_norms, 0, state_.max_seq_len * NUM_KV_HEADS * sizeof(half));
+            cudaMemset(state_.kv_cache[i].value_norms, 0, state_.max_seq_len * NUM_KV_HEADS * sizeof(half));
+        }
     }
 }
 
@@ -381,6 +459,10 @@ void InferenceEngine::sleep() {
     for (int i = 0; i < NUM_LAYERS; i++) {
         cudaFree(state_.kv_cache[i].key); state_.kv_cache[i].key = nullptr;
         cudaFree(state_.kv_cache[i].value); state_.kv_cache[i].value = nullptr;
+        cudaFree(state_.kv_cache[i].key_quant); state_.kv_cache[i].key_quant = nullptr;
+        cudaFree(state_.kv_cache[i].value_quant); state_.kv_cache[i].value_quant = nullptr;
+        cudaFree(state_.kv_cache[i].key_norms); state_.kv_cache[i].key_norms = nullptr;
+        cudaFree(state_.kv_cache[i].value_norms); state_.kv_cache[i].value_norms = nullptr;
     }
 
     // Free single-sequence scratch buffers
@@ -425,8 +507,19 @@ void InferenceEngine::wake() {
     if (!state_.hidden) {
         int max_seq_len = state_.max_seq_len;
         for (int i = 0; i < NUM_LAYERS; i++) {
-            cudaMallocChecked(&state_.kv_cache[i].key, max_seq_len * KV_DIM * sizeof(half));
-            cudaMallocChecked(&state_.kv_cache[i].value, max_seq_len * KV_DIM * sizeof(half));
+            if (kv_bits_ == 0) {
+                cudaMallocChecked(&state_.kv_cache[i].key, max_seq_len * KV_DIM * sizeof(half));
+                cudaMallocChecked(&state_.kv_cache[i].value, max_seq_len * KV_DIM * sizeof(half));
+            } else {
+                cudaMallocChecked(&state_.kv_cache[i].key_quant,
+                                  max_seq_len * (KV_DIM_PACKED) * sizeof(uint8_t));
+                cudaMallocChecked(&state_.kv_cache[i].value_quant,
+                                  max_seq_len * (KV_DIM_PACKED) * sizeof(uint8_t));
+                cudaMallocChecked(&state_.kv_cache[i].key_norms,
+                                  max_seq_len * NUM_KV_HEADS * sizeof(half));
+                cudaMallocChecked(&state_.kv_cache[i].value_norms,
+                                  max_seq_len * NUM_KV_HEADS * sizeof(half));
+            }
         }
         cudaMallocChecked(&state_.hidden, HIDDEN_SIZE * sizeof(half));
         cudaMallocChecked(&state_.residual, HIDDEN_SIZE * sizeof(half));
@@ -495,15 +588,45 @@ void InferenceEngine::forward_layer(int layer_idx) {
                 NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, stream);
 
     // 4. Store K, V into cache at current position
-    cudaMemcpyAsync(kv.key + state_.current_pos * KV_DIM, state_.k_buf,
-                     KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
-    cudaMemcpyAsync(kv.value + state_.current_pos * KV_DIM, state_.v_buf,
-                     KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+    if (kv_bits_ == 0) {
+        cudaMemcpyAsync(kv.key + state_.current_pos * KV_DIM, state_.k_buf,
+                         KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(kv.value + state_.current_pos * KV_DIM, state_.v_buf,
+                         KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+    } else {
+        // TurboQuant: rotate + quantize K and V to 2-bit
+        // Use a 1-element position array on the stack (single-sequence decode)
+        int h_pos = state_.current_pos;
+        int* d_pos_tmp;
+        cudaMallocChecked(&d_pos_tmp, sizeof(int));
+        cudaMemcpyAsync(d_pos_tmp, &h_pos, sizeof(int), cudaMemcpyHostToDevice, stream);
+        launch_turbo_kv_quantize(kv.key_quant, kv.key_norms,
+                                 state_.k_buf, state_.turbo_rotation, d_pos_tmp,
+                                 state_.max_seq_len, 1,
+                                 NUM_KV_HEADS, HEAD_DIM, KV_DIM,
+                                 kv_bits_, stream);
+        launch_turbo_kv_quantize(kv.value_quant, kv.value_norms,
+                                 state_.v_buf, state_.turbo_rotation, d_pos_tmp,
+                                 state_.max_seq_len, 1,
+                                 NUM_KV_HEADS, HEAD_DIM, KV_DIM,
+                                 kv_bits_, stream);
+        cudaFree(d_pos_tmp);
+    }
 
     // 5. GQA Attention
-    launch_gqa_attention(state_.q_buf, kv.key, kv.value, state_.attn_out,
-                          state_.attn_scores, state_.current_pos, state_.max_seq_len,
-                          NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, stream);
+    if (kv_bits_ == 0) {
+        launch_gqa_attention(state_.q_buf, kv.key, kv.value, state_.attn_out,
+                              state_.attn_scores, state_.current_pos, state_.max_seq_len,
+                              NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, stream);
+    } else {
+        launch_turbo_gqa_attention(state_.q_buf,
+                                    kv.key_quant, kv.value_quant,
+                                    kv.key_norms, kv.value_norms,
+                                    state_.turbo_rotation,
+                                    state_.attn_out, state_.attn_scores,
+                                    state_.current_pos, state_.max_seq_len,
+                                    NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, kv_bits_, stream);
+    }
 
     // 6. Output projection (input: attn_out, dim=Q_DIM)
     if (!layer.o_proj_fp16 && weights_.is_q4l) {
@@ -753,8 +876,15 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     if (!weights_cached_)
         add((size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half)); // dequant_scratch
     for (int i = 0; i < NUM_LAYERS; i++) {
-        add((size_t)G * max_seq_len * KV_DIM * sizeof(half));  // kv_keys
-        add((size_t)G * max_seq_len * KV_DIM * sizeof(half));  // kv_values
+        if (kv_bits_ == 0) {
+            add((size_t)G * max_seq_len * KV_DIM * sizeof(half));  // kv_keys
+            add((size_t)G * max_seq_len * KV_DIM * sizeof(half));  // kv_values
+        } else {
+            add((size_t)G * max_seq_len * (KV_DIM_PACKED));           // kv_keys_q (2-bit packed)
+            add((size_t)G * max_seq_len * (KV_DIM_PACKED));           // kv_values_q
+            add((size_t)G * max_seq_len * NUM_KV_HEADS * sizeof(half)); // kv_keys_norms
+            add((size_t)G * max_seq_len * NUM_KV_HEADS * sizeof(half)); // kv_values_norms
+        }
     }
     add(N * sizeof(int));   // d_positions (max(G, T))
     add(N * sizeof(int));   // d_tokens (max(G, T))
@@ -801,8 +931,21 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
         batch_->dequant_scratch = nullptr;
     }
     for (int i = 0; i < NUM_LAYERS; i++) {
-        batch_->kv_keys[i]   = (half*)batch_arena_.alloc((size_t)G * max_seq_len * KV_DIM * sizeof(half));
-        batch_->kv_values[i] = (half*)batch_arena_.alloc((size_t)G * max_seq_len * KV_DIM * sizeof(half));
+        if (kv_bits_ == 0) {
+            batch_->kv_keys[i]   = (half*)batch_arena_.alloc((size_t)G * max_seq_len * KV_DIM * sizeof(half));
+            batch_->kv_values[i] = (half*)batch_arena_.alloc((size_t)G * max_seq_len * KV_DIM * sizeof(half));
+            batch_->kv_keys_q[i] = nullptr;
+            batch_->kv_values_q[i] = nullptr;
+            batch_->kv_keys_norms[i] = nullptr;
+            batch_->kv_values_norms[i] = nullptr;
+        } else {
+            batch_->kv_keys[i] = nullptr;
+            batch_->kv_values[i] = nullptr;
+            batch_->kv_keys_q[i]   = (uint8_t*)batch_arena_.alloc((size_t)G * max_seq_len * (KV_DIM_PACKED));
+            batch_->kv_values_q[i] = (uint8_t*)batch_arena_.alloc((size_t)G * max_seq_len * (KV_DIM_PACKED));
+            batch_->kv_keys_norms[i]   = (half*)batch_arena_.alloc((size_t)G * max_seq_len * NUM_KV_HEADS * sizeof(half));
+            batch_->kv_values_norms[i] = (half*)batch_arena_.alloc((size_t)G * max_seq_len * NUM_KV_HEADS * sizeof(half));
+        }
     }
     batch_->d_positions  = (int*)batch_arena_.alloc(N * sizeof(int));
     batch_->d_tokens     = (int*)batch_arena_.alloc(N * sizeof(int));
@@ -934,15 +1077,33 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
                       NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, stream);
 
     // 4. KV cache write
-    launch_kv_cache_write_batch(B->kv_keys[layer_idx], B->kv_values[layer_idx],
-                                 B->k_buf, B->v_buf, B->d_positions, B->max_seq_len, G,
-                                 KV_DIM, stream);
+    if (kv_bits_ == 0) {
+        launch_kv_cache_write_batch(B->kv_keys[layer_idx], B->kv_values[layer_idx],
+                                     B->k_buf, B->v_buf, B->d_positions, B->max_seq_len, G,
+                                     KV_DIM, stream);
+    } else {
+        launch_turbo_kv_quantize_batch(B->kv_keys_q[layer_idx], B->kv_keys_norms[layer_idx],
+                                        B->k_buf, state_.turbo_rotation, B->d_positions,
+                                        B->max_seq_len, G, NUM_KV_HEADS, HEAD_DIM, KV_DIM, kv_bits_, stream);
+        launch_turbo_kv_quantize_batch(B->kv_values_q[layer_idx], B->kv_values_norms[layer_idx],
+                                        B->v_buf, state_.turbo_rotation, B->d_positions,
+                                        B->max_seq_len, G, NUM_KV_HEADS, HEAD_DIM, KV_DIM, kv_bits_, stream);
+    }
 
     // 5. GQA attention
-    launch_gqa_attention_batch(B->attn_out, B->q_buf,
-                                B->kv_keys[layer_idx], B->kv_values[layer_idx],
-                                B->attn_scores, B->d_positions, B->max_seq_len, G,
-                                NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, stream);
+    if (kv_bits_ == 0) {
+        launch_gqa_attention_batch(B->attn_out, B->q_buf,
+                                    B->kv_keys[layer_idx], B->kv_values[layer_idx],
+                                    B->attn_scores, B->d_positions, B->max_seq_len, G,
+                                    NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, stream);
+    } else {
+        launch_turbo_gqa_attention_batch(B->attn_out, B->q_buf,
+                                          B->kv_keys_q[layer_idx], B->kv_values_q[layer_idx],
+                                          B->kv_keys_norms[layer_idx], B->kv_values_norms[layer_idx],
+                                          state_.turbo_rotation,
+                                          B->attn_scores, B->d_positions, B->max_seq_len, G,
+                                          NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, kv_bits_, stream);
+    }
 
     // 6. Output projection
     project(B->hidden, L.o_proj_fp16, L.o_proj_nf4, B->attn_out, HIDDEN_SIZE, Q_DIM, L.lora_o);
@@ -1032,19 +1193,42 @@ void InferenceEngine::prefill_chunked(int T, int G, cudaStream_t stream) {
                           B->d_positions, B->max_seq_len, T,
                           NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, stream);
 
-        // 4. Write K,V to cache for sequence 0 (contiguous memcpy, no kernel needed)
-        // k_buf is (KV_DIM, T) col-major -> cache is (max_seq_len, KV_DIM) row-major
-        // k_buf[t] = col t = k_buf + t * KV_DIM, cache[t] = cache + t * KV_DIM -> same layout
-        cudaMemcpyAsync(B->kv_keys[layer], B->k_buf,
-                        T * KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(B->kv_values[layer], B->v_buf,
-                        T * KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+        // 4. Write K,V to cache for sequence 0
+        if (kv_bits_ == 0) {
+            // k_buf is (KV_DIM, T) col-major -> cache is (max_seq_len, KV_DIM) row-major
+            // k_buf[t] = col t = k_buf + t * KV_DIM, cache[t] = cache + t * KV_DIM -> same layout
+            cudaMemcpyAsync(B->kv_keys[layer], B->k_buf,
+                            T * KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(B->kv_values[layer], B->v_buf,
+                            T * KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+        } else {
+            // TurboQuant: rotate + quantize all T tokens at once
+            launch_turbo_kv_quantize(B->kv_keys_q[layer], B->kv_keys_norms[layer],
+                                     B->k_buf, state_.turbo_rotation, B->d_positions,
+                                     B->max_seq_len, T,
+                                     NUM_KV_HEADS, HEAD_DIM, KV_DIM,
+                                     kv_bits_, stream);
+            launch_turbo_kv_quantize(B->kv_values_q[layer], B->kv_values_norms[layer],
+                                     B->v_buf, state_.turbo_rotation, B->d_positions,
+                                     B->max_seq_len, T,
+                                     NUM_KV_HEADS, HEAD_DIM, KV_DIM,
+                                     kv_bits_, stream);
+        }
 
         // 5. Causal self-attention (T queries against T KV entries in seq 0 cache)
-        launch_gqa_prefill_attention(B->attn_out, B->q_buf,
-                                      B->kv_keys[layer], B->kv_values[layer],
-                                      B->attn_scores, T, B->max_seq_len,
-                                      NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, stream);
+        if (kv_bits_ == 0) {
+            launch_gqa_prefill_attention(B->attn_out, B->q_buf,
+                                          B->kv_keys[layer], B->kv_values[layer],
+                                          B->attn_scores, T, B->max_seq_len,
+                                          NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, stream);
+        } else {
+            launch_turbo_gqa_prefill_attention(B->attn_out, B->q_buf,
+                                                B->kv_keys_q[layer], B->kv_values_q[layer],
+                                                B->kv_keys_norms[layer], B->kv_values_norms[layer],
+                                                state_.turbo_rotation,
+                                                B->attn_scores, T, B->max_seq_len,
+                                                NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, kv_bits_, stream);
+        }
 
         // 6. Output projection + residual
         project(B->hidden, L.o_proj_fp16, L.o_proj_nf4, B->attn_out, HIDDEN_SIZE, Q_DIM);
@@ -1068,12 +1252,30 @@ void InferenceEngine::prefill_chunked(int T, int G, cudaStream_t stream) {
     // Broadcast KV cache from seq 0 to seqs 1..G-1
     for (int layer = 0; layer < NUM_LAYERS; layer++) {
         for (int g = 1; g < G; g++) {
-            cudaMemcpyAsync(B->kv_keys[layer] + (size_t)g * B->max_seq_len * KV_DIM,
-                            B->kv_keys[layer],
-                            T * KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(B->kv_values[layer] + (size_t)g * B->max_seq_len * KV_DIM,
-                            B->kv_values[layer],
-                            T * KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            if (kv_bits_ == 0) {
+                cudaMemcpyAsync(B->kv_keys[layer] + (size_t)g * B->max_seq_len * KV_DIM,
+                                B->kv_keys[layer],
+                                T * KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync(B->kv_values[layer] + (size_t)g * B->max_seq_len * KV_DIM,
+                                B->kv_values[layer],
+                                T * KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            } else {
+                // Broadcast quantized KV cache
+                size_t q_stride = (size_t)B->max_seq_len * (KV_DIM_PACKED);
+                size_t n_stride = (size_t)B->max_seq_len * NUM_KV_HEADS;
+                cudaMemcpyAsync(B->kv_keys_q[layer] + g * q_stride,
+                                B->kv_keys_q[layer],
+                                T * (KV_DIM_PACKED), cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync(B->kv_values_q[layer] + g * q_stride,
+                                B->kv_values_q[layer],
+                                T * (KV_DIM_PACKED), cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync(B->kv_keys_norms[layer] + g * n_stride,
+                                B->kv_keys_norms[layer],
+                                T * NUM_KV_HEADS * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync(B->kv_values_norms[layer] + g * n_stride,
+                                B->kv_values_norms[layer],
+                                T * NUM_KV_HEADS * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            }
         }
     }
 
@@ -1096,8 +1298,15 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
     // Reset
     for (int i = 0; i < G; i++) { B->h_positions[i] = 0; B->h_finished[i] = false; }
     for (int i = 0; i < NUM_LAYERS; i++) {
-        cudaMemset(B->kv_keys[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
-        cudaMemset(B->kv_values[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
+        if (kv_bits_ == 0) {
+            cudaMemset(B->kv_keys[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
+            cudaMemset(B->kv_values[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
+        } else {
+            cudaMemset(B->kv_keys_q[i], 0, (size_t)G * total_max_len * (KV_DIM_PACKED));
+            cudaMemset(B->kv_values_q[i], 0, (size_t)G * total_max_len * (KV_DIM_PACKED));
+            cudaMemset(B->kv_keys_norms[i], 0, (size_t)G * total_max_len * NUM_KV_HEADS * sizeof(half));
+            cudaMemset(B->kv_values_norms[i], 0, (size_t)G * total_max_len * NUM_KV_HEADS * sizeof(half));
+        }
     }
 
     std::vector<std::vector<int>> outputs(G);
@@ -1221,8 +1430,15 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
 
         // Re-prefill (warmup corrupted KV cache) using chunked prefill
         for (int i = 0; i < NUM_LAYERS; i++) {
-            cudaMemset(B->kv_keys[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
-            cudaMemset(B->kv_values[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
+            if (kv_bits_ == 0) {
+                cudaMemset(B->kv_keys[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
+                cudaMemset(B->kv_values[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
+            } else {
+                cudaMemset(B->kv_keys_q[i], 0, (size_t)G * total_max_len * (KV_DIM_PACKED));
+                cudaMemset(B->kv_values_q[i], 0, (size_t)G * total_max_len * (KV_DIM_PACKED));
+                cudaMemset(B->kv_keys_norms[i], 0, (size_t)G * total_max_len * NUM_KV_HEADS * sizeof(half));
+                cudaMemset(B->kv_values_norms[i], 0, (size_t)G * total_max_len * NUM_KV_HEADS * sizeof(half));
+            }
         }
         {
             std::vector<int> h_tok(max_prompt_len), h_pos(max_prompt_len);

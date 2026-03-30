@@ -120,13 +120,32 @@ Compresses the KV cache using random rotation + optimal scalar quantization ([Za
 | `kv_bits=4` | 4 | **4x** | Good -- coherent, slight accuracy loss |
 | `kv_bits=2` | 2 | **8x** | Needs 8B+ models (too aggressive for 0.6B) |
 
-### Max context length (Qwen3-0.6B, G=4 GRPO training)
+### Jetson Orin 8 GB memory breakdown (measured, Qwen3-0.6B GRPO training)
 
-| Device | fp16 | TurboQuant 4-bit | Gain |
-|---|---|---|---|
-| Jetson Orin 8GB | ~7K tokens | ~24K tokens | 3.4x |
-| RTX 4060 8GB | ~7K tokens | ~24K tokens | 3.4x |
-| RTX 4090 24GB | ~20K tokens | ~65K tokens | 3.3x |
+```
+Total unified memory:              7,990 MB
+- CUDA runtime + OS:              -2,012 MB
+- Engine weights (Q4L + fp16):      -937 MB
+- PyTorch model (4-bit BnB):      -1,572 MB
+- LoRA + AdamW optimizer:             -2 MB
+                                  ---------
+= Available for batch arena:       3,467 MB
+```
+
+### Max context length (measured, G=4)
+
+| Prompt | Completion | Total | fp16 KV | TQ4 KV | Fits 8 GB? |
+|--------|------------|-------|---------|--------|------------|
+| 200 | 824 | 1,024 | 448 MB | 116 MB | Both: Yes |
+| 200 | 3,896 | 4,096 | 1,792 MB | 462 MB | Both: Yes |
+| 200 | 6,968 | **7,168** | **3,406 MB** | 879 MB | **fp16: limit** |
+| 200 | 7,992 | 8,192 | 3,893 MB | 1,005 MB | fp16: OOM |
+| 200 | 16,184 | 16,384 | -- | 2,008 MB | TQ4: Yes |
+| 200 | 25,400 | **25,600** | -- | **3,447 MB** | **TQ4: limit** |
+
+**TQ4: 3.6x longer context** (7,168 -> 25,600 tokens on Jetson Orin 8 GB).
+
+### Usage
 
 ```bash
 # Enable 4-bit KV cache (recommended for Qwen3-0.6B)

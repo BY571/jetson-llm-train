@@ -19,8 +19,11 @@ PYBIND11_MODULE(jetson_engine, m) {
     m.doc() = "Jetson LLM Inference Engine — fast generation for small transformers";
 
     py::class_<InferenceEngine>(m, "Engine")
-        .def(py::init<int>(), py::arg("max_seq_len") = 1024,
-             "Create inference engine with pre-allocated KV cache")
+        .def(py::init<int, int>(), py::arg("max_seq_len") = 1024, py::arg("kv_bits") = 0,
+             "Create inference engine. kv_bits=0: fp16 KV cache, kv_bits=2: TurboQuant 2-bit (8x compression)")
+
+        .def("kv_bits", &InferenceEngine::kv_bits,
+             "KV cache quantization bits (0=fp16, 2=TurboQuant 2-bit)")
 
         .def("load_weights", &InferenceEngine::load_weights,
              py::arg("model_dir"),

@@ -1392,4 +1392,624 @@ void launch_lm_head(
     );
 }
 
+// ============================================================================
+// TurboQuant: 2-bit KV Cache Quantization (Zandieh et al. 2025)
+// ============================================================================
+//
+// Algorithm: randomly rotate K/V vectors, then quantize each coordinate to
+// 2 bits using Lloyd-Max centroids precomputed for the resulting Beta/Gaussian
+// distribution. Inner products are preserved because softmax is scale-invariant
+// (K side) and V weighted sums are rotated back after accumulation.
+//
+// Memory: 2 bits/value → 8x reduction vs fp16 (32 bytes/head vs 256 bytes/head)
+// Quality: near-lossless at 3.5 bits, marginal degradation at 2 bits (LongBench)
+
+// Lloyd-Max centroids for N(0, 1/d) with d=128
+// σ = 1/√128 ≈ 0.08839
+
+// 2-bit: 4 centroids at ±0.4528σ, ±1.5104σ
+__constant__ float TURBO_CENTROIDS_2[4] = {
+    -0.13351f, -0.04003f, 0.04003f, 0.13351f
+};
+__constant__ float TURBO_BOUNDS_2[3] = {
+    -0.08677f, 0.0f, 0.08677f
+};
+
+// 4-bit: 16 centroids (standard Lloyd-Max for N(0,1) scaled by σ)
+__constant__ float TURBO_CENTROIDS_4[16] = {
+    -0.24155f, -0.18293f, -0.14304f, -0.11099f,
+    -0.08330f, -0.05806f, -0.03432f, -0.01135f,
+     0.01135f,  0.03432f,  0.05806f,  0.08330f,
+     0.11099f,  0.14304f,  0.18293f,  0.24155f
+};
+__constant__ float TURBO_BOUNDS_4[15] = {
+    -0.21224f, -0.16299f, -0.12701f, -0.09715f,
+    -0.07068f, -0.04619f, -0.02284f,  0.00000f,
+     0.02284f,  0.04619f,  0.07068f,  0.09715f,
+     0.12701f,  0.16299f,  0.21224f
+};
+
+// Helper: quantize a rotated value to b-bit index using precomputed boundaries
+__device__ __forceinline__ int turbo_quantize(float val, int bits) {
+    if (bits == 4) {
+        // Binary search for 16 centroids (4 comparisons)
+        int idx;
+        if (val < TURBO_BOUNDS_4[7]) {
+            if (val < TURBO_BOUNDS_4[3]) {
+                if (val < TURBO_BOUNDS_4[1]) idx = val < TURBO_BOUNDS_4[0] ? 0 : 1;
+                else idx = val < TURBO_BOUNDS_4[2] ? 2 : 3;
+            } else {
+                if (val < TURBO_BOUNDS_4[5]) idx = val < TURBO_BOUNDS_4[4] ? 4 : 5;
+                else idx = val < TURBO_BOUNDS_4[6] ? 6 : 7;
+            }
+        } else {
+            if (val < TURBO_BOUNDS_4[11]) {
+                if (val < TURBO_BOUNDS_4[9]) idx = val < TURBO_BOUNDS_4[8] ? 8 : 9;
+                else idx = val < TURBO_BOUNDS_4[10] ? 10 : 11;
+            } else {
+                if (val < TURBO_BOUNDS_4[13]) idx = val < TURBO_BOUNDS_4[12] ? 12 : 13;
+                else idx = val < TURBO_BOUNDS_4[14] ? 14 : 15;
+            }
+        }
+        return idx;
+    } else {
+        return (val >= TURBO_BOUNDS_2[0]) + (val >= TURBO_BOUNDS_2[1]) + (val >= TURBO_BOUNDS_2[2]);
+    }
+}
+
+// Helper: look up centroid value from index
+__device__ __forceinline__ float turbo_centroid(int idx, int bits) {
+    return (bits == 4) ? TURBO_CENTROIDS_4[idx] : TURBO_CENTROIDS_2[idx];
+}
+
+// Quantize + pack: rotate K or V head by Π, quantize, pack.
+// Grid: (num_tokens, num_kv_heads), blockDim: 128 (= head_dim)
+__global__ void turbo_kv_quantize_kernel(
+    uint8_t* __restrict__ cache_q,
+    half* __restrict__ cache_norms,
+    const half* __restrict__ kv_buf,
+    const half* __restrict__ rotation,
+    const int* __restrict__ positions,
+    int max_seq_len, int num_tokens,
+    int num_kv_heads, int head_dim, int kv_dim,
+    int bits  // 2 or 4
+) {
+    int tok = blockIdx.x;
+    int h = blockIdx.y;
+    if (tok >= num_tokens || h >= num_kv_heads) return;
+
+    int d = threadIdx.x;
+    if (d >= head_dim) return;
+
+    int pos = positions[tok];
+    int vals_per_byte = (bits == 2) ? 4 : 2;
+    int bytes_per_head = head_dim / vals_per_byte;
+
+    // Load and compute norm
+    __shared__ float head_vec[128];
+    float val = __half2float(kv_buf[tok * kv_dim + h * head_dim + d]);
+    head_vec[d] = val;
+
+    float norm_sq = val * val;
+    for (int off = warpSize / 2; off > 0; off /= 2)
+        norm_sq += __shfl_down_sync(0xFFFFFFFF, norm_sq, off);
+    __shared__ float s_partial[4];
+    int wid = d / warpSize, lid = d % warpSize;
+    if (lid == 0) s_partial[wid] = norm_sq;
+    __syncthreads();
+    if (wid == 0) {
+        norm_sq = (lid < (head_dim + 31) / 32) ? s_partial[lid] : 0.0f;
+        for (int off = warpSize / 2; off > 0; off /= 2)
+            norm_sq += __shfl_down_sync(0xFFFFFFFF, norm_sq, off);
+        if (lid == 0) s_partial[0] = norm_sq;
+    }
+    __syncthreads();
+
+    float inv_norm = rsqrtf(s_partial[0] + 1e-12f);
+    head_vec[d] *= inv_norm;
+    __syncthreads();
+
+    // Rotate + quantize
+    const half* rot_row = rotation + d * head_dim;
+    float rotated = 0.0f;
+    for (int k = 0; k < head_dim; k++)
+        rotated += __half2float(rot_row[k]) * head_vec[k];
+
+    int idx = turbo_quantize(rotated, bits);
+
+    __shared__ uint8_t quant_idx[128];
+    quant_idx[d] = (uint8_t)idx;
+    __syncthreads();
+
+    // Pack
+    int kv_dim_packed = kv_dim / vals_per_byte;
+    if (d < bytes_per_head) {
+        uint8_t packed;
+        if (bits == 2) {
+            int base = d * 4;
+            packed = quant_idx[base]
+                   | (quant_idx[base + 1] << 2)
+                   | (quant_idx[base + 2] << 4)
+                   | (quant_idx[base + 3] << 6);
+        } else {
+            int base = d * 2;
+            packed = quant_idx[base] | (quant_idx[base + 1] << 4);
+        }
+        cache_q[pos * kv_dim_packed + h * bytes_per_head + d] = packed;
+    }
+
+    if (d == 0) {
+        float norm = sqrtf(s_partial[0] + 1e-12f);
+        cache_norms[pos * num_kv_heads + h] = __float2half(norm);
+    }
+}
+
+// Batched variant
+__global__ void turbo_kv_quantize_batch_kernel(
+    uint8_t* __restrict__ cache_q,
+    half* __restrict__ cache_norms,
+    const half* __restrict__ kv_buf,
+    const half* __restrict__ rotation,
+    const int* __restrict__ positions,
+    int max_seq_len, int G,
+    int num_kv_heads, int head_dim, int kv_dim,
+    int bits
+) {
+    int block_id = blockIdx.x;
+    int g = block_id / num_kv_heads;
+    int h = block_id % num_kv_heads;
+    if (g >= G) return;
+
+    int d = threadIdx.x;
+    if (d >= head_dim) return;
+
+    int pos = positions[g];
+    int vals_per_byte = (bits == 2) ? 4 : 2;
+    int bytes_per_head = head_dim / vals_per_byte;
+    int kv_dim_packed = kv_dim / vals_per_byte;
+
+    __shared__ float head_vec[128];
+    float val = __half2float(kv_buf[g * kv_dim + h * head_dim + d]);
+    head_vec[d] = val;
+
+    float norm_sq = val * val;
+    for (int off = warpSize / 2; off > 0; off /= 2)
+        norm_sq += __shfl_down_sync(0xFFFFFFFF, norm_sq, off);
+    __shared__ float s_partial[4];
+    int wid = d / warpSize, lid = d % warpSize;
+    if (lid == 0) s_partial[wid] = norm_sq;
+    __syncthreads();
+    if (wid == 0) {
+        norm_sq = (lid < (head_dim + 31) / 32) ? s_partial[lid] : 0.0f;
+        for (int off = warpSize / 2; off > 0; off /= 2)
+            norm_sq += __shfl_down_sync(0xFFFFFFFF, norm_sq, off);
+        if (lid == 0) s_partial[0] = norm_sq;
+    }
+    __syncthreads();
+
+    float inv_norm = rsqrtf(s_partial[0] + 1e-12f);
+    head_vec[d] *= inv_norm;
+    __syncthreads();
+
+    const half* rot_row = rotation + d * head_dim;
+    float rotated = 0.0f;
+    for (int k = 0; k < head_dim; k++)
+        rotated += __half2float(rot_row[k]) * head_vec[k];
+
+    int idx = turbo_quantize(rotated, bits);
+
+    __shared__ uint8_t quant_idx[128];
+    quant_idx[d] = (uint8_t)idx;
+    __syncthreads();
+
+    if (d < bytes_per_head) {
+        uint8_t packed;
+        if (bits == 2) {
+            int base = d * 4;
+            packed = quant_idx[base] | (quant_idx[base+1]<<2) | (quant_idx[base+2]<<4) | (quant_idx[base+3]<<6);
+        } else {
+            int base = d * 2;
+            packed = quant_idx[base] | (quant_idx[base+1] << 4);
+        }
+        cache_q[(g * max_seq_len + pos) * kv_dim_packed + h * bytes_per_head + d] = packed;
+    }
+
+    if (d == 0) {
+        float norm = sqrtf(s_partial[0] + 1e-12f);
+        cache_norms[(g * max_seq_len + pos) * num_kv_heads + h] = __float2half(norm);
+    }
+}
+
+// Unified TurboQuant attention kernel (batch decode).
+// Supports both 2-bit and 4-bit via the `bits` parameter.
+// Grid: (G, num_heads), blockDim: 128 (= head_dim)
+__global__ void turbo_gqa_attention_batch_kernel(
+    half* __restrict__ out,
+    const half* __restrict__ q,
+    const uint8_t* __restrict__ cache_k_q,
+    const uint8_t* __restrict__ cache_v_q,
+    const half* __restrict__ k_norms,
+    const half* __restrict__ v_norms,
+    const half* __restrict__ rotation,
+    float* __restrict__ attn_scratch,
+    const int* __restrict__ positions,
+    int max_seq_len, int G,
+    int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim,
+    int bits
+) {
+    int g = blockIdx.x;
+    int head = blockIdx.y;
+    if (g >= G || head >= num_heads) return;
+
+    int d = threadIdx.x;
+    if (d >= head_dim) return;
+
+    int gqa_groups = num_heads / num_kv_heads;
+    int pos = positions[g];
+    int kv_head = head / gqa_groups;
+    float scale = rsqrtf((float)head_dim);
+    int vals_per_byte = (bits == 2) ? 4 : 2;
+    int bytes_per_head = head_dim / vals_per_byte;
+    int kv_dim_packed = kv_dim / vals_per_byte;
+
+    // --- Phase 1: Rotate Q ---
+    __shared__ float q_rot[128];
+    {
+        __shared__ float q_raw[128];
+        q_raw[d] = __half2float(q[g * q_dim + head * head_dim + d]);
+        __syncthreads();
+        const half* rot_row = rotation + d * head_dim;
+        float r = 0.0f;
+        for (int k = 0; k < head_dim; k++)
+            r += __half2float(rot_row[k]) * q_raw[k];
+        q_rot[d] = r;
+    }
+    __syncthreads();
+
+    // --- Phase 2: Score computation ---
+    float* scores = attn_scratch + (g * num_heads + head) * max_seq_len;
+    float max_score = -1e30f;
+
+    for (int p = d; p <= pos; p += head_dim) {
+        float k_norm = __half2float(k_norms[(g * max_seq_len + p) * num_kv_heads + kv_head]);
+        int k_off = (g * max_seq_len + p) * kv_dim_packed + kv_head * bytes_per_head;
+        float dot = 0.0f;
+        if (bits == 4) {
+            for (int b = 0; b < bytes_per_head; b++) {
+                uint8_t packed = cache_k_q[k_off + b];
+                dot += q_rot[b*2+0] * TURBO_CENTROIDS_4[packed & 0xF];
+                dot += q_rot[b*2+1] * TURBO_CENTROIDS_4[(packed >> 4) & 0xF];
+            }
+        } else {
+            for (int b = 0; b < bytes_per_head; b++) {
+                uint8_t packed = cache_k_q[k_off + b];
+                dot += q_rot[b*4+0] * TURBO_CENTROIDS_2[(packed   ) & 3];
+                dot += q_rot[b*4+1] * TURBO_CENTROIDS_2[(packed>>2) & 3];
+                dot += q_rot[b*4+2] * TURBO_CENTROIDS_2[(packed>>4) & 3];
+                dot += q_rot[b*4+3] * TURBO_CENTROIDS_2[(packed>>6) & 3];
+            }
+        }
+        dot *= k_norm * scale;
+        scores[p] = dot;
+        max_score = fmaxf(max_score, dot);
+    }
+
+    // Reduce max + softmax (same pattern for all bit widths)
+    for (int off = warpSize/2; off > 0; off /= 2)
+        max_score = fmaxf(max_score, __shfl_down_sync(0xFFFFFFFF, max_score, off));
+    __shared__ float s_max[4];
+    int wid = d / warpSize, lid = d % warpSize;
+    if (lid == 0) s_max[wid] = max_score;
+    __syncthreads();
+    if (wid == 0) {
+        max_score = (lid < (head_dim+31)/32) ? s_max[lid] : -1e30f;
+        for (int off = warpSize/2; off > 0; off /= 2)
+            max_score = fmaxf(max_score, __shfl_down_sync(0xFFFFFFFF, max_score, off));
+        if (lid == 0) s_max[0] = max_score;
+    }
+    __syncthreads();
+    max_score = s_max[0];
+
+    float sum_exp = 0.0f;
+    for (int p = d; p <= pos; p += head_dim) {
+        float v = expf(scores[p] - max_score);
+        scores[p] = v;
+        sum_exp += v;
+    }
+    for (int off = warpSize/2; off > 0; off /= 2)
+        sum_exp += __shfl_down_sync(0xFFFFFFFF, sum_exp, off);
+    __shared__ float s_sum[4];
+    if (lid == 0) s_sum[wid] = sum_exp;
+    __syncthreads();
+    if (wid == 0) {
+        sum_exp = (lid < (head_dim+31)/32) ? s_sum[lid] : 0.0f;
+        for (int off = warpSize/2; off > 0; off /= 2)
+            sum_exp += __shfl_down_sync(0xFFFFFFFF, sum_exp, off);
+        if (lid == 0) s_sum[0] = sum_exp;
+    }
+    __syncthreads();
+    float inv_sum = 1.0f / (s_sum[0] + 1e-8f);
+    for (int p = d; p <= pos; p += head_dim)
+        scores[p] *= inv_sum;
+    __syncthreads();
+
+    // --- Phase 3: V weighted sum ---
+    int sub, byte_in_head;
+    if (bits == 4) { sub = d % 2; byte_in_head = d / 2; }
+    else { sub = d % 4; byte_in_head = d / 4; }
+    int bit_shift = (bits == 4) ? sub * 4 : sub * 2;
+    int mask = (bits == 4) ? 0xF : 3;
+    float v_acc = 0.0f;
+
+    for (int p = 0; p <= pos; p++) {
+        float s = scores[p];
+        float vn = __half2float(v_norms[(g * max_seq_len + p) * num_kv_heads + kv_head]);
+        int v_off = (g * max_seq_len + p) * kv_dim_packed + kv_head * bytes_per_head + byte_in_head;
+        uint8_t packed = cache_v_q[v_off];
+        int idx = (packed >> bit_shift) & mask;
+        v_acc += s * vn * turbo_centroid(idx, bits);
+    }
+
+    // --- Phase 4: Rotate V back ---
+    __shared__ float v_acc_shared[128];
+    v_acc_shared[d] = v_acc;
+    __syncthreads();
+    float out_val = 0.0f;
+    for (int k = 0; k < head_dim; k++)
+        out_val += __half2float(rotation[k * head_dim + d]) * v_acc_shared[k];
+    out[g * q_dim + head * head_dim + d] = __float2half(out_val);
+}
+
+// Single-sequence decode attention (same structure, no g offset)
+__global__ void turbo_gqa_attention_kernel(
+    const half* __restrict__ q,
+    const uint8_t* __restrict__ cache_k_q,
+    const uint8_t* __restrict__ cache_v_q,
+    const half* __restrict__ k_norms,
+    const half* __restrict__ v_norms,
+    const half* __restrict__ rotation,
+    half* __restrict__ output,
+    float* __restrict__ attn_scratch,
+    int pos, int max_seq_len,
+    int num_heads, int num_kv_heads, int head_dim,
+    int bits
+) {
+    int head = blockIdx.x;
+    if (head >= num_heads) return;
+    int d = threadIdx.x;
+    if (d >= head_dim) return;
+
+    int gqa_groups = num_heads / num_kv_heads;
+    int kv_head = head / gqa_groups;
+    float scale = rsqrtf((float)head_dim);
+    int kv_dim = num_kv_heads * head_dim;
+    int vals_per_byte = (bits == 2) ? 4 : 2;
+    int bytes_per_head = head_dim / vals_per_byte;
+    int kv_dim_packed = kv_dim / vals_per_byte;
+
+    __shared__ float q_rot[128];
+    { __shared__ float q_raw[128];
+      q_raw[d] = __half2float(q[head * head_dim + d]);
+      __syncthreads();
+      float r = 0.0f;
+      const half* rot_row = rotation + d * head_dim;
+      for (int k = 0; k < head_dim; k++) r += __half2float(rot_row[k]) * q_raw[k];
+      q_rot[d] = r;
+    }
+    __syncthreads();
+
+    float* scores = attn_scratch + head * max_seq_len;
+    float max_score = -1e30f;
+    for (int p = d; p <= pos; p += head_dim) {
+        float kn = __half2float(k_norms[p * num_kv_heads + kv_head]);
+        int k_off = p * kv_dim_packed + kv_head * bytes_per_head;
+        float dot = 0.0f;
+        if (bits == 4) {
+            for (int b = 0; b < bytes_per_head; b++) {
+                uint8_t pk = cache_k_q[k_off+b];
+                dot += q_rot[b*2+0]*TURBO_CENTROIDS_4[pk & 0xF];
+                dot += q_rot[b*2+1]*TURBO_CENTROIDS_4[(pk>>4) & 0xF];
+            }
+        } else {
+            for (int b = 0; b < bytes_per_head; b++) {
+                uint8_t pk = cache_k_q[k_off+b];
+                dot += q_rot[b*4+0]*TURBO_CENTROIDS_2[(pk   )&3];
+                dot += q_rot[b*4+1]*TURBO_CENTROIDS_2[(pk>>2)&3];
+                dot += q_rot[b*4+2]*TURBO_CENTROIDS_2[(pk>>4)&3];
+                dot += q_rot[b*4+3]*TURBO_CENTROIDS_2[(pk>>6)&3];
+            }
+        }
+        dot *= kn * scale; scores[p] = dot;
+        max_score = fmaxf(max_score, dot);
+    }
+
+    for (int off=warpSize/2;off>0;off/=2) max_score=fmaxf(max_score,__shfl_down_sync(0xFFFFFFFF,max_score,off));
+    __shared__ float s_max[4]; int wid=d/warpSize, lid=d%warpSize;
+    if(lid==0) s_max[wid]=max_score; __syncthreads();
+    if(wid==0){max_score=(lid<(head_dim+31)/32)?s_max[lid]:-1e30f;
+      for(int off=warpSize/2;off>0;off/=2) max_score=fmaxf(max_score,__shfl_down_sync(0xFFFFFFFF,max_score,off));
+      if(lid==0)s_max[0]=max_score;} __syncthreads(); max_score=s_max[0];
+
+    float sum_exp=0; for(int p=d;p<=pos;p+=head_dim){float v=expf(scores[p]-max_score);scores[p]=v;sum_exp+=v;}
+    for(int off=warpSize/2;off>0;off/=2) sum_exp+=__shfl_down_sync(0xFFFFFFFF,sum_exp,off);
+    __shared__ float s_sum[4]; if(lid==0)s_sum[wid]=sum_exp; __syncthreads();
+    if(wid==0){sum_exp=(lid<(head_dim+31)/32)?s_sum[lid]:0;
+      for(int off=warpSize/2;off>0;off/=2) sum_exp+=__shfl_down_sync(0xFFFFFFFF,sum_exp,off);
+      if(lid==0)s_sum[0]=sum_exp;} __syncthreads();
+    float inv_sum=1.0f/(s_sum[0]+1e-8f);
+    for(int p=d;p<=pos;p+=head_dim) scores[p]*=inv_sum; __syncthreads();
+
+    int sub, byte_in_head;
+    if(bits==4){sub=d%2;byte_in_head=d/2;} else{sub=d%4;byte_in_head=d/4;}
+    int bit_shift=(bits==4)?sub*4:sub*2; int mask=(bits==4)?0xF:3;
+    float v_acc=0;
+    for(int p=0;p<=pos;p++){
+        float s=scores[p]; float vn=__half2float(v_norms[p*num_kv_heads+kv_head]);
+        uint8_t pk=cache_v_q[p*kv_dim_packed+kv_head*bytes_per_head+byte_in_head];
+        v_acc+=s*vn*turbo_centroid((pk>>bit_shift)&mask,bits);
+    }
+
+    __shared__ float v_acc_shared[128]; v_acc_shared[d]=v_acc; __syncthreads();
+    float out_val=0; for(int k=0;k<head_dim;k++) out_val+=__half2float(rotation[k*head_dim+d])*v_acc_shared[k];
+    output[head*head_dim+d]=__float2half(out_val);
+}
+
+// Prefill attention with TurboQuant (causal).
+// Grid: (num_heads, T), blockDim: 128
+__global__ void turbo_gqa_prefill_attention_kernel(
+    half* __restrict__ out,
+    const half* __restrict__ q,
+    const uint8_t* __restrict__ cache_k_q,
+    const uint8_t* __restrict__ cache_v_q,
+    const half* __restrict__ k_norms,
+    const half* __restrict__ v_norms,
+    const half* __restrict__ rotation,
+    float* __restrict__ attn_scratch,
+    int T, int max_seq_len,
+    int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim,
+    int bits
+) {
+    int head = blockIdx.x; int tq = blockIdx.y;
+    if (head >= num_heads || tq >= T) return;
+    int d = threadIdx.x; if (d >= head_dim) return;
+
+    int gqa_groups = num_heads / num_kv_heads;
+    int kv_head = head / gqa_groups;
+    float scale = rsqrtf((float)head_dim);
+    int vals_per_byte = (bits == 2) ? 4 : 2;
+    int bytes_per_head = head_dim / vals_per_byte;
+    int kv_dim_packed = kv_dim / vals_per_byte;
+
+    __shared__ float q_rot[128];
+    { __shared__ float q_raw[128];
+      q_raw[d] = __half2float(q[tq * q_dim + head * head_dim + d]);
+      __syncthreads();
+      float r = 0.0f; const half* rot_row = rotation + d * head_dim;
+      for (int k = 0; k < head_dim; k++) r += __half2float(rot_row[k]) * q_raw[k];
+      q_rot[d] = r;
+    } __syncthreads();
+
+    float* scores = attn_scratch + (tq * num_heads + head) * T;
+    float max_score = -1e30f;
+    for (int p = d; p <= tq; p += head_dim) {
+        float kn = __half2float(k_norms[p * num_kv_heads + kv_head]);
+        int k_off = p * kv_dim_packed + kv_head * bytes_per_head;
+        float dot = 0.0f;
+        if (bits == 4) {
+            for (int b = 0; b < bytes_per_head; b++) {
+                uint8_t pk = cache_k_q[k_off+b];
+                dot += q_rot[b*2+0]*TURBO_CENTROIDS_4[pk & 0xF];
+                dot += q_rot[b*2+1]*TURBO_CENTROIDS_4[(pk>>4) & 0xF];
+            }
+        } else {
+            for (int b = 0; b < bytes_per_head; b++) {
+                uint8_t pk = cache_k_q[k_off+b];
+                dot += q_rot[b*4+0]*TURBO_CENTROIDS_2[(pk   )&3];
+                dot += q_rot[b*4+1]*TURBO_CENTROIDS_2[(pk>>2)&3];
+                dot += q_rot[b*4+2]*TURBO_CENTROIDS_2[(pk>>4)&3];
+                dot += q_rot[b*4+3]*TURBO_CENTROIDS_2[(pk>>6)&3];
+            }
+        }
+        dot *= kn * scale; scores[p] = dot; max_score = fmaxf(max_score, dot);
+    }
+
+    for(int off=warpSize/2;off>0;off/=2) max_score=fmaxf(max_score,__shfl_down_sync(0xFFFFFFFF,max_score,off));
+    __shared__ float s_max[4]; int wid=d/warpSize, lid=d%warpSize;
+    if(lid==0) s_max[wid]=max_score; __syncthreads();
+    if(wid==0){max_score=(lid<(head_dim+31)/32)?s_max[lid]:-1e30f;
+      for(int off=warpSize/2;off>0;off/=2) max_score=fmaxf(max_score,__shfl_down_sync(0xFFFFFFFF,max_score,off));
+      if(lid==0)s_max[0]=max_score;} __syncthreads(); max_score=s_max[0];
+
+    float sum_exp=0; for(int p=d;p<=tq;p+=head_dim){float v=expf(scores[p]-max_score);scores[p]=v;sum_exp+=v;}
+    for(int off=warpSize/2;off>0;off/=2) sum_exp+=__shfl_down_sync(0xFFFFFFFF,sum_exp,off);
+    __shared__ float s_sum[4]; if(lid==0)s_sum[wid]=sum_exp; __syncthreads();
+    if(wid==0){sum_exp=(lid<(head_dim+31)/32)?s_sum[lid]:0;
+      for(int off=warpSize/2;off>0;off/=2) sum_exp+=__shfl_down_sync(0xFFFFFFFF,sum_exp,off);
+      if(lid==0)s_sum[0]=sum_exp;} __syncthreads();
+    float inv_sum=1.0f/(s_sum[0]+1e-8f);
+    for(int p=d;p<=tq;p+=head_dim) scores[p]*=inv_sum; __syncthreads();
+
+    int sub, byte_in_head;
+    if(bits==4){sub=d%2;byte_in_head=d/2;} else{sub=d%4;byte_in_head=d/4;}
+    int bit_shift=(bits==4)?sub*4:sub*2; int mask=(bits==4)?0xF:3;
+    float v_acc=0;
+    for(int p=0;p<=tq;p++){
+        float s=scores[p]; float vn=__half2float(v_norms[p*num_kv_heads+kv_head]);
+        uint8_t pk=cache_v_q[p*kv_dim_packed+kv_head*bytes_per_head+byte_in_head];
+        v_acc+=s*vn*turbo_centroid((pk>>bit_shift)&mask,bits);
+    }
+
+    __shared__ float v_acc_shared[128]; v_acc_shared[d]=v_acc; __syncthreads();
+    float out_val=0; for(int k=0;k<head_dim;k++) out_val+=__half2float(rotation[k*head_dim+d])*v_acc_shared[k];
+    out[tq*q_dim+head*head_dim+d]=__float2half(out_val);
+}
+
+// Launch wrappers for TurboQuant kernels
+void launch_turbo_kv_quantize(
+    uint8_t* cache_q, half* cache_norms,
+    const half* kv_buf, const half* rotation, const int* positions,
+    int max_seq_len, int num_tokens, int num_kv_heads, int head_dim, int kv_dim,
+    int bits, cudaStream_t s
+) {
+    dim3 grid(num_tokens, num_kv_heads);
+    turbo_kv_quantize_kernel<<<grid, head_dim, 0, s>>>(
+        cache_q, cache_norms, kv_buf, rotation, positions,
+        max_seq_len, num_tokens, num_kv_heads, head_dim, kv_dim, bits);
+}
+
+void launch_turbo_kv_quantize_batch(
+    uint8_t* cache_q, half* cache_norms,
+    const half* kv_buf, const half* rotation, const int* positions,
+    int max_seq_len, int G, int num_kv_heads, int head_dim, int kv_dim,
+    int bits, cudaStream_t s
+) {
+    turbo_kv_quantize_batch_kernel<<<G * num_kv_heads, head_dim, 0, s>>>(
+        cache_q, cache_norms, kv_buf, rotation, positions,
+        max_seq_len, G, num_kv_heads, head_dim, kv_dim, bits);
+}
+
+void launch_turbo_gqa_attention_batch(
+    half* out, const half* q,
+    const uint8_t* ck_q, const uint8_t* cv_q,
+    const half* k_norms, const half* v_norms,
+    const half* rotation,
+    float* as, const int* pos,
+    int msl, int G, int num_heads, int num_kv_heads, int head_dim,
+    int q_dim, int kv_dim, int bits, cudaStream_t s
+) {
+    dim3 grid(G, num_heads);
+    turbo_gqa_attention_batch_kernel<<<grid, head_dim, 0, s>>>(
+        out, q, ck_q, cv_q, k_norms, v_norms, rotation, as, pos,
+        msl, G, num_heads, num_kv_heads, head_dim, q_dim, kv_dim, bits);
+}
+
+void launch_turbo_gqa_attention(
+    const half* q,
+    const uint8_t* ck_q, const uint8_t* cv_q,
+    const half* k_norms, const half* v_norms,
+    const half* rotation,
+    half* output, float* as,
+    int pos, int msl,
+    int num_heads, int num_kv_heads, int head_dim, int bits, cudaStream_t s
+) {
+    turbo_gqa_attention_kernel<<<num_heads, head_dim, 0, s>>>(
+        q, ck_q, cv_q, k_norms, v_norms, rotation, output, as,
+        pos, msl, num_heads, num_kv_heads, head_dim, bits);
+}
+
+void launch_turbo_gqa_prefill_attention(
+    half* out, const half* q,
+    const uint8_t* ck_q, const uint8_t* cv_q,
+    const half* k_norms, const half* v_norms,
+    const half* rotation,
+    float* as, int T, int msl,
+    int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim,
+    int bits, cudaStream_t s
+) {
+    dim3 grid(num_heads, T);
+    turbo_gqa_prefill_attention_kernel<<<grid, head_dim, 0, s>>>(
+        out, q, ck_q, cv_q, k_norms, v_norms, rotation, as,
+        T, msl, num_heads, num_kv_heads, head_dim, q_dim, kv_dim, bits);
+}
+
 } // extern "C"

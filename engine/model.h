@@ -121,8 +121,14 @@ struct TransformerLayerWeights {
 
 // KV cache for one layer
 struct KVCache {
+    // FP16 mode (kv_bits == 0)
     half* key;   // (max_seq_len, KV_DIM)
     half* value; // (max_seq_len, KV_DIM)
+    // TurboQuant mode (kv_bits == 2): 2-bit packed quantized storage
+    uint8_t* key_quant;    // (max_seq_len, KV_DIM / 4) — 4 values per byte
+    uint8_t* value_quant;  // same
+    half* key_norms;       // (max_seq_len, num_kv_heads) per-head norms
+    half* value_norms;     // same
 };
 
 // Full model weights
@@ -176,6 +182,9 @@ struct InferenceState {
 
     // LoRA scratch buffer (for A @ x intermediate, max rank = 64)
     half* lora_scratch; // (max_lora_rank,)
+
+    // TurboQuant: 2-bit KV cache quantization (Zandieh et al. 2025)
+    half* turbo_rotation;   // (HEAD_DIM, HEAD_DIM) random orthogonal matrix, shared across layers
 };
 
 // Simple GPU arena: one cudaMalloc, bump-pointer suballocation.
@@ -221,6 +230,12 @@ struct BatchState {
     half* kv_keys[MAX_LAYERS];
     half* kv_values[MAX_LAYERS];
 
+    // TurboQuant 2-bit KV cache (used when kv_bits == 2)
+    uint8_t* kv_keys_q[MAX_LAYERS];    // (G * max_seq_len, KV_DIM / 4)
+    uint8_t* kv_values_q[MAX_LAYERS];  // same
+    half* kv_keys_norms[MAX_LAYERS];   // (G * max_seq_len, num_kv_heads)
+    half* kv_values_norms[MAX_LAYERS]; // same
+
     // Q4L dequant scratch (largest projection = INTERMEDIATE_SIZE * HIDDEN_SIZE)
     half* dequant_scratch;
 
@@ -255,8 +270,10 @@ struct BatchState {
 // Top-level engine
 class InferenceEngine {
 public:
-    InferenceEngine(int max_seq_len = 1024);
+    InferenceEngine(int max_seq_len = 1024, int kv_bits = 0);
     ~InferenceEngine();
+
+    int kv_bits() const { return kv_bits_; }
 
     // Load weights from safetensors directory (HF format)
     void load_weights(const std::string& model_dir);
@@ -325,6 +342,7 @@ public:
 
 private:
     bool weights_cached_ = false;
+    int kv_bits_ = 0;  // 0 = fp16 KV cache, 2 = TurboQuant 2-bit
     GpuArena batch_arena_;
 
     // Dedicated stream for batched decode (isolated from PyTorch's default stream)
