@@ -377,31 +377,39 @@ def print_banner(args, run_id):
     kv_bits = getattr(args, 'kv_bits', 0)
     kv_mode = "TurboQuant 2-bit" if kv_bits == 2 else "fp16"
 
-    # Estimate KV cache capacity
-    # Qwen3-0.6B: 28 layers, KV_DIM=1024 (8 heads * 128 head_dim)
-    num_layers = 28
-    kv_dim = 1024
+    # Estimate KV cache capacity from model config
+    # Auto-detect from model name, or use engine config if available
+    model_configs = {
+        "Qwen/Qwen3-0.6B": (28, 1024),   # (num_layers, kv_dim)
+        "Qwen/Qwen3-1.7B": (28, 2048),
+        "Qwen/Qwen3-4B":   (36, 2560),
+        "Qwen/Qwen3-8B":   (36, 4096),
+    }
+    num_layers, kv_dim = model_configs.get(args.model, (28, 1024))
+
+    # Override with engine config if passed
+    if hasattr(args, '_model_config') and args._model_config:
+        cfg = args._model_config
+        num_layers = cfg.get('num_layers', num_layers)
+        kv_dim = cfg.get('num_kv_heads', 8) * cfg.get('head_dim', 128)
+
     G = args.num_generations
     max_tokens = args.max_completion_tokens
-    prompt_est = 100  # typical prompt length
+    prompt_est = 100
 
     if kv_bits == 2:
-        # 2-bit: 0.25 bytes/value + norms overhead
-        kv_bytes_per_token_per_layer = G * (kv_dim * 2 * 0.25 + 16)  # ~16 bytes norms
+        kv_bytes_per_token_per_layer = G * (kv_dim * 2 * 0.25 + 16)
     else:
-        # fp16: 2 bytes/value, K+V
         kv_bytes_per_token_per_layer = G * kv_dim * 2 * 2
 
     total_context = prompt_est + max_tokens
     kv_total_mb = total_context * num_layers * kv_bytes_per_token_per_layer / 1e6
 
-    # Estimate max context from available VRAM
     if torch.cuda.is_available():
         free_mem = torch.cuda.mem_get_info()[0]
-        # Reserve ~2GB for model + PyTorch + engine buffers
         kv_budget = max(0, free_mem - 2e9)
         max_context = int(kv_budget / (num_layers * kv_bytes_per_token_per_layer))
-        max_context = min(max_context, 32768)  # cap at 32k
+        max_context = min(max_context, 32768)
     else:
         max_context = 1024
 
@@ -462,7 +470,11 @@ def train(args):
         engine.load_weights(weights_path)
         engine.cache_weights()
 
-        print(f"  Engine weights loaded + cached")
+        # Print actual model config from engine
+        cfg = engine.model_config()
+        real_kv_dim = cfg['num_kv_heads'] * cfg['head_dim']
+        print(f"  Engine: {cfg['num_layers']}L, {cfg['hidden_size']}h, "
+              f"{cfg['num_heads']}Qh/{cfg['num_kv_heads']}KVh, KV_dim={real_kv_dim}")
 
     # ── Load PyTorch model (gets remaining contiguous VRAM) ──
     print(f"\nLoading {args.model} (4-bit NF4, fp16)...")
