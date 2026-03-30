@@ -231,12 +231,21 @@ def grpo_step(model, optimizer, scaler, samples, config):
             new_comp_lp = new_lp[len(p_ids) - 1:]
 
             if config.loss_type == "dg":
-                # Delightful Policy Gradient (Osband 2025)
+                # Delightful Policy Gradient + Kondo Gate (Osband 2025)
                 # gate = sigmoid(advantage * surprisal / eta), no reference model needed
                 surprisal = -new_comp_lp.detach()
                 eta = getattr(config, 'dg_eta', 1.0)
                 delight = adv * surprisal
                 gate = torch.sigmoid(delight / eta)
+                mean_delight = delight.mean().item()
+
+                # Kondo gate: skip backward for low-delight samples (lambda=0 adaptive)
+                # Positive delight = breakthrough (rare correct action), worth training on
+                # Negative delight = blunder (rare wrong action), skip to save compute
+                if mean_delight <= 0:
+                    del outputs, logits, new_lp, input_tensor, new_comp_lp
+                    continue  # skip backward pass entirely
+
                 per_token_loss = -(gate.detach() * adv * new_comp_lp)
             elif config.loss_type == "grpo":
                 ratio = torch.exp(new_comp_lp - old_lp)
@@ -261,6 +270,9 @@ def grpo_step(model, optimizer, scaler, samples, config):
         torch.cuda.empty_cache()
 
     # Gradient clipping + optimizer step
+    if total_loss_val == 0.0:
+        # No backward was called (all samples skipped by Kondo gate or zero advantage)
+        return 0.0
     scaler.unscale_(optimizer)
     grad_norm = torch.nn.utils.clip_grad_norm_(
         [p for p in model.parameters() if p.requires_grad],
