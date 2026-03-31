@@ -440,11 +440,11 @@ class BaseTrainer(ABC):
         print(f"\n   \033[90m{'=' * 62}\033[0m")
         print(f"   \033[1m{'Training complete!':^62}\033[0m")
         print(f"   \033[90m{'-' * 62}\033[0m")
-        print(f"   \033[1m Zeit:\033[0m       {total_time/3600:.1f}h ({total_time/max_steps:.1f}s/step)")
+        print(f"   \033[1m Time:\033[0m       {total_time/3600:.1f}h ({total_time/max_steps:.1f}s/step)")
         print(f"   \033[1m Tokens:\033[0m     {total_gen_tokens:,} in {total_gen_time:.1f}s ({avg_tok_s:.0f} tok/s)")
-        print(f"   \033[1m Belohnung:\033[0m  {summary['final_mean_reward']:.2f}")
+        print(f"   \033[1m Reward:\033[0m     {summary['final_mean_reward']:.2f}")
         print(f"   \033[1m LoRA:\033[0m       {final_path}")
-        print(f"   \033[1m Metriken:\033[0m   {run_dir}/metrics.json")
+        print(f"   \033[1m Metrics:\033[0m    {run_dir}/metrics.json")
         print(f"   \033[90m{'=' * 62}\033[0m")
 
         return final_path

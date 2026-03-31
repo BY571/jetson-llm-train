@@ -15,11 +15,11 @@ def print_banner(args, run_id):
 
     is_integrated = torch.cuda.get_device_properties(0).is_integrated if torch.cuda.is_available() else False
     if args.dry_run:
-        gang = "Leerlauf (dry-run)"
+        gang = "Idle (dry-run)"
     elif is_integrated:
-        gang = "Sparsam"
+        gang = "Efficient"
     else:
-        gang = "Schnell"
+        gang = "Fast"
 
     engine_mode = "C++ dp4a" if not args.dry_run else "HF generate"
     kv_bits = getattr(args, 'kv_bits', 0)
@@ -80,17 +80,17 @@ def print_banner(args, run_id):
     w = 62
     print(f"   \033[90m{'=' * w}\033[0m")
     print(f"   \033[1m{'TRIEBWERK':^{w}}\033[0m")
-    print(f"   \033[90m{'Hochleistung GRPO Training':^{w}}\033[0m")
+    print(f"   \033[90m{'High-Performance GRPO Training':^{w}}\033[0m")
     print(f"   \033[90m{'-' * w}\033[0m")
     print(f"   \033[1m Version:\033[0m  {VERSION}")
-    print(f"   \033[1m Maschine:\033[0m {gpu_name}{gpu_mem}")
-    print(f"   \033[1m Antrieb:\033[0m  {engine_mode}")
-    print(f"   \033[1m Gang:\033[0m     {gang}")
-    print(f"   \033[1m Modell:\033[0m   {args.model}")
-    print(f"   \033[1m KV-Cache:\033[0m {kv_mode} ({kv_total_mb:.0f} MB for {total_context} tok)")
-    print(f"   \033[1m Kontext:\033[0m  {ctx_color}{total_context}/{max_context} ({context_pct:.0f}%)\033[0m")
-    print(f"   \033[1m Schritte:\033[0m {args.max_steps} (G={G}, {max_tokens} tok)")
-    print(f"   \033[1m Lauf:\033[0m     {run_id}")
+    print(f"   \033[1m Device:\033[0m   {gpu_name}{gpu_mem}")
+    print(f"   \033[1m Engine:\033[0m   {engine_mode}")
+    print(f"   \033[1m Gear:\033[0m     {gang}")
+    print(f"   \033[1m Model:\033[0m    {args.model}")
+    print(f"   \033[1m KV Cache:\033[0m {kv_mode} ({kv_total_mb:.0f} MB for {total_context} tok)")
+    print(f"   \033[1m Context:\033[0m  {ctx_color}{total_context}/{max_context} ({context_pct:.0f}%)\033[0m")
+    print(f"   \033[1m Steps:\033[0m    {args.max_steps} (G={G}, {max_tokens} tok)")
+    print(f"   \033[1m Run:\033[0m      {run_id}")
     print(f"   \033[90m{'=' * w}\033[0m")
 
 
@@ -127,7 +127,7 @@ def print_memory_map(engine=None, weights_path=None):
     arena_bytes = max(0, engine_bytes - weight_bytes - cache_bytes)
 
     segments = [
-        ("Gewichte",   weight_bytes, "\033[36m"),   # cyan
+        ("Weights",    weight_bytes, "\033[36m"),   # cyan
         ("FP16-Cache", cache_bytes,  "\033[34m"),   # blue
         ("PyTorch",    pt_reserved,  "\033[33m"),   # yellow
         ("Arena+KV",   arena_bytes,  "\033[35m"),   # magenta
@@ -153,7 +153,7 @@ def print_memory_map(engine=None, weights_path=None):
     free_chars = max(0, bar_width - block_count)
     free_blocks = '\u2591' * free_chars
     bar += f"\033[90m{free_blocks}\033[0m"
-    legend.append(f"\033[90m\u2591\u2591\033[0m Frei {free_bytes/1e9:.1f}G")
+    legend.append(f"\033[90m\u2591\u2591\033[0m Free {free_bytes/1e9:.1f}G")
 
     pct = used_mem / total_mem * 100
     if pct > 90:
@@ -163,7 +163,7 @@ def print_memory_map(engine=None, weights_path=None):
     else:
         pct_color = "\033[1;32m"
 
-    print(f"\n   \033[1m Speicher:\033[0m [{bar}] {pct_color}{used_mem/1e9:.1f}/{total_gb:.1f} GB ({pct:.0f}%)\033[0m")
+    print(f"\n   \033[1m Memory:\033[0m  [{bar}] {pct_color}{used_mem/1e9:.1f}/{total_gb:.1f} GB ({pct:.0f}%)\033[0m")
     # Print legend in rows of 3
     for i in range(0, len(legend), 3):
         row = "  ".join(legend[i:i+3])

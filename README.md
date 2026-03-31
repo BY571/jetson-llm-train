@@ -24,21 +24,21 @@ Output: standard HuggingFace PEFT LoRA adapters. Load with `PeftModel.from_pretr
 
    ==============================================================
                             TRIEBWERK
-                    Hochleistung GRPO Training
+                   High-Performance GRPO Training
    --------------------------------------------------------------
     Version:  0.1.0
-    Maschine: NVIDIA GeForce RTX 4060 Laptop GPU (8.2 GB)
-    Antrieb:  C++ dp4a
-    Gang:     Schnell
-    Modell:   Qwen/Qwen3-0.6B
-    KV-Cache: fp16 (281 MB for 612 tok)
-    Kontext:  612/13108 (5%)
-    Schritte: 300 (G=4, 512 tok)
+    Device:   NVIDIA GeForce RTX 4060 Laptop GPU (8.2 GB)
+    Engine:   C++ dp4a
+    Gear:     Fast
+    Model:    Qwen/Qwen3-0.6B
+    KV Cache: fp16 (281 MB for 612 tok)
+    Context:  612/13108 (5%)
+    Steps:    300 (G=4, 512 tok)
    ==============================================================
 
-    Speicher: [███████████████░░░░░░░░░░░░░░░░░░░░░░░░░] 3.2/8.2 GB (39%)
-              ██ Gewichte 0.6G  ██ FP16-Cache 0.8G  ██ PyTorch 1.4G
-              ██ Arena+KV 0.5G  ░░ Frei 5.0G
+    Memory:  [███████████████░░░░░░░░░░░░░░░░░░░░░░░░░] 3.2/8.2 GB (39%)
+             ██ Weights 0.6G  ██ FP16-Cache 0.8G  ██ PyTorch 1.4G
+             ██ Arena+KV 0.5G  ░░ Free 5.0G
 
    [1/300] loss=-0.67  reward=-0.88  tok/s=300  gen=5.2s  step=5.8s  [0m]
    [2/300] loss=-0.42  reward= 0.25  tok/s=284  gen=3.9s  step=4.6s  [0m]
