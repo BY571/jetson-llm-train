@@ -1,6 +1,6 @@
 # Triebwerk
 
-Fast LoRA fine-tuning engine for LLMs. Custom C++/CUDA inference engine with CUDA graphs, dp4a 4-bit quantization, and zero-overhead batched generation. PyTorch handles gradients, Triebwerk handles speed.
+Fast GRPO/RL fine-tuning engine for LLMs on any NVIDIA GPU. Matches vLLM speed on desktop GPUs and runs on edge devices like Jetson Orin where vLLM can't. Custom C++/CUDA inference engine with CUDA graphs, 4-bit quantization, and batched generation. PyTorch handles gradients, Triebwerk handles speed.
 
 ## Performance
 
