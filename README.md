@@ -139,17 +139,6 @@ PYTHONPATH=engine/build_local uv run python3 examples/gsm8k.py --max-steps 300  
 uv run python3 examples/countdown.py --dry-run --max-steps 5                              # Dry run (no engine)
 ```
 
-## How it works
-
-```
-Training step:
-  1. C++ engine generates G completions (chunked prefill + CUDA graph, ~300 tok/s)
-  2. Reward functions score completions (Python)
-  3. PyTorch computes log-probs + loss + backward
-  4. LoRA weights synced back to engine (~0.02ms)
-```
-
-Key optimizations: chunked prefill, CUDA graphs with pointer-indirection sampling, Q4L dp4a 4-bit, arena allocator, amortized stop checking, GPU-GPU LoRA sync.
 
 ## TurboQuant: compressed KV cache
 
