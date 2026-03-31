@@ -51,6 +51,57 @@ RL fine-tuning engine for LLMs. C++/CUDA inference engine with CUDA graphs and 4
 | **Triebwerk** | **RTX 4060** | **5.8s** | **~300** |
 | **Triebwerk** | **Jetson Orin 8GB** | **16.5s** | **~104** |
 
+## Setup
+
+<details>
+<summary><b>Desktop GPU (RTX 30xx/40xx/50xx)</b></summary>
+
+```bash
+pip install torch transformers peft datasets bitsandbytes
+
+# Build C++ engine (one-time)
+cd engine && mkdir -p build_local && cd build_local
+cmake .. -DCMAKE_CUDA_ARCHITECTURES=89  # 89 for RTX 40xx, 86 for RTX 30xx
+make -j$(nproc) && cd ../..
+
+# Convert weights (one-time)
+python3 engine/convert_weights.py --model Qwen/Qwen3-0.6B --output engine/weights_q4l --mode q4l
+
+# Train
+PYTHONPATH=engine/build_local python3 train.py --max-steps 300
+
+# Dry run (no engine build needed, uses HF generate)
+python3 train.py --max-steps 5 --dry-run
+```
+</details>
+
+<details>
+<summary><b>Jetson Orin (Docker)</b></summary>
+
+Jetson needs Docker because bitsandbytes requires a specific CUDA/ARM build.
+
+```bash
+# Build Docker image (one-time, ~15 min)
+docker build --network=host -t triebwerk .
+
+# Convert weights + build engine (one-time)
+docker run --runtime nvidia --network=host \
+  -v $(pwd):/workspace -v ~/.cache/huggingface:/root/.cache/huggingface \
+  triebwerk bash -c '
+    python3 engine/convert_weights.py --model Qwen/Qwen3-0.6B --output engine/weights_q4l --mode q4l &&
+    cd engine && mkdir -p build_docker && cd build_docker &&
+    cmake .. -DCMAKE_CUDA_ARCHITECTURES=87 && make -j4'
+
+# Train
+docker run --runtime nvidia --network=host \
+  -v $(pwd):/workspace -v ~/.cache/huggingface:/root/.cache/huggingface \
+  triebwerk bash -c \
+  'ENGINE_BUILD=engine/build_docker PYTHONPATH=engine/build_docker python3 train.py --max-steps 300'
+```
+
+> **Tip:** disable desktop GUI (`sudo systemctl set-default multi-user.target`) to free ~800MB RAM.
+</details>
+
 ## Quick start
 
 ```python
@@ -67,119 +118,37 @@ trainer = GRPOTrainer(
 trainer.train(dataset, max_steps=300)
 ```
 
-## Training algorithms
-
 ```python
-from triebwerk import GRPOTrainer, DGTrainer
+from triebwerk import DGTrainer
 
-# GRPO / DAPO (default) -- clipped surrogate with reference model
-trainer = GRPOTrainer(
-    model="Qwen/Qwen3-0.6B",
-    reward_funcs=[my_reward],
-    loss_type="dapo",  # or "grpo"
-)
-
-# Delightful Policy Gradient (https://arxiv.org/abs/2603.14608)
-# No reference model, simpler, one hyperparameter
-# Includes Kondo gate (https://arxiv.org/abs/2603.20526): auto-skips backward for low-value samples
+# Delightful Policy Gradient -- no reference model, includes Kondo gate
 trainer = DGTrainer(
     model="Qwen/Qwen3-0.6B",
     reward_funcs=[my_reward],
-    eta=1.0,
 )
+trainer.train(dataset, max_steps=300)
 ```
 
 ## Examples
 
 ```bash
-# Countdown numbers game (recommended -- clearest learning signal for small models)
-PYTHONPATH=engine/build_local python3 examples/countdown.py --max-steps 300
-
-# Letter counting (continuous reward, good for debugging)
-PYTHONPATH=engine/build_local python3 examples/letter_counting.py --max-steps 300
-
-# GSM8K math (granular rewards: format + integer + correctness)
-PYTHONPATH=engine/build_local python3 examples/gsm8k.py --max-steps 300
-
-# Dry run (no C++ engine needed, uses HF generate)
-python3 examples/countdown.py --dry-run --max-steps 5
+PYTHONPATH=engine/build_local python3 examples/countdown.py --max-steps 300       # Countdown numbers
+PYTHONPATH=engine/build_local python3 examples/letter_counting.py --max-steps 300  # Letter counting
+PYTHONPATH=engine/build_local python3 examples/gsm8k.py --max-steps 300            # GSM8K math
+python3 examples/countdown.py --dry-run --max-steps 5                              # Dry run (no engine)
 ```
 
-## What makes it fast
-
-- **Chunked prefill**: all prompt tokens in one forward pass per layer (weights read once, not T times)
-- **CUDA graphs**: decode + sampling captured as a single graph, ~1us launch overhead per token
-- **Pointer-indirection sampling**: device-side `float**` lets the graph read different random values each step
-- **Q4L 4-bit with dp4a**: integer dot product, 4 MACs per instruction on Jetson
-- **TurboQuant KV cache**: 4x-8x KV cache compression via random rotation + Lloyd-Max quantization ([paper](https://arxiv.org/abs/2504.19874))
-- **Batched generation**: all G completions in parallel via cuBLAS GEMM with tensor cores
-- **Arena allocator**: single cudaMalloc for all batch buffers, zero fragmentation with PyTorch
-- **Amortized stop checking**: sync every 8 tokens instead of every token, GPU-side position increment
-- **GPU-GPU LoRA sync**: direct device-to-device memcpy, no CPU roundtrip
-
-## Architecture
+## How it works
 
 ```
 Training step:
-  1. Triebwerk generates G completions (chunked prefill + CUDA graph decode, ~300 tok/s)
+  1. C++ engine generates G completions (chunked prefill + CUDA graph, ~300 tok/s)
   2. Reward functions score completions (Python)
-  3. PyTorch forward pass computes log-probs (batched, one call for all G)
-  4. Loss: GRPO clipped surrogate or DG sigmoid gate
-  5. PyTorch backward + optimizer step
-  6. LoRA weights synced to engine via GPU-GPU memcpy (~0.02ms)
+  3. PyTorch computes log-probs + loss + backward
+  4. LoRA weights synced back to engine (~0.02ms)
 ```
 
-## Setup (Desktop GPU)
-
-```bash
-# Install Python deps
-pip install torch transformers peft datasets bitsandbytes
-
-# Build the C++ engine (one-time)
-cd engine && mkdir -p build_local && cd build_local
-cmake .. -DCMAKE_CUDA_ARCHITECTURES=89  # 89 for RTX 40xx, 86 for RTX 30xx
-make -j$(nproc) && cd ../..
-
-# Convert weights (one-time)
-python3 engine/convert_weights.py --model Qwen/Qwen3-0.6B --output engine/weights_q4l --mode q4l
-
-# Train
-PYTHONPATH=engine/build_local python3 train.py --max-steps 300
-
-# Dry run (no engine build needed, uses HF generate)
-python3 train.py --max-steps 5 --dry-run
-```
-
-## Setup (Jetson Orin)
-
-Jetson needs Docker because bitsandbytes requires a specific CUDA/ARM build:
-
-```bash
-# Build Docker image (one-time, ~15 min)
-docker build --network=host -t triebwerk .
-
-# Convert weights (one-time)
-docker run --runtime nvidia --network=host \
-  -v $(pwd):/workspace \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  triebwerk python3 engine/convert_weights.py \
-    --model Qwen/Qwen3-0.6B --output engine/weights_q4l --mode q4l
-
-# Build the C++ engine inside Docker (one-time)
-docker run --runtime nvidia -v $(pwd):/workspace triebwerk bash -c \
-  'cd engine && mkdir -p build_docker && cd build_docker && \
-   cmake .. -DCMAKE_CUDA_ARCHITECTURES=87 && make -j4'
-
-# Train
-docker run --runtime nvidia --network=host \
-  -v $(pwd):/workspace \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  triebwerk bash -c \
-  'ENGINE_BUILD=engine/build_docker PYTHONPATH=engine/build_docker \
-   python3 train.py --max-steps 300'
-```
-
-Jetson tips: disable the desktop GUI (`sudo systemctl set-default multi-user.target`) to free ~800MB RAM. Add swap (`sudo fallocate -l 16G /home/$USER/16GB.swap && sudo mkswap /home/$USER/16GB.swap && sudo swapon /home/$USER/16GB.swap`).
+Key optimizations: chunked prefill, CUDA graphs with pointer-indirection sampling, Q4L dp4a 4-bit, arena allocator, amortized stop checking, GPU-GPU LoRA sync.
 
 ## TurboQuant: compressed KV cache
 
