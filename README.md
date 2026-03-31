@@ -57,7 +57,8 @@ RL fine-tuning engine for LLMs. C++/CUDA inference engine with CUDA graphs and 4
 <summary><b>Desktop GPU (RTX 30xx/40xx/50xx)</b></summary>
 
 ```bash
-pip install torch transformers peft datasets bitsandbytes
+git clone https://github.com/BY571/triebwerk && cd triebwerk
+uv sync
 
 # Build C++ engine (one-time)
 cd engine && mkdir -p build_local && cd build_local
@@ -68,10 +69,10 @@ make -j$(nproc) && cd ../..
 python3 engine/convert_weights.py --model Qwen/Qwen3-0.6B --output engine/weights_q4l --mode q4l
 
 # Train
-PYTHONPATH=engine/build_local python3 train.py --max-steps 300
+PYTHONPATH=engine/build_local uv run python3 train.py --max-steps 300
 
-# Dry run (no engine build needed, uses HF generate)
-python3 train.py --max-steps 5 --dry-run
+# Dry run (no engine build needed)
+uv run python3 train.py --max-steps 5 --dry-run
 ```
 </details>
 
@@ -132,10 +133,10 @@ trainer.train(dataset, max_steps=300)
 ## Examples
 
 ```bash
-PYTHONPATH=engine/build_local python3 examples/countdown.py --max-steps 300       # Countdown numbers
-PYTHONPATH=engine/build_local python3 examples/letter_counting.py --max-steps 300  # Letter counting
-PYTHONPATH=engine/build_local python3 examples/gsm8k.py --max-steps 300            # GSM8K math
-python3 examples/countdown.py --dry-run --max-steps 5                              # Dry run (no engine)
+PYTHONPATH=engine/build_local uv run python3 examples/countdown.py --max-steps 300       # Countdown numbers
+PYTHONPATH=engine/build_local uv run python3 examples/letter_counting.py --max-steps 300  # Letter counting
+PYTHONPATH=engine/build_local uv run python3 examples/gsm8k.py --max-steps 300            # GSM8K math
+uv run python3 examples/countdown.py --dry-run --max-steps 5                              # Dry run (no engine)
 ```
 
 ## How it works
