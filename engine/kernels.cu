@@ -2052,8 +2052,8 @@ __global__ void ssm_conv1d_decode_kernel(
     int total = conv_dim * G;
     if (idx >= total) return;
 
-    int c = idx / G;  // channel
-    int g = idx % G;  // batch
+    int g = idx / conv_dim;  // batch (col-major: g is slow index)
+    int c = idx % conv_dim;  // channel (col-major: c is fast index)
     int hist = kernel_size - 1;  // 3 for kernel=4
 
     // Gather: [conv_state[g,c,0], conv_state[g,c,1], conv_state[g,c,2], input[c,g]]
@@ -2063,14 +2063,15 @@ __global__ void ssm_conv1d_decode_kernel(
         float w = __half2float(weight[c * kernel_size + k]);
         acc += s * w;
     }
-    float in_val = __half2float(input[c * G + g]);
+    // Col-major: element (c, g) at c + g * conv_dim
+    float in_val = __half2float(input[c + g * conv_dim]);
     acc += in_val * __half2float(weight[c * kernel_size + hist]);
     if (bias) acc += __half2float(bias[c]);
 
     // SiLU activation
     float silu_val = acc / (1.0f + expf(-acc));
 
-    output[c * G + g] = silu_val;  // fp32 output
+    output[c + g * conv_dim] = silu_val;  // fp32, col-major
 
     // Shift conv state left, push input (fp32)
     for (int k = 0; k < hist - 1; k++) {
@@ -2096,18 +2097,19 @@ __global__ void ssm_compute_dt_decay_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_v_heads * G) return;
 
-    int h = idx / G;
-    int g = idx % G;
+    // Col-major: element (h, g) at h + g * num_v_heads
+    int g = idx / num_v_heads;
+    int h = idx % num_v_heads;
 
-    float a_val = __half2float(a_in[h * G + g]);
-    float b_val = __half2float(b_in[h * G + g]);
+    float a_val = __half2float(a_in[h + g * num_v_heads]);
+    float b_val = __half2float(b_in[h + g * num_v_heads]);
     float A = expf(__half2float(A_log[h]));
     float dt = __half2float(dt_bias[h]) + a_val;
     dt = logf(1.0f + expf(dt));  // softplus
     float d = expf(-A * dt);     // decay
 
-    decay[h * G + g] = d;
-    beta[h * G + g] = 1.0f / (1.0f + expf(-b_val));  // sigmoid
+    decay[h + g * num_v_heads] = d;
+    beta[h + g * num_v_heads] = 1.0f / (1.0f + expf(-b_val));  // sigmoid
 }
 
 // --- SSM state update + output (Gated Delta Rule, batched decode) ---
@@ -2144,15 +2146,19 @@ __global__ void ssm_gated_delta_rule_kernel(
     int kv_ratio = num_v_heads / num_k_heads;
     int kh = vh / kv_ratio;
 
-    float d = decay[vh * G + g];
-    float b = beta[vh * G + g];
+    // Col-major: element (dim, g) at dim + g * total_dim
+    int key_dim = num_k_heads * k_head_dim;
+    int value_dim = num_v_heads * v_head_dim;
+
+    float d = decay[vh + g * num_v_heads];
+    float b = beta[vh + g * num_v_heads];
 
     // Pointers into state for this (g, vh) pair
     // State layout: state[(g * num_v_heads + vh) * k_head_dim * v_head_dim + row * v_head_dim + col]
     int state_base = (g * num_v_heads + vh) * k_head_dim * v_head_dim;
 
-    // Load v[vh, vd, g] — fp32 from conv1d
-    float v_val = v[(vh * v_head_dim + vd) * G + g];
+    // Load v[vh, vd, g] — fp32 from conv1d, col-major
+    float v_val = v[(vh * v_head_dim + vd) + g * value_dim];
 
     // Compute kv_recall[vd] = sum_kd state[kd, vd] * k[kd]
     // and y[vd] = sum_kd state_new[kd, vd] * q[kd]
@@ -2162,7 +2168,7 @@ __global__ void ssm_gated_delta_rule_kernel(
     float kv_recall = 0.0f;
     for (int kd = 0; kd < k_head_dim; kd++) {
         float s = state[state_base + kd * v_head_dim + vd];
-        float k_val = k[(kh * k_head_dim + kd) * G + g];  // fp32
+        float k_val = k[(kh * k_head_dim + kd) + g * key_dim];
         kv_recall += s * k_val;
     }
 
@@ -2172,8 +2178,8 @@ __global__ void ssm_gated_delta_rule_kernel(
     // Pass 2: update state and compute output
     for (int kd = 0; kd < k_head_dim; kd++) {
         float s = state[state_base + kd * v_head_dim + vd];
-        float k_val = k[(kh * k_head_dim + kd) * G + g];  // fp32
-        float q_val = q[(kh * k_head_dim + kd) * G + g];   // fp32
+        float k_val = k[(kh * k_head_dim + kd) + g * key_dim];
+        float q_val = q[(kh * k_head_dim + kd) + g * key_dim];
 
         float s_new = d * s + k_val * delta;
         state[state_base + kd * v_head_dim + vd] = s_new;
@@ -2182,7 +2188,7 @@ __global__ void ssm_gated_delta_rule_kernel(
 
     // Scale output by 1/sqrt(k_head_dim) — matches SSD dual attention scaling
     y_val *= rsqrtf((float)k_head_dim);
-    y_out[(vh * v_head_dim + vd) * G + g] = y_val;
+    y_out[(vh * v_head_dim + vd) + g * value_dim] = y_val;  // col-major
 }
 
 // --- Gated RMSNorm: y = RMSNorm(y) * SiLU(z) ---
@@ -2203,8 +2209,9 @@ __global__ void ssm_gated_rmsnorm_kernel(
     int d = threadIdx.x;
     if (d >= v_head_dim) return;
 
-    // Load y value (fp32 from delta rule)
-    int idx = (vh * v_head_dim + d) * G + g;
+    // Col-major: element (dim, g) at dim + g * value_dim
+    int value_dim = num_v_heads * v_head_dim;
+    int idx = (vh * v_head_dim + d) + g * value_dim;
     float y_val = y_in[idx];
 
     // Compute RMS (reduce across v_head_dim)
@@ -2228,7 +2235,7 @@ __global__ void ssm_gated_rmsnorm_kernel(
     float w = __half2float(weight[d]);
     float normalized = y_val * rms * w;
 
-    // Gate with SiLU(z)
+    // Gate with SiLU(z) — z is also col-major from GEMM
     float z_val = __half2float(z[idx]);
     float silu_z = z_val / (1.0f + expf(-z_val));
 
@@ -2299,7 +2306,9 @@ __global__ void ssm_l2norm_qk_kernel(
     int d = threadIdx.x;
     if (d >= k_head_dim) return;
 
-    int q_idx = (h * k_head_dim + d) * G + g;
+    // Col-major: element (dim, g) at dim + g * key_dim
+    int key_dim = num_k_heads * k_head_dim;
+    int q_idx = (h * k_head_dim + d) + g * key_dim;
     int k_idx = q_idx;
 
     float qv = q[q_idx];  // fp32
