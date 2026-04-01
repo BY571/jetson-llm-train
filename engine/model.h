@@ -390,6 +390,9 @@ public:
     // Share embedding from PyTorch (avoids 311MB duplicate on Jetson)
     // Pass the raw GPU pointer from model.embed_tokens.weight.data_ptr()
     void share_embedding(void* external_embed_ptr);
+    void share_weight(int layer, const char* name, half* ptr);
+    void load_config(const std::string& config_path);
+    void load_weights_gguf(const std::string& gguf_path);
     bool embed_is_external_ = false;
 
     // Prefill: process multiple tokens at once

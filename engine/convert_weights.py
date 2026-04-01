@@ -290,9 +290,11 @@ def convert_fp16(args, config=None):
     print(f"Saved {len(lines)} tensors ({total_mb:.1f}MB)")
 
 
-def convert_q4l(args):
+def convert_q4l(args, config=None):
     """Dequantize NF4 to fp16, then re-quantize to linear Q4.
     This eliminates the NF4 lookup table — dequant is just (nibble-8)*scale."""
+    if config is None:
+        config = {}
     print(f"Converting {args.model} (Q4L mode: NF4→fp16→Q4Linear)...")
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     import bitsandbytes as bnb
@@ -317,16 +319,36 @@ def convert_q4l(args):
             clean = name[6:] if name.startswith("model.") else name
 
             if hasattr(param, "quant_state"):
-                # Dequantize NF4 → fp16 → re-quantize to Q4L
+                # Dequantize NF4 → fp16
                 fp16_data = bnb.functional.dequantize_4bit(
                     param.data, param.quant_state
-                ).to(torch.float16).contiguous().cpu().numpy()
+                ).to(torch.float16).contiguous().cpu()
 
-                packed, q4l_scales = quantize_fp16_to_q4l(fp16_data, block_size=64)
+                # Small projections (e.g., in_proj_a 16x1024): keep as fp16
+                # Q4L block_size=64 is larger than these rows → terrible quantization
+                if fp16_data.shape[0] <= 64:
+                    data = fp16_data.numpy().tobytes()
+                    shape = ",".join(str(s) for s in fp16_data.shape)
+                    lines.append(f"{clean} {offset} {len(data)} float16 {shape}")
+                    f.write(data)
+                    offset += len(data)
+                    continue
+
+                # Gated-Q reorder: [q_h0, gate_h0, ...] → [all_query | all_gate]
+                if "q_proj.weight" in clean and config.get("gated_attn"):
+                    hd = config["head_dim"]
+                    nh = config["num_attention_heads"]
+                    fp16_data = fp16_data.reshape(nh, 2, hd, -1)
+                    query = fp16_data[:, 0, :, :].reshape(-1, fp16_data.shape[-1])
+                    gate = fp16_data[:, 1, :, :].reshape(-1, fp16_data.shape[-1])
+                    fp16_data = torch.cat([query, gate], dim=0).contiguous()
+
+                fp16_np = fp16_data.numpy()
+                packed, q4l_scales = quantize_fp16_to_q4l(fp16_np, block_size=64)
 
                 # Save packed weights as uint8
                 data = packed.tobytes()
-                shape = ",".join(str(s) for s in fp16_data.shape)
+                shape = ",".join(str(s) for s in fp16_np.shape)
                 lines.append(f"{clean} {offset} {len(data)} uint8 {shape}")
                 f.write(data)
                 offset += len(data)
@@ -341,8 +363,19 @@ def convert_q4l(args):
                 n_q4l += 1
             else:
                 # Keep fp16 (embeddings, norms, etc.)
-                data = param.data.to(torch.float16).contiguous().cpu().numpy().tobytes()
-                shape = ",".join(str(s) for s in param.shape)
+                pdata = param.data.to(torch.float16).contiguous().cpu()
+
+                # Gated-Q reorder for non-quantized q_proj (if model loaded without bnb)
+                if "q_proj.weight" in clean and config.get("gated_attn"):
+                    hd = config["head_dim"]
+                    nh = config["num_attention_heads"]
+                    pdata = pdata.reshape(nh, 2, hd, -1)
+                    query = pdata[:, 0, :, :].reshape(-1, pdata.shape[-1])
+                    gate = pdata[:, 1, :, :].reshape(-1, pdata.shape[-1])
+                    pdata = torch.cat([query, gate], dim=0).contiguous()
+
+                data = pdata.numpy().tobytes()
+                shape = ",".join(str(s) for s in pdata.shape)
                 lines.append(f"{clean} {offset} {len(data)} float16 {shape}")
                 f.write(data)
                 offset += len(data)
@@ -557,7 +590,7 @@ def main():
     if args.mode == "nf4":
         convert_nf4(args)
     elif args.mode == "q4l":
-        convert_q4l(args)
+        convert_q4l(args, config=model_config)
     elif args.mode == "vlm_q4l":
         convert_vlm_q4l(args)
     else:

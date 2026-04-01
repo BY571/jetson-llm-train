@@ -192,11 +192,7 @@ class BaseTrainer(ABC):
         if self.engine is None:
             return
 
-        # Limit PyTorch's CUDA allocator to prevent it from grabbing engine's memory
-        if torch.cuda.is_available():
-            torch.cuda.set_per_process_memory_fraction(0.5)
-
-        # Share embedding (engine uses PyTorch's tensor, saves 311MB)
+        # Share embedding (engine uses PyTorch's tensor, saves ~300MB)
         embed_weight = self.model.base_model.model.model.embed_tokens.weight
         if embed_weight.dtype == torch.float16 and embed_weight.is_cuda:
             self.engine.share_embedding(embed_weight.data_ptr())
@@ -234,15 +230,15 @@ class BaseTrainer(ABC):
 
         args = self._build_args_namespace(max_steps, num_generations, max_completion_tokens)
 
-        # 1. Load engine (before PyTorch for clean VRAM)
-        self._load_engine(args)
-
-        # 2. Banner
+        # 1. Banner
         print_banner(args, run_id)
         print("=" * 60)
 
-        # 3. Load model
+        # 2. Load PyTorch model first (on Jetson, CPU=GPU share RAM, so load order matters)
         trainable, total = self._load_model()
+
+        # 3. Load engine (uses remaining VRAM for Q4L weights + arena)
+        self._load_engine(args)
 
         # 4. Connect engine to model
         self._connect_engine(args)

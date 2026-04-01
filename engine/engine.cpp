@@ -6,6 +6,7 @@
  */
 
 #include "model.h"
+#include "gguf_loader.h"
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <algorithm>
@@ -475,6 +476,222 @@ void InferenceEngine::precompute_rope() {
 // ============================================================================
 // Reset
 // ============================================================================
+
+// ============================================================================
+// GGUF weight loading — single quantized model file, no conversion step
+// ============================================================================
+void InferenceEngine::load_weights_gguf(const std::string& gguf_path) {
+    GGUFFile gguf;
+    if (!gguf.open(gguf_path)) {
+        fprintf(stderr, "Failed to open GGUF: %s\n", gguf_path.c_str());
+        return;
+    }
+
+    // Extract model config from GGUF metadata
+    // Try both "qwen35" and "qwen3" prefixes (model-dependent)
+    std::string arch = gguf.get_string("general.architecture", "qwen3");
+    auto gi = [&](const std::string& key, int def) {
+        int v = gguf.get_int(arch + "." + key, -1);
+        return v >= 0 ? v : def;
+    };
+    auto gf = [&](const std::string& key, float def) {
+        float v = gguf.get_float(arch + "." + key, -1.0f);
+        return v >= 0 ? v : def;
+    };
+
+    config_.hidden_size = gi("embedding_length", 1024);
+    config_.num_layers = gi("block_count", 24);
+    config_.num_heads = gi("attention.head_count", 8);
+    config_.num_kv_heads = gi("attention.head_count_kv", 2);
+    config_.head_dim = gi("attention.key_length", config_.hidden_size / config_.num_heads);
+    config_.intermediate_size = gi("feed_forward_length", 3584);
+    config_.vocab_size = 248320;  // not always in metadata; derive from token_embd shape
+    auto* emb_t = gguf.find_tensor("token_embd.weight");
+    if (emb_t && emb_t->n_dims >= 2) config_.vocab_size = emb_t->dims[1];
+    config_.rms_norm_eps = gf("attention.layer_norm_rms_epsilon", 1e-6f);
+    config_.rope_theta = gf("rope.freq_base", 10000000.0f);
+    config_.rope_dim = gi("rope.dimension_count", config_.head_dim);
+
+    // SSM config
+    config_.ssm_conv_kernel = gi("ssm.conv_kernel", 4);
+    int ssm_state = gi("ssm.state_size", 0);
+    int ssm_groups = gi("ssm.group_count", 0);
+    config_.ssm_k_head_dim = ssm_state > 0 ? ssm_state : 128;
+    config_.ssm_v_head_dim = config_.ssm_k_head_dim;
+    config_.ssm_num_k_heads = ssm_groups > 0 ? ssm_groups : 16;
+    config_.ssm_num_v_heads = config_.ssm_num_k_heads;
+
+    // Detect layer types from tensor names
+    for (int i = 0; i < config_.num_layers; i++) {
+        std::string ssm_name = "blk." + std::to_string(i) + ".ssm_a";
+        if (gguf.find_tensor(ssm_name)) {
+            config_.layer_type[i] = LAYER_SSM;
+        } else {
+            config_.layer_type[i] = LAYER_ATTENTION;
+        }
+    }
+
+    // Detect gated attention from attn_gate tensor
+    config_.gated_attn = (gguf.find_tensor("blk.0.attn_gate.weight") != nullptr);
+
+    // Detect full_attention_interval for hybrid models
+    int attn_interval = gi("full_attention_interval", 0);
+    if (attn_interval > 0) {
+        // Override layer types: every attn_interval-th layer is attention
+        for (int i = 0; i < config_.num_layers; i++) {
+            config_.layer_type[i] = ((i + 1) % attn_interval == 0) ? LAYER_ATTENTION : LAYER_SSM;
+        }
+    }
+
+    fprintf(stderr, "  GGUF config: %dh, %di, %dL, %dQh/%dKVh, %dhd, %dV\n",
+            config_.hidden_size, config_.intermediate_size, config_.num_layers,
+            config_.num_heads, config_.num_kv_heads, config_.head_dim, config_.vocab_size);
+    if (config_.is_hybrid())
+        fprintf(stderr, "  Hybrid: SSM k_heads=%d, v_heads=%d\n",
+                config_.ssm_num_k_heads, config_.ssm_num_v_heads);
+    if (config_.gated_attn)
+        fprintf(stderr, "  Gated attention (Q_PROJ_DIM=%d)\n", config_.q_proj_dim());
+
+    // Allocate buffers now that config is known
+    allocate_buffers();
+
+    // Helper: allocate GPU memory and load a GGUF tensor into it
+    auto load = [&](const std::string& name) -> half* {
+        auto* t = gguf.find_tensor(name);
+        if (!t) return nullptr;
+        half* ptr;
+        cudaMalloc(&ptr, t->n_elements * sizeof(half));
+        gguf.load_tensor_fp16(name, ptr);
+        return ptr;
+    };
+
+    // Helper: load and transpose a 2D tensor (GGUF stores [cols, rows], we need [rows, cols])
+    auto load_transposed = [&](const std::string& name) -> half* {
+        auto* t = gguf.find_tensor(name);
+        if (!t || t->n_dims < 2) return load(name);
+        int rows = t->dims[1];  // outer dim = rows in target
+        int cols = t->dims[0];  // inner dim = cols in target
+        // Load to temp
+        half* tmp;
+        cudaMalloc(&tmp, t->n_elements * sizeof(half));
+        gguf.load_tensor_fp16(name, tmp);
+        // Transpose on CPU (embedding is accessed by lookup, not GEMM)
+        std::vector<half> h_src(t->n_elements), h_dst(t->n_elements);
+        cudaMemcpy(h_src.data(), tmp, t->n_elements * sizeof(half), cudaMemcpyDeviceToHost);
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+                h_dst[r * cols + c] = h_src[c * rows + r];
+        cudaMemcpy(tmp, h_dst.data(), t->n_elements * sizeof(half), cudaMemcpyHostToDevice);
+        return tmp;
+    };
+
+    // Load embedding (needs transpose: GGUF [hidden, vocab] → engine [vocab, hidden])
+    weights_.embed_tokens = load_transposed("token_embd.weight");
+    weights_.final_layernorm = load("output_norm.weight");
+
+    // Load per-layer weights using GGUF tensor names
+    // GGUF Qwen3.5 naming:
+    //   blk.N.attn_qkv.weight  — fused Q+K+V (attention) or Q+K+V (SSM in_proj_qkv)
+    //   blk.N.attn_gate.weight — attention sigmoid gate
+    //   blk.N.ssm_a            — A_log
+    //   blk.N.ssm_alpha.weight — in_proj_a (decay input)
+    //   blk.N.ssm_beta.weight  — in_proj_b (write strength input)
+    //   blk.N.ssm_conv1d.weight
+    //   blk.N.ssm_dt.bias
+    //   blk.N.ssm_norm.weight
+    //   blk.N.ssm_out.weight   — out_proj
+
+    int n_attn = 0, n_ssm = 0, n_missing = 0;
+    for (int i = 0; i < config_.num_layers; i++) {
+        auto& L = weights_.layers[i];
+        L = {};
+        std::string p = "blk." + std::to_string(i) + ".";
+
+        // Shared: norms and MLP
+        L.input_layernorm = load(p + "attn_norm.weight");
+        L.post_attn_layernorm = load(p + "post_attention_norm.weight");
+        if (!L.post_attn_layernorm) L.post_attn_layernorm = load(p + "ffn_norm.weight");
+        L.gate_proj_fp16 = load(p + "ffn_gate.weight");
+        L.up_proj_fp16 = load(p + "ffn_up.weight");
+        L.down_proj_fp16 = load(p + "ffn_down.weight");
+
+        if (config_.layer_type[i] == LAYER_ATTENTION) {
+            // Attention: separate Q, K, V, O tensors
+            // Q is (hidden, q_proj_dim) where q_proj_dim includes gate for gated attn
+            L.q_proj_fp16 = load(p + "attn_q.weight");
+            L.k_proj_fp16 = load(p + "attn_k.weight");
+            L.v_proj_fp16 = load(p + "attn_v.weight");
+            L.o_proj_fp16 = load(p + "attn_output.weight");
+            L.q_norm = load(p + "attn_q_norm.weight");
+            L.k_norm = load(p + "attn_k_norm.weight");
+            n_attn++;
+        } else {
+            // SSM layer:
+            // attn_qkv.weight = in_proj_qkv (Q+K+V fused)
+            // attn_gate.weight = in_proj_z (the Z/gate projection)
+            L.ssm_in_proj_qkv_fp16 = load(p + "attn_qkv.weight");
+            L.ssm_in_proj_z_fp16 = load(p + "attn_gate.weight");
+            L.ssm_out_proj_fp16 = load(p + "ssm_out.weight");
+            L.ssm_in_proj_a_fp16 = load(p + "ssm_alpha.weight");
+            L.ssm_in_proj_b_fp16 = load(p + "ssm_beta.weight");
+            L.ssm_conv1d_weight = load(p + "ssm_conv1d.weight");
+            L.ssm_conv1d_bias = nullptr;
+            L.ssm_A_log = load(p + "ssm_a");
+            L.ssm_dt_bias = load(p + "ssm_dt.bias");
+            L.ssm_norm_weight = load(p + "ssm_norm.weight");
+            n_ssm++;
+        }
+    }
+
+    fprintf(stderr, "  Loaded %d attention + %d SSM layers from GGUF\n", n_attn, n_ssm);
+}
+
+void InferenceEngine::load_config(const std::string& config_path) {
+    config_ = ModelConfig::from_json(config_path);
+    allocate_buffers();
+    // Initialize layer weight pointers to null
+    for (int i = 0; i < config_.num_layers; i++) {
+        auto& L = weights_.layers[i];
+        L = {};  // zero-init all pointers
+    }
+    weights_.embed_tokens = nullptr;
+    weights_.final_layernorm = nullptr;
+    fprintf(stderr, "  Config loaded: %dh, %dL, %dQh/%dKVh, %dhd\n",
+            config_.hidden_size, config_.num_layers, config_.num_heads,
+            config_.num_kv_heads, config_.head_dim);
+}
+
+void InferenceEngine::share_weight(int layer, const char* name, half* ptr) {
+    if (layer < 0 || layer >= config_.num_layers) return;
+    auto& L = weights_.layers[layer];
+    std::string n(name);
+
+    // Attention projections
+    if (n == "q_proj") { L.q_proj_fp16 = ptr; }
+    else if (n == "k_proj") { L.k_proj_fp16 = ptr; }
+    else if (n == "v_proj") { L.v_proj_fp16 = ptr; }
+    else if (n == "o_proj") { L.o_proj_fp16 = ptr; }
+    // MLP projections
+    else if (n == "gate_proj") { L.gate_proj_fp16 = ptr; }
+    else if (n == "up_proj") { L.up_proj_fp16 = ptr; }
+    else if (n == "down_proj") { L.down_proj_fp16 = ptr; }
+    // Norms
+    else if (n == "input_layernorm") { L.input_layernorm = ptr; }
+    else if (n == "post_attention_layernorm") { L.post_attn_layernorm = ptr; }
+    else if (n == "q_norm") { L.q_norm = ptr; }
+    else if (n == "k_norm") { L.k_norm = ptr; }
+    // SSM projections
+    else if (n == "ssm_in_proj_qkv") { L.ssm_in_proj_qkv_fp16 = ptr; }
+    else if (n == "ssm_in_proj_z") { L.ssm_in_proj_z_fp16 = ptr; }
+    else if (n == "ssm_in_proj_a") { L.ssm_in_proj_a_fp16 = ptr; }
+    else if (n == "ssm_in_proj_b") { L.ssm_in_proj_b_fp16 = ptr; }
+    else if (n == "ssm_out_proj") { L.ssm_out_proj_fp16 = ptr; }
+    else if (n == "ssm_conv1d_weight") { L.ssm_conv1d_weight = ptr; }
+    else if (n == "ssm_conv1d_bias") { L.ssm_conv1d_bias = ptr; }
+    else if (n == "ssm_norm") { L.ssm_norm_weight = ptr; }
+    else if (n == "ssm_A_log") { L.ssm_A_log = ptr; }
+    else if (n == "ssm_dt_bias") { L.ssm_dt_bias = ptr; }
+}
 
 void InferenceEngine::share_embedding(void* external_embed_ptr) {
     if (weights_.embed_tokens && !embed_is_external_) {
@@ -1868,7 +2085,8 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
 
     // CUDA graph captures: decode_batch + sampling (with pointer indirection for randoms).
     // The graph reads *d_randoms_ptr which is updated via 8-byte cudaMemcpyAsync per step.
-    if (G > 1 && max_new_tokens >= 50 && !(graph_G_ == G && decode_graph_exec_)) {
+    // CUDA graph not compatible with SSM layers (they use cudaMemset during decode)
+    if (!config_.is_hybrid() && G > 1 && max_new_tokens >= 50 && !(graph_G_ == G && decode_graph_exec_)) {
         if (decode_graph_exec_) { cudaGraphExecDestroy(decode_graph_exec_); decode_graph_exec_ = nullptr; }
         if (decode_graph_) { cudaGraphDestroy(decode_graph_); decode_graph_ = nullptr; }
 

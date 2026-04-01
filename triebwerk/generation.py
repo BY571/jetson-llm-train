@@ -8,7 +8,8 @@ def generate_with_engine(engine, tokenizer, prompt, num_generations,
     """Generate G completions using C++ engine (batched GEMM with tensor cores)."""
     if isinstance(prompt, list):
         text = tokenizer.apply_chat_template(
-            prompt, tokenize=False, add_generation_prompt=True
+            prompt, tokenize=False, add_generation_prompt=True,
+            enable_thinking=True,
         )
     else:
         text = prompt
@@ -46,7 +47,8 @@ def generate_with_hf(model, tokenizer, prompt, num_generations,
     """Generate G completions using HuggingFace generate (for dry-run)."""
     if isinstance(prompt, list):
         text = tokenizer.apply_chat_template(
-            prompt, tokenize=False, add_generation_prompt=True
+            prompt, tokenize=False, add_generation_prompt=True,
+            enable_thinking=True,
         )
     else:
         text = prompt

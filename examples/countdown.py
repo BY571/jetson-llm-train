@@ -115,12 +115,15 @@ def equation_reward(completions, nums, target, **kwargs):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--max-steps", type=int, default=300)
+    parser.add_argument("--num-generations", type=int, default=4)
+    parser.add_argument("--max-completion-tokens", type=int, default=512)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     trainer = GRPOTrainer(
-        model="Qwen/Qwen3-0.6B",
+        model=args.model,
         reward_funcs=[format_reward, equation_reward],
         loss_type="dapo",
         dry_run=args.dry_run,
@@ -128,7 +131,7 @@ if __name__ == "__main__":
     trainer.train(
         dataset=get_countdown(),
         max_steps=args.max_steps,
-        num_generations=4,
-        max_completion_tokens=512,
+        num_generations=args.num_generations,
+        max_completion_tokens=args.max_completion_tokens,
         stop_texts=["</answer>"],
     )

@@ -29,6 +29,10 @@ PYBIND11_MODULE(jetson_engine, m) {
              py::arg("model_dir"),
              "Load model weights from safetensors directory")
 
+        .def("load_weights_gguf", &InferenceEngine::load_weights_gguf,
+             py::arg("gguf_path"),
+             "Load model weights from a single GGUF file (quantized, no conversion needed)")
+
         .def("load_lora", &InferenceEngine::load_lora,
              py::arg("lora_dir"), py::arg("scale") = 1.0f,
              "Load LoRA adapter weights")
@@ -41,6 +45,12 @@ PYBIND11_MODULE(jetson_engine, m) {
              },
              py::arg("data_ptr"),
              "Share embedding from PyTorch tensor (pass tensor.data_ptr())")
+
+        .def("share_weight", [](InferenceEngine& self, int layer, const std::string& name, size_t ptr) {
+                 self.share_weight(layer, name.c_str(), reinterpret_cast<half*>(ptr));
+             },
+             py::arg("layer"), py::arg("name"), py::arg("data_ptr"),
+             "Share a dequantized weight from PyTorch (pass tensor.data_ptr())")
 
         .def("cache_weights", &InferenceEngine::cache_weights,
              "Pre-dequant Q4L weights to fp16 for fast batched GEMM")
