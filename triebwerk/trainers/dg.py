@@ -63,8 +63,14 @@ class DGTrainer(BaseTrainer):
                 logits = outputs.logits[0, :-1, :]
                 targets = input_tensor[0, 1:]
 
-                new_lp = F.log_softmax(logits.float(), dim=-1)
-                new_lp = new_lp.gather(1, targets.unsqueeze(1)).squeeze(1)
+                # Chunked log-softmax to avoid fp32 OOM on (seq_len, vocab_size)
+                new_lp = torch.zeros(logits.shape[0], device=device)
+                chunk = 256
+                for ci in range(0, logits.shape[0], chunk):
+                    ei = min(ci + chunk, logits.shape[0])
+                    lp_c = F.log_softmax(logits[ci:ei].float(), dim=-1)
+                    new_lp[ci:ei] = lp_c.gather(1, targets[ci:ei].unsqueeze(1)).squeeze(1)
+                    del lp_c
                 new_comp_lp = new_lp[len(p_ids) - 1:]
 
                 # Delightful Policy Gradient + Kondo Gate

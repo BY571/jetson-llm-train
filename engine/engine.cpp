@@ -114,11 +114,11 @@ extern "C" {
 
     // Batched kernel launchers
     void launch_embed_batch(half* h, const half* et, const int* tok, int G, int hidden_size, cudaStream_t s);
-    void launch_rms_norm_batch(half* out, const half* in, const half* w, int dim, int G, float eps, cudaStream_t s);
+    void launch_rms_norm_batch(half* out, const half* in, const half* w, int dim, int G, float eps, cudaStream_t s, bool biased = false);
     void launch_copy_batch(half* dst, const half* src, int total, cudaStream_t s);
     void launch_residual_add_batch(half* out, const half* res, int total, cudaStream_t s);
-    void launch_qk_norm_batch(half* q, half* k, const half* qw, const half* kw, int nq, int nkv, int hd, int G, float eps, int q_dim, int kv_dim, cudaStream_t s);
-    void launch_rope_batch(half* q, half* k, const half* ct, const half* st, const int* pos, int msl, int G, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, cudaStream_t s);
+    void launch_qk_norm_batch(half* q, half* k, const half* qw, const half* kw, int nq, int nkv, int hd, int G, float eps, int q_dim, int kv_dim, cudaStream_t s, bool biased = false);
+    void launch_rope_batch(half* q, half* k, const half* ct, const half* st, const int* pos, int msl, int G, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, int rope_dim, cudaStream_t s);
     void launch_kv_cache_write_batch(half* ck, half* cv, const half* k, const half* v, const int* pos, int msl, int G, int kv_dim, cudaStream_t s);
     void launch_gqa_attention_batch(half* out, const half* q, const half* ck, const half* cv, float* as, const int* pos, int msl, int G, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, cudaStream_t s);
     void launch_gqa_prefill_attention(half* out, const half* q, const half* ck, const half* cv, float* as, int T, int msl, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, cudaStream_t s);
@@ -132,6 +132,24 @@ extern "C" {
     void launch_turbo_gqa_attention_batch(half* out, const half* q, const uint8_t* ck_q, const uint8_t* cv_q, const half* k_norms, const half* v_norms, const half* rotation, float* as, const int* pos, int msl, int G, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, int bits, cudaStream_t s);
     void launch_turbo_gqa_attention(const half* q, const uint8_t* ck_q, const uint8_t* cv_q, const half* k_norms, const half* v_norms, const half* rotation, half* output, float* as, int pos, int msl, int num_heads, int num_kv_heads, int head_dim, int bits, cudaStream_t s);
     void launch_turbo_gqa_prefill_attention(half* out, const half* q, const uint8_t* ck_q, const uint8_t* cv_q, const half* k_norms, const half* v_norms, const half* rotation, float* as, int T, int msl, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, int bits, cudaStream_t s);
+
+    // SSM (Gated Delta Rule) kernel launchers
+    void launch_ssm_conv1d_decode(float* output, float* conv_state, const half* input, const half* weight, const half* bias, int conv_dim, int G, int kernel_size, cudaStream_t s);
+    void launch_ssm_compute_dt_decay(float* decay, float* beta, const half* a_in, const half* b_in, const half* A_log, const half* dt_bias, int num_v_heads, int G, cudaStream_t s);
+    void launch_ssm_gated_delta_rule(float* state, float* y_out, const float* q, const float* k, const float* v, const float* decay, const float* beta, int num_v_heads, int num_k_heads, int k_head_dim, int v_head_dim, int G, cudaStream_t s);
+    void launch_ssm_gated_rmsnorm(half* y_out, const float* y_in, const half* z, const half* weight, int num_v_heads, int v_head_dim, int G, float eps, cudaStream_t s);
+    void launch_ssm_gated_rmsnorm_colmajor(half* y_out, const float* y_in, const half* z, const half* weight, int num_v_heads, int v_head_dim, int T, float eps, cudaStream_t s);
+    void launch_ssm_l2norm_qk(float* q, float* k, int num_k_heads, int k_head_dim, int G, cudaStream_t s);
+    void launch_ssm_expand_kv_heads(half* out, const half* in, int num_k_heads, int num_v_heads, int k_head_dim, int G, cudaStream_t s);
+
+    // SSM chunked prefill kernel launchers
+    void launch_ssm_causal_conv1d_prefill(float* output, float* conv_state, const half* input, const half* weight, const half* bias, int conv_dim, int T, int kernel_size, cudaStream_t s);
+    void launch_ssm_compute_g_beta(float* g_out, float* beta_out, const half* a_in, const half* b_in, const half* A_log, const half* dt_bias, int num_v_heads, int T, cudaStream_t s);
+    void launch_ssm_chunk_rearrange(float* Q_out, float* K_out, float* V_out, float* K_beta_out, float* V_beta_out, const float* qkv, const float* beta, int num_heads, int head_dim, int T, int T_padded, int key_dim, int value_dim, int conv_dim, cudaStream_t s);
+    void launch_ssm_chunked_delta_rule(float* state, float* output, const float* Q, const float* K, const float* V, const float* K_beta, const float* V_beta, const float* g, float* workspace, int num_heads, int head_dim, int T, int T_padded, int chunk_idx, int chunk_size, int T_actual, cudaStream_t s);
+    void launch_ssm_chunk_output_rearrange(float* y_out, const float* output, int num_heads, int head_dim, int T, int T_padded, cudaStream_t s);
+
+    void launch_sigmoid_gate_batch(half* data, const half* gate, int dim, int G, cudaStream_t s);
 
     void launch_rms_norm(const half* input, const half* weight, half* output, int dim, float eps, cudaStream_t stream);
     void launch_copy_rms_norm(const half* input, const half* weight, half* residual, half* norm_out, int dim, float eps, cudaStream_t stream);
@@ -189,9 +207,52 @@ ModelConfig ModelConfig::from_json(const std::string& path) {
     if (c.head_dim <= 0 && c.hidden_size > 0 && c.num_heads > 0)
         c.head_dim = c.hidden_size / c.num_heads;
 
+    // Partial rotary: rope_dim = rotary dimensions (default = head_dim)
+    c.rope_dim = get_int("rope_dim");
+    if (c.rope_dim <= 0) c.rope_dim = c.head_dim;
+
+    // Gated attention: q_proj outputs 2x (query + gate), Qwen3.5 style
+    c.gated_attn = (get_int("gated_attn") > 0);
+
+    // Hybrid SSM fields (default 0 = pure transformer)
+    c.ssm_num_k_heads = std::max(0, get_int("ssm_num_k_heads"));
+    c.ssm_num_v_heads = std::max(0, get_int("ssm_num_v_heads"));
+    c.ssm_k_head_dim = std::max(0, get_int("ssm_k_head_dim"));
+    c.ssm_v_head_dim = std::max(0, get_int("ssm_v_head_dim"));
+    c.ssm_conv_kernel = std::max(0, get_int("ssm_conv_kernel"));
+    if (c.ssm_conv_kernel == 0) c.ssm_conv_kernel = 4; // default
+
+    // Parse layer_types array: [0,1,1,0,...] (0=attention, 1=SSM)
+    // Default: all attention
+    for (int i = 0; i < c.num_layers; i++) c.layer_type[i] = LAYER_ATTENTION;
+
+    if (c.ssm_num_v_heads > 0) {
+        // Find "layer_types" array in JSON
+        auto pos = json.find("\"layer_types\"");
+        if (pos != std::string::npos) {
+            auto start = json.find('[', pos);
+            auto end = json.find(']', start);
+            if (start != std::string::npos && end != std::string::npos) {
+                std::string arr = json.substr(start + 1, end - start - 1);
+                std::istringstream ss(arr);
+                std::string tok;
+                int idx = 0;
+                while (std::getline(ss, tok, ',') && idx < c.num_layers) {
+                    int val = std::stoi(tok);
+                    c.layer_type[idx++] = (val == 1) ? LAYER_SSM : LAYER_ATTENTION;
+                }
+            }
+        }
+    }
+
     std::cout << "  Config: " << c.hidden_size << "h, " << c.intermediate_size << "i, "
               << c.num_layers << "L, " << c.num_heads << "Qh, " << c.num_kv_heads << "KVh, "
               << c.head_dim << "hd, " << c.vocab_size << "V" << std::endl;
+    if (c.is_hybrid()) {
+        std::cout << "  Hybrid: " << c.num_attn_layers() << " attn + "
+                  << c.num_ssm_layers() << " SSM layers (k_heads="
+                  << c.ssm_num_k_heads << ", v_heads=" << c.ssm_num_v_heads << ")" << std::endl;
+    }
     return c;
 }
 
@@ -216,6 +277,7 @@ ModelConfig ModelConfig::from_json(const std::string& path) {
 #define HEAD_DIM config_.head_dim
 #define VOCAB_SIZE config_.vocab_size
 #define Q_DIM config_.q_dim()
+#define Q_PROJ_DIM config_.q_proj_dim()
 #define KV_DIM config_.kv_dim()
 #define RMS_NORM_EPS config_.rms_norm_eps
 #define ROPE_THETA config_.rope_theta
@@ -275,8 +337,8 @@ void InferenceEngine::allocate_buffers() {
     cudaMallocChecked(&state_.attn_scores, NUM_HEADS * max_seq_len * sizeof(float));
 
     // Allocate and precompute RoPE tables
-    cudaMallocChecked(&state_.rope_cos, max_seq_len * (HEAD_DIM / 2) * sizeof(half));
-    cudaMallocChecked(&state_.rope_sin, max_seq_len * (HEAD_DIM / 2) * sizeof(half));
+    cudaMallocChecked(&state_.rope_cos, max_seq_len * (config_.rope_dim / 2) * sizeof(half));
+    cudaMallocChecked(&state_.rope_sin, max_seq_len * (config_.rope_dim / 2) * sizeof(half));
     precompute_rope();
 
     // GPU-side sampling
@@ -389,23 +451,25 @@ InferenceEngine::~InferenceEngine() {
 // ============================================================================
 
 void InferenceEngine::precompute_rope() {
-    int half_dim = HEAD_DIM / 2;
-    std::vector<half> cos_h(state_.max_seq_len * half_dim);
-    std::vector<half> sin_h(state_.max_seq_len * half_dim);
+    // Partial RoPE: only rope_dim dimensions get rotary encoding
+    int rope_dim = config_.rope_dim;  // e.g., 64 for Qwen3.5 (25% of head_dim=256)
+    int half_rope = rope_dim / 2;
+    std::vector<half> cos_h(state_.max_seq_len * half_rope);
+    std::vector<half> sin_h(state_.max_seq_len * half_rope);
 
     for (int pos = 0; pos < state_.max_seq_len; pos++) {
-        for (int d = 0; d < half_dim; d++) {
-            float freq = 1.0f / powf(ROPE_THETA, (float)(2 * d) / HEAD_DIM);
+        for (int d = 0; d < half_rope; d++) {
+            float freq = 1.0f / powf(ROPE_THETA, (float)(2 * d) / rope_dim);
             float angle = pos * freq;
-            cos_h[pos * half_dim + d] = __float2half(cosf(angle));
-            sin_h[pos * half_dim + d] = __float2half(sinf(angle));
+            cos_h[pos * half_rope + d] = __float2half(cosf(angle));
+            sin_h[pos * half_rope + d] = __float2half(sinf(angle));
         }
     }
 
     cudaMemcpy(state_.rope_cos, cos_h.data(),
-               state_.max_seq_len * half_dim * sizeof(half), cudaMemcpyHostToDevice);
+               state_.max_seq_len * half_rope * sizeof(half), cudaMemcpyHostToDevice);
     cudaMemcpy(state_.rope_sin, sin_h.data(),
-               state_.max_seq_len * half_dim * sizeof(half), cudaMemcpyHostToDevice);
+               state_.max_seq_len * half_rope * sizeof(half), cudaMemcpyHostToDevice);
 }
 
 // ============================================================================
@@ -424,14 +488,24 @@ void InferenceEngine::share_embedding(void* external_embed_ptr) {
 void InferenceEngine::reset() {
     state_.current_pos = 0;
     for (int i = 0; i < NUM_LAYERS; i++) {
+        if (config_.layer_type[i] == LAYER_SSM) {
+            // SSM layers don't use KV cache — their state is in batch_->ssm_state
+            continue;
+        }
         if (kv_bits_ == 0) {
-            cudaMemset(state_.kv_cache[i].key, 0, state_.max_seq_len * KV_DIM * sizeof(half));
-            cudaMemset(state_.kv_cache[i].value, 0, state_.max_seq_len * KV_DIM * sizeof(half));
+            if (state_.kv_cache[i].key)
+                cudaMemset(state_.kv_cache[i].key, 0, state_.max_seq_len * KV_DIM * sizeof(half));
+            if (state_.kv_cache[i].value)
+                cudaMemset(state_.kv_cache[i].value, 0, state_.max_seq_len * KV_DIM * sizeof(half));
         } else {
-            cudaMemset(state_.kv_cache[i].key_quant, 0, state_.max_seq_len * (KV_DIM_PACKED));
-            cudaMemset(state_.kv_cache[i].value_quant, 0, state_.max_seq_len * (KV_DIM_PACKED));
-            cudaMemset(state_.kv_cache[i].key_norms, 0, state_.max_seq_len * NUM_KV_HEADS * sizeof(half));
-            cudaMemset(state_.kv_cache[i].value_norms, 0, state_.max_seq_len * NUM_KV_HEADS * sizeof(half));
+            if (state_.kv_cache[i].key_quant)
+                cudaMemset(state_.kv_cache[i].key_quant, 0, state_.max_seq_len * (KV_DIM_PACKED));
+            if (state_.kv_cache[i].value_quant)
+                cudaMemset(state_.kv_cache[i].value_quant, 0, state_.max_seq_len * (KV_DIM_PACKED));
+            if (state_.kv_cache[i].key_norms)
+                cudaMemset(state_.kv_cache[i].key_norms, 0, state_.max_seq_len * NUM_KV_HEADS * sizeof(half));
+            if (state_.kv_cache[i].value_norms)
+                cudaMemset(state_.kv_cache[i].value_norms, 0, state_.max_seq_len * NUM_KV_HEADS * sizeof(half));
         }
     }
 }
@@ -865,7 +939,7 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     add(HIDDEN_SIZE * N * sizeof(half));          // hidden
     add(HIDDEN_SIZE * N * sizeof(half));          // residual
     add(HIDDEN_SIZE * N * sizeof(half));          // norm_buf
-    add(Q_DIM * N * sizeof(half));                // q_buf
+    add(Q_PROJ_DIM * N * sizeof(half));            // q_buf (2x for gated attn)
     add(KV_DIM * N * sizeof(half));               // k_buf
     add(KV_DIM * N * sizeof(half));               // v_buf
     add(Q_DIM * N * sizeof(half));                // attn_out
@@ -876,7 +950,13 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     if (!weights_cached_)
         add((size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half)); // dequant_scratch
     for (int i = 0; i < NUM_LAYERS; i++) {
-        if (kv_bits_ == 0) {
+        if (config_.layer_type[i] == LAYER_SSM) {
+            // SSM state: (G, num_v_heads, k_head_dim, v_head_dim) per layer — fp32
+            add((size_t)G * config_.ssm_num_v_heads * config_.ssm_k_head_dim
+                * config_.ssm_v_head_dim * sizeof(float));
+            // Conv state: (G, conv_dim, conv_kernel-1)
+            add((size_t)G * config_.ssm_conv_dim() * (config_.ssm_conv_kernel - 1) * sizeof(float));
+        } else if (kv_bits_ == 0) {
             add((size_t)G * max_seq_len * KV_DIM * sizeof(half));  // kv_keys
             add((size_t)G * max_seq_len * KV_DIM * sizeof(half));  // kv_values
         } else {
@@ -885,6 +965,35 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
             add((size_t)G * max_seq_len * NUM_KV_HEADS * sizeof(half)); // kv_keys_norms
             add((size_t)G * max_seq_len * NUM_KV_HEADS * sizeof(half)); // kv_values_norms
         }
+    }
+    // SSM scratch buffers (shared across layers, sized for largest)
+    if (config_.is_hybrid()) {
+        int cd = config_.ssm_conv_dim();
+        int vd = config_.ssm_value_dim();
+        int nv = config_.ssm_num_v_heads;
+        add((size_t)cd * N * sizeof(half));              // ssm_qkv_buf (fp16 GEMM output)
+        add((size_t)cd * N * sizeof(float));             // ssm_qkv_fp32 (conv1d output)
+        add((size_t)vd * N * sizeof(half));              // ssm_z_buf
+        add((size_t)vd * N * sizeof(float));             // ssm_y_fp32 (delta rule output)
+        add((size_t)vd * N * sizeof(half));              // ssm_y_buf (after rmsnorm, for GEMM)
+        add((size_t)2 * nv * N * sizeof(float));         // ssm_dt_buf (decay + beta) — N not G for prefill
+        add((size_t)nv * N * sizeof(half));              // ssm_a_buf
+        add((size_t)nv * N * sizeof(half));              // ssm_b_buf
+
+        // Chunked prefill workspace
+        int hd = config_.ssm_k_head_dim;
+        int cs = 64;  // chunk size
+        int T_padded = ((N + cs - 1) / cs) * cs;
+        add((size_t)nv * T_padded * hd * sizeof(float));  // ssm_chunk_Q
+        add((size_t)nv * T_padded * hd * sizeof(float));  // ssm_chunk_K
+        add((size_t)nv * T_padded * hd * sizeof(float));  // ssm_chunk_V
+        add((size_t)nv * T_padded * hd * sizeof(float));  // ssm_chunk_K_beta
+        add((size_t)nv * T_padded * hd * sizeof(float));  // ssm_chunk_V_beta
+        add((size_t)nv * N * sizeof(float));               // ssm_chunk_g
+        add((size_t)nv * N * sizeof(float));               // ssm_chunk_beta
+        add((size_t)nv * T_padded * hd * sizeof(float));  // ssm_chunk_output
+        int ws_per_head = cs * cs + 3 * cs * hd + cs;
+        add((size_t)nv * ws_per_head * sizeof(float));     // ssm_chunk_workspace
     }
     add(N * sizeof(int));   // d_positions (max(G, T))
     add(N * sizeof(int));   // d_tokens (max(G, T))
@@ -917,7 +1026,7 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     batch_->hidden    = (half*)batch_arena_.alloc(HIDDEN_SIZE * N * sizeof(half));
     batch_->residual  = (half*)batch_arena_.alloc(HIDDEN_SIZE * N * sizeof(half));
     batch_->norm_buf  = (half*)batch_arena_.alloc(HIDDEN_SIZE * N * sizeof(half));
-    batch_->q_buf     = (half*)batch_arena_.alloc(Q_DIM * N * sizeof(half));
+    batch_->q_buf     = (half*)batch_arena_.alloc(Q_PROJ_DIM * N * sizeof(half));
     batch_->k_buf     = (half*)batch_arena_.alloc(KV_DIM * N * sizeof(half));
     batch_->v_buf     = (half*)batch_arena_.alloc(KV_DIM * N * sizeof(half));
     batch_->attn_out  = (half*)batch_arena_.alloc(Q_DIM * N * sizeof(half));
@@ -931,22 +1040,67 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
         batch_->dequant_scratch = nullptr;
     }
     for (int i = 0; i < NUM_LAYERS; i++) {
-        if (kv_bits_ == 0) {
+        // Initialize all pointers to null
+        batch_->kv_keys[i] = batch_->kv_values[i] = nullptr;
+        batch_->kv_keys_q[i] = batch_->kv_values_q[i] = nullptr;
+        batch_->kv_keys_norms[i] = batch_->kv_values_norms[i] = nullptr;
+        batch_->ssm_state[i] = nullptr;
+        batch_->ssm_conv_state[i] = nullptr;
+
+        if (config_.layer_type[i] == LAYER_SSM) {
+            batch_->ssm_state[i] = (float*)batch_arena_.alloc(
+                (size_t)G * config_.ssm_num_v_heads * config_.ssm_k_head_dim
+                * config_.ssm_v_head_dim * sizeof(float));
+            batch_->ssm_conv_state[i] = (float*)batch_arena_.alloc(
+                (size_t)G * config_.ssm_conv_dim() * (config_.ssm_conv_kernel - 1) * sizeof(float));
+        } else if (kv_bits_ == 0) {
             batch_->kv_keys[i]   = (half*)batch_arena_.alloc((size_t)G * max_seq_len * KV_DIM * sizeof(half));
             batch_->kv_values[i] = (half*)batch_arena_.alloc((size_t)G * max_seq_len * KV_DIM * sizeof(half));
-            batch_->kv_keys_q[i] = nullptr;
-            batch_->kv_values_q[i] = nullptr;
-            batch_->kv_keys_norms[i] = nullptr;
-            batch_->kv_values_norms[i] = nullptr;
         } else {
-            batch_->kv_keys[i] = nullptr;
-            batch_->kv_values[i] = nullptr;
             batch_->kv_keys_q[i]   = (uint8_t*)batch_arena_.alloc((size_t)G * max_seq_len * (KV_DIM_PACKED));
             batch_->kv_values_q[i] = (uint8_t*)batch_arena_.alloc((size_t)G * max_seq_len * (KV_DIM_PACKED));
             batch_->kv_keys_norms[i]   = (half*)batch_arena_.alloc((size_t)G * max_seq_len * NUM_KV_HEADS * sizeof(half));
             batch_->kv_values_norms[i] = (half*)batch_arena_.alloc((size_t)G * max_seq_len * NUM_KV_HEADS * sizeof(half));
         }
     }
+    // SSM scratch buffers (shared across all SSM layers)
+    if (config_.is_hybrid()) {
+        int cd = config_.ssm_conv_dim();
+        int vd = config_.ssm_value_dim();
+        int nv = config_.ssm_num_v_heads;
+        batch_->ssm_qkv_buf = (half*)batch_arena_.alloc((size_t)cd * N * sizeof(half));
+        batch_->ssm_qkv_fp32 = (float*)batch_arena_.alloc((size_t)cd * N * sizeof(float));
+        batch_->ssm_z_buf   = (half*)batch_arena_.alloc((size_t)vd * N * sizeof(half));
+        batch_->ssm_y_fp32  = (float*)batch_arena_.alloc((size_t)vd * N * sizeof(float));
+        batch_->ssm_y_buf   = (half*)batch_arena_.alloc((size_t)vd * N * sizeof(half));
+        batch_->ssm_dt_buf  = (float*)batch_arena_.alloc((size_t)2 * nv * N * sizeof(float)); // decay + beta — N for prefill
+        batch_->ssm_a_buf   = (half*)batch_arena_.alloc((size_t)nv * N * sizeof(half));
+        batch_->ssm_b_buf   = (half*)batch_arena_.alloc((size_t)nv * N * sizeof(half));
+
+        // Chunked prefill workspace
+        int hd = config_.ssm_k_head_dim;
+        int cs = 64;
+        int T_padded = ((N + cs - 1) / cs) * cs;
+        batch_->ssm_chunk_Q       = (float*)batch_arena_.alloc((size_t)nv * T_padded * hd * sizeof(float));
+        batch_->ssm_chunk_K       = (float*)batch_arena_.alloc((size_t)nv * T_padded * hd * sizeof(float));
+        batch_->ssm_chunk_V       = (float*)batch_arena_.alloc((size_t)nv * T_padded * hd * sizeof(float));
+        batch_->ssm_chunk_K_beta  = (float*)batch_arena_.alloc((size_t)nv * T_padded * hd * sizeof(float));
+        batch_->ssm_chunk_V_beta  = (float*)batch_arena_.alloc((size_t)nv * T_padded * hd * sizeof(float));
+        batch_->ssm_chunk_g       = (float*)batch_arena_.alloc((size_t)nv * N * sizeof(float));
+        batch_->ssm_chunk_beta    = (float*)batch_arena_.alloc((size_t)nv * N * sizeof(float));
+        batch_->ssm_chunk_output  = (float*)batch_arena_.alloc((size_t)nv * T_padded * hd * sizeof(float));
+        int ws_per_head = cs * cs + 3 * cs * hd + cs;
+        batch_->ssm_chunk_workspace = (float*)batch_arena_.alloc((size_t)nv * ws_per_head * sizeof(float));
+    } else {
+        batch_->ssm_qkv_buf = batch_->ssm_z_buf = batch_->ssm_y_buf = nullptr;
+        batch_->ssm_dt_buf = nullptr;
+        batch_->ssm_a_buf = batch_->ssm_b_buf = nullptr;
+        batch_->ssm_chunk_Q = batch_->ssm_chunk_K = batch_->ssm_chunk_V = nullptr;
+        batch_->ssm_chunk_K_beta = batch_->ssm_chunk_V_beta = nullptr;
+        batch_->ssm_chunk_g = batch_->ssm_chunk_beta = nullptr;
+        batch_->ssm_chunk_output = batch_->ssm_chunk_workspace = nullptr;
+    }
+
     batch_->d_positions  = (int*)batch_arena_.alloc(N * sizeof(int));
     batch_->d_tokens     = (int*)batch_arena_.alloc(N * sizeof(int));
     batch_->d_randoms    = (float*)batch_arena_.alloc(G * sizeof(float));
@@ -964,17 +1118,21 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
 
 void InferenceEngine::batch_gemm(half* out, const half* weight, const half* in,
                                   int M, int N, int K, cudaStream_t stream) {
-    ensure_cublas();
+    ensure_cublas(stream);
     // weight is (M, K) row-major = (K, M) col-major for cuBLAS
     // in is (K, N) col-major, out is (M, N) col-major
     // Use fp32 accumulation for precision (fp16 loses accuracy for K=1024+)
     float alpha = 1.0f, beta = 0.0f;
-    cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+    cublasStatus_t stat = cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
                  M, N, K, &alpha,
                  weight, CUDA_R_16F, K,
                  in, CUDA_R_16F, K,
                  &beta, out, CUDA_R_16F, M,
                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[batch_gemm] cuBLAS error %d: M=%d N=%d K=%d weight=%p in=%p out=%p stream=%p\n",
+                (int)stat, M, N, K, (void*)weight, (void*)in, (void*)out, (void*)stream);
+    }
 }
 
 void InferenceEngine::cache_weights() {
@@ -989,10 +1147,16 @@ void InferenceEngine::cache_weights() {
     };
     for (int i = 0; i < NUM_LAYERS; i++) {
         auto& L = weights_.layers[i];
+        // Attention projections
         cache_one(L.q_proj_nf4); cache_one(L.k_proj_nf4);
         cache_one(L.v_proj_nf4); cache_one(L.o_proj_nf4);
+        // MLP projections
         cache_one(L.gate_proj_nf4); cache_one(L.up_proj_nf4);
         cache_one(L.down_proj_nf4);
+        // SSM projections (hybrid models)
+        cache_one(L.ssm_in_proj_qkv_nf4);
+        cache_one(L.ssm_in_proj_z_nf4);
+        cache_one(L.ssm_out_proj_nf4);
     }
     cudaDeviceSynchronize();
     weights_cached_ = true;
@@ -1026,7 +1190,245 @@ void InferenceEngine::batch_gemm_q4l(half* out, const NF4Weight& w, const half* 
     }
 }
 
+// ============================================================================
+// SSM (Gated Delta Rule) batch forward — one decode step for G sequences
+// ============================================================================
+void InferenceEngine::forward_layer_ssm_batch(int layer_idx, int G, cudaStream_t stream) {
+    auto& L = weights_.layers[layer_idx];
+    auto* B = batch_;
+    ensure_cublas(stream);
+
+    int SSM_CONV_DIM = config_.ssm_conv_dim();
+    int SSM_KEY_DIM = config_.ssm_key_dim();
+    int SSM_VALUE_DIM = config_.ssm_value_dim();
+    int SSM_NUM_K_HEADS = config_.ssm_num_k_heads;
+    int SSM_NUM_V_HEADS = config_.ssm_num_v_heads;
+    int SSM_K_HEAD_DIM = config_.ssm_k_head_dim;
+    int SSM_V_HEAD_DIM = config_.ssm_v_head_dim;
+
+    auto project = [&](half* out, half* fp16w, NF4Weight& nf4w, const half* input,
+                       int out_dim, int in_dim) {
+        if (fp16w) batch_gemm(out, fp16w, input, out_dim, G, in_dim, stream);
+        else batch_gemm_q4l(out, nf4w, input, G, stream);
+    };
+
+    // Debug: sync + check after each step to find crash
+    #define SSM_CHECK(msg) do { \
+        cudaStreamSynchronize(stream); \
+        auto _e = cudaGetLastError(); \
+        if (_e != cudaSuccess) { \
+            fprintf(stderr, "[SSM L%d] CUDA error at %s: %s\n", layer_idx, msg, cudaGetErrorString(_e)); \
+            return; \
+        } \
+    } while(0)
+
+    // 1. RMSNorm
+    launch_copy_batch(B->residual, B->hidden, HIDDEN_SIZE * G, stream);
+    SSM_CHECK("copy");
+    launch_rms_norm_batch(B->norm_buf, B->residual, L.input_layernorm,
+                          HIDDEN_SIZE, G, RMS_NORM_EPS, stream, config_.is_hybrid());
+    SSM_CHECK("rmsnorm");
+
+    // 2. Projections: QKV, Z, A, B
+    project(B->ssm_qkv_buf, L.ssm_in_proj_qkv_fp16, L.ssm_in_proj_qkv_nf4,
+            B->norm_buf, SSM_CONV_DIM, HIDDEN_SIZE);
+    SSM_CHECK("qkv_proj");
+    project(B->ssm_z_buf, L.ssm_in_proj_z_fp16, L.ssm_in_proj_z_nf4,
+            B->norm_buf, SSM_VALUE_DIM, HIDDEN_SIZE);
+    SSM_CHECK("z_proj");
+    // Small projections: always fp16 GEMV
+    batch_gemm(B->ssm_a_buf, L.ssm_in_proj_a_fp16, B->norm_buf,
+               SSM_NUM_V_HEADS, G, HIDDEN_SIZE, stream);
+    SSM_CHECK("a_proj");
+    batch_gemm(B->ssm_b_buf, L.ssm_in_proj_b_fp16, B->norm_buf,
+               SSM_NUM_V_HEADS, G, HIDDEN_SIZE, stream);
+    SSM_CHECK("b_proj");
+
+
+    // 3. Causal conv1d on QKV: reads fp16 input, outputs fp32
+    launch_ssm_conv1d_decode(B->ssm_qkv_fp32, B->ssm_conv_state[layer_idx],
+                              B->ssm_qkv_buf,  // fp16 input from GEMM
+                              L.ssm_conv1d_weight, L.ssm_conv1d_bias,
+                              SSM_CONV_DIM, G, config_.ssm_conv_kernel, stream);
+    SSM_CHECK("conv1d");
+
+    // 4. Compute dt (decay) and beta from A, B inputs
+    float* ssm_decay = B->ssm_dt_buf;
+    float* ssm_beta = B->ssm_dt_buf + SSM_NUM_V_HEADS * G;
+    launch_ssm_compute_dt_decay(ssm_decay, ssm_beta,
+                                 B->ssm_a_buf, B->ssm_b_buf,
+                                 L.ssm_A_log, L.ssm_dt_bias,
+                                 SSM_NUM_V_HEADS, G, stream);
+    SSM_CHECK("dt_decay");
+
+    // 5. Split QKV into Q, K, V (fp32 pointers into ssm_qkv_fp32)
+    float* ssm_q = B->ssm_qkv_fp32;                           // (key_dim, G)
+    float* ssm_k = B->ssm_qkv_fp32 + SSM_KEY_DIM * G;         // (key_dim, G)
+    float* ssm_v = B->ssm_qkv_fp32 + 2 * SSM_KEY_DIM * G;     // (value_dim, G)
+
+    // 6. L2-normalize Q and K per head (fp32)
+    launch_ssm_l2norm_qk(ssm_q, ssm_k, SSM_NUM_K_HEADS, SSM_K_HEAD_DIM, G, stream);
+
+    // 7. Expand K heads to match V heads if needed (GQA-like)
+    // Q and K have num_k_heads, but SSM state has num_v_heads.
+    // The kernel handles this internally via kv_ratio = num_v_heads / num_k_heads.
+
+    SSM_CHECK("l2norm");
+
+
+    // 8. Gated Delta Rule: state update + output (fp32 for precision)
+    launch_ssm_gated_delta_rule(B->ssm_state[layer_idx], B->ssm_y_fp32,
+                                 ssm_q, ssm_k, ssm_v,
+                                 ssm_decay, ssm_beta,
+                                 SSM_NUM_V_HEADS, SSM_NUM_K_HEADS,
+                                 SSM_K_HEAD_DIM, SSM_V_HEAD_DIM, G, stream);
+    SSM_CHECK("gated_delta_rule");
+
+    // 9. Gated RMSNorm: y_buf = RMSNorm(y_fp32) * SiLU(z) → fp16
+    launch_ssm_gated_rmsnorm(B->ssm_y_buf, B->ssm_y_fp32, B->ssm_z_buf, L.ssm_norm_weight,
+                              SSM_NUM_V_HEADS, SSM_V_HEAD_DIM, G, RMS_NORM_EPS, stream);
+    SSM_CHECK("gated_rmsnorm");
+
+
+    // 10. Output projection: hidden = out_proj @ y_buf
+    project(B->hidden, L.ssm_out_proj_fp16, L.ssm_out_proj_nf4,
+            B->ssm_y_buf, HIDDEN_SIZE, SSM_VALUE_DIM);
+    SSM_CHECK("out_proj");
+
+    // 11. Residual add
+    launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * G, stream);
+
+    // 12. Post-SSM LayerNorm + MLP (same as attention layers)
+    launch_copy_batch(B->residual, B->hidden, HIDDEN_SIZE * G, stream);
+    launch_rms_norm_batch(B->norm_buf, B->residual, L.post_attn_layernorm,
+                          HIDDEN_SIZE, G, RMS_NORM_EPS, stream, config_.is_hybrid());
+
+    project(B->gate_buf, L.gate_proj_fp16, L.gate_proj_nf4,
+            B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+    project(B->up_buf, L.up_proj_fp16, L.up_proj_nf4,
+            B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+    launch_silu_mul_batch(B->gate_buf, B->up_buf, INTERMEDIATE_SIZE * G, stream);
+    project(B->hidden, L.down_proj_fp16, L.down_proj_nf4,
+            B->gate_buf, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+
+    launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * G, stream);
+}
+
+// ============================================================================
+// Chunked SSM prefill: process all T tokens through one SSM layer using
+// the parallel (chunked) Gated Delta Rule formulation.
+// This avoids sequential error accumulation from token-by-token recurrence.
+// ============================================================================
+void InferenceEngine::forward_layer_ssm_prefill(int layer_idx, int T, cudaStream_t stream) {
+    auto& L = weights_.layers[layer_idx];
+    auto* B = batch_;
+    ensure_cublas(stream);
+
+    int SSM_CONV_DIM = config_.ssm_conv_dim();
+    int SSM_KEY_DIM = config_.ssm_key_dim();
+    int SSM_VALUE_DIM = config_.ssm_value_dim();
+    int SSM_NUM_HEADS = config_.ssm_num_v_heads;  // 16
+    int SSM_HEAD_DIM = config_.ssm_k_head_dim;     // 128
+
+    int CHUNK_SIZE = 64;
+    int T_padded = ((T + CHUNK_SIZE - 1) / CHUNK_SIZE) * CHUNK_SIZE;
+    int num_chunks = T_padded / CHUNK_SIZE;
+
+    auto project = [&](half* out, half* fp16w, NF4Weight& nf4w, const half* input,
+                       int out_dim, int in_dim) {
+        if (fp16w) batch_gemm(out, fp16w, input, out_dim, T, in_dim, stream);
+        else batch_gemm_q4l(out, nf4w, input, T, stream);
+    };
+
+    // 1. RMSNorm (all T tokens)
+    launch_copy_batch(B->residual, B->hidden, HIDDEN_SIZE * T, stream);
+    launch_rms_norm_batch(B->norm_buf, B->residual, L.input_layernorm,
+                          HIDDEN_SIZE, T, RMS_NORM_EPS, stream, config_.is_hybrid());
+
+    // 2. Projections: QKV, Z, A, B (all T tokens at once via batched GEMM)
+    project(B->ssm_qkv_buf, L.ssm_in_proj_qkv_fp16, L.ssm_in_proj_qkv_nf4,
+            B->norm_buf, SSM_CONV_DIM, HIDDEN_SIZE);
+    project(B->ssm_z_buf, L.ssm_in_proj_z_fp16, L.ssm_in_proj_z_nf4,
+            B->norm_buf, SSM_VALUE_DIM, HIDDEN_SIZE);
+    batch_gemm(B->ssm_a_buf, L.ssm_in_proj_a_fp16, B->norm_buf,
+               SSM_NUM_HEADS, T, HIDDEN_SIZE, stream);
+    batch_gemm(B->ssm_b_buf, L.ssm_in_proj_b_fp16, B->norm_buf,
+               SSM_NUM_HEADS, T, HIDDEN_SIZE, stream);
+
+    // 3. Causal conv1d for all T tokens (parallel prefill kernel)
+    // Outputs fp32 QKV, also sets conv_state for future decode
+    launch_ssm_causal_conv1d_prefill(B->ssm_qkv_fp32, B->ssm_conv_state[layer_idx],
+                                      B->ssm_qkv_buf, L.ssm_conv1d_weight, L.ssm_conv1d_bias,
+                                      SSM_CONV_DIM, T, config_.ssm_conv_kernel, stream);
+
+    // 4. Compute raw gate g and beta for all T tokens
+    launch_ssm_compute_g_beta(B->ssm_chunk_g, B->ssm_chunk_beta,
+                               B->ssm_a_buf, B->ssm_b_buf,
+                               L.ssm_A_log, L.ssm_dt_bias,
+                               SSM_NUM_HEADS, T, stream);
+
+    // 5. Rearrange QKV from (dim, T) to (H, T_padded, D), L2-normalize Q/K,
+    //    scale Q by 1/sqrt(D), compute K*beta and V*beta
+    launch_ssm_chunk_rearrange(B->ssm_chunk_Q, B->ssm_chunk_K, B->ssm_chunk_V,
+                                B->ssm_chunk_K_beta, B->ssm_chunk_V_beta,
+                                B->ssm_qkv_fp32, B->ssm_chunk_beta,
+                                SSM_NUM_HEADS, SSM_HEAD_DIM, T, T_padded,
+                                SSM_KEY_DIM, SSM_VALUE_DIM, SSM_CONV_DIM, stream);
+
+    // 6. Zero the recurrent state for seq 0 before prefill
+    size_t state_size = (size_t)SSM_NUM_HEADS * SSM_HEAD_DIM * SSM_HEAD_DIM * sizeof(float);
+    cudaMemsetAsync(B->ssm_state[layer_idx], 0, state_size, stream);
+
+    // 7. Process chunks sequentially through the chunked delta rule
+    for (int c = 0; c < num_chunks; c++) {
+        launch_ssm_chunked_delta_rule(
+            B->ssm_state[layer_idx], B->ssm_chunk_output,
+            B->ssm_chunk_Q, B->ssm_chunk_K, B->ssm_chunk_V,
+            B->ssm_chunk_K_beta, B->ssm_chunk_V_beta,
+            B->ssm_chunk_g, B->ssm_chunk_workspace,
+            SSM_NUM_HEADS, SSM_HEAD_DIM, T, T_padded,
+            c, CHUNK_SIZE, T, stream);
+    }
+
+    // 8. Rearrange output from (H, T_padded, D) back to (value_dim, T) col-major
+    launch_ssm_chunk_output_rearrange(B->ssm_y_fp32, B->ssm_chunk_output,
+                                       SSM_NUM_HEADS, SSM_HEAD_DIM, T, T_padded, stream);
+
+    // 9. Gated RMSNorm (col-major): y = RMSNorm(y) * SiLU(z) → fp16
+    // y_fp32 and z_buf are col-major from rearrange kernel / GEMM output
+    launch_ssm_gated_rmsnorm_colmajor(B->ssm_y_buf, B->ssm_y_fp32, B->ssm_z_buf, L.ssm_norm_weight,
+                                       SSM_NUM_HEADS, SSM_HEAD_DIM, T, RMS_NORM_EPS, stream);
+
+    // 10. Output projection
+    project(B->hidden, L.ssm_out_proj_fp16, L.ssm_out_proj_nf4,
+            B->ssm_y_buf, HIDDEN_SIZE, SSM_VALUE_DIM);
+
+    // 11. Residual add
+    launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * T, stream);
+
+    // 12. Post-SSM LayerNorm + MLP
+    launch_copy_batch(B->residual, B->hidden, HIDDEN_SIZE * T, stream);
+    launch_rms_norm_batch(B->norm_buf, B->residual, L.post_attn_layernorm,
+                          HIDDEN_SIZE, T, RMS_NORM_EPS, stream, config_.is_hybrid());
+
+    project(B->gate_buf, L.gate_proj_fp16, L.gate_proj_nf4,
+            B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+    project(B->up_buf, L.up_proj_fp16, L.up_proj_nf4,
+            B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+    launch_silu_mul_batch(B->gate_buf, B->up_buf, INTERMEDIATE_SIZE * T, stream);
+    project(B->hidden, L.down_proj_fp16, L.down_proj_nf4,
+            B->gate_buf, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+
+    launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * T, stream);
+}
+
 void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t stream) {
+    // Dispatch SSM layers to separate forward path
+    if (config_.layer_type[layer_idx] == LAYER_SSM) {
+        forward_layer_ssm_batch(layer_idx, G, stream);
+        return;
+    }
+
     auto& L = weights_.layers[layer_idx];
     auto* B = batch_;
 
@@ -1061,20 +1463,26 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
     // 1. Copy hidden -> residual, RMSNorm -> norm_buf
     launch_copy_batch(B->residual, B->hidden, HIDDEN_SIZE * G, stream);
     launch_rms_norm_batch(B->norm_buf, B->residual, L.input_layernorm,
-                          HIDDEN_SIZE, G, RMS_NORM_EPS, stream);
+                          HIDDEN_SIZE, G, RMS_NORM_EPS, stream, config_.is_hybrid());
 
     // 2. QKV projections
-    project(B->q_buf, L.q_proj_fp16, L.q_proj_nf4, B->norm_buf, Q_DIM, HIDDEN_SIZE, L.lora_q);
+    // For gated attention: q_buf holds [query | gate], each Q_DIM wide
+    project(B->q_buf, L.q_proj_fp16, L.q_proj_nf4, B->norm_buf, Q_PROJ_DIM, HIDDEN_SIZE, L.lora_q);
     project(B->k_buf, L.k_proj_fp16, L.k_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE, L.lora_k);
     project(B->v_buf, L.v_proj_fp16, L.v_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE, L.lora_v);
 
-    // 3. QKNorm + RoPE
+    // For gated attention: split q_buf into query (first half) and gate (second half)
+    // In col-major (Q_PROJ_DIM, G): query is rows [0, Q_DIM), gate is rows [Q_DIM, Q_PROJ_DIM)
+    // The QK norm and RoPE only operate on the query part (first Q_DIM rows)
+    // Gate stays in q_buf starting at offset Q_DIM (col-major: rows Q_DIM..Q_PROJ_DIM-1)
+
+    // 3. QKNorm + RoPE (on query portion only)
     launch_qk_norm_batch(B->q_buf, B->k_buf, L.q_norm, L.k_norm,
                          NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, G, RMS_NORM_EPS,
-                         Q_DIM, KV_DIM, stream);
+                         Q_PROJ_DIM, KV_DIM, stream, config_.is_hybrid());
     launch_rope_batch(B->q_buf, B->k_buf, state_.rope_cos, state_.rope_sin,
                       B->d_positions, B->max_seq_len, G,
-                      NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, stream);
+                      NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_PROJ_DIM, KV_DIM, config_.rope_dim, stream);
 
     // 4. KV cache write
     if (kv_bits_ == 0) {
@@ -1105,16 +1513,22 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
                                           NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, kv_bits_, stream);
     }
 
-    // 6. Output projection
+    // 6. Gated attention: attn_out *= sigmoid(gate)
+    // Gate is in q_buf rows [Q_DIM..Q_PROJ_DIM), col-major layout
+    if (config_.gated_attn) {
+        launch_sigmoid_gate_batch(B->attn_out, B->q_buf + Q_DIM, Q_DIM, G, stream);
+    }
+
+    // 7. Output projection
     project(B->hidden, L.o_proj_fp16, L.o_proj_nf4, B->attn_out, HIDDEN_SIZE, Q_DIM, L.lora_o);
 
-    // 7. Residual add
+    // 8. Residual add
     launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * G, stream);
 
-    // 8. Post-attention norm
+    // 9. Post-attention norm
     launch_copy_batch(B->residual, B->hidden, HIDDEN_SIZE * G, stream);
     launch_rms_norm_batch(B->norm_buf, B->residual, L.post_attn_layernorm,
-                          HIDDEN_SIZE, G, RMS_NORM_EPS, stream);
+                          HIDDEN_SIZE, G, RMS_NORM_EPS, stream, config_.is_hybrid());
 
     // 9. FFN
     project(B->gate_buf, L.gate_proj_fp16, L.gate_proj_nf4, B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, L.lora_gate);
@@ -1138,7 +1552,7 @@ void InferenceEngine::decode_batch(int G, cudaStream_t stream) {
 
     // Final norm
     launch_rms_norm_batch(B->norm_buf, B->hidden, weights_.final_layernorm,
-                          HIDDEN_SIZE, G, RMS_NORM_EPS, stream);
+                          HIDDEN_SIZE, G, RMS_NORM_EPS, stream, config_.is_hybrid());
 
     // LM head: (VOCAB_SIZE, HIDDEN_SIZE) @ (HIDDEN_SIZE, G) -> (VOCAB_SIZE, G) in fp32
     {
@@ -1169,10 +1583,16 @@ void InferenceEngine::prefill_chunked(int T, int G, cudaStream_t stream) {
     for (int layer = 0; layer < NUM_LAYERS; layer++) {
         auto& L = weights_.layers[layer];
 
+        // SSM layers: use chunked parallel delta rule (avoids sequential error accumulation)
+        if (config_.layer_type[layer] == LAYER_SSM) {
+            forward_layer_ssm_prefill(layer, T, stream);
+            continue;  // skip the attention/MLP code below
+        }
+
         // 1. Copy + RMSNorm (treat T as batch dim)
         launch_copy_batch(B->residual, B->hidden, HIDDEN_SIZE * T, stream);
         launch_rms_norm_batch(B->norm_buf, B->residual, L.input_layernorm,
-                              HIDDEN_SIZE, T, RMS_NORM_EPS, stream);
+                              HIDDEN_SIZE, T, RMS_NORM_EPS, stream, config_.is_hybrid());
 
         // 2. QKV projections: GEMM with N=T
         auto project = [&](half* out, half* fp16w, NF4Weight& nf4w, const half* input,
@@ -1181,17 +1601,20 @@ void InferenceEngine::prefill_chunked(int T, int G, cudaStream_t stream) {
             else batch_gemm_q4l(out, nf4w, input, T, stream);
             // No LoRA during prefill (LoRA not synced yet at this point)
         };
-        project(B->q_buf, L.q_proj_fp16, L.q_proj_nf4, B->norm_buf, Q_DIM, HIDDEN_SIZE);
+        project(B->q_buf, L.q_proj_fp16, L.q_proj_nf4, B->norm_buf, Q_PROJ_DIM, HIDDEN_SIZE);
         project(B->k_buf, L.k_proj_fp16, L.k_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
         project(B->v_buf, L.v_proj_fp16, L.v_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
 
-        // 3. QKNorm + RoPE (pass T as "G", d_positions = [0,1,...,T-1])
+        // 3. QKNorm + RoPE
+        // For gated attention: q_buf layout is [query(Q_DIM) | gate(Q_DIM)] per token in col-major
+        // QK norm and RoPE operate on query only. The q_dim stride is Q_PROJ_DIM (so gate is skipped).
+        // But head_idx * head_dim addresses correctly since weights are reordered to [all_query | all_gate].
         launch_qk_norm_batch(B->q_buf, B->k_buf, L.q_norm, L.k_norm,
                              NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, T, RMS_NORM_EPS,
-                             Q_DIM, KV_DIM, stream);
+                             Q_PROJ_DIM, KV_DIM, stream, config_.is_hybrid());
         launch_rope_batch(B->q_buf, B->k_buf, state_.rope_cos, state_.rope_sin,
                           B->d_positions, B->max_seq_len, T,
-                          NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, stream);
+                          NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_PROJ_DIM, KV_DIM, config_.rope_dim, stream);
 
         // 4. Write K,V to cache for sequence 0
         if (kv_bits_ == 0) {
@@ -1215,19 +1638,24 @@ void InferenceEngine::prefill_chunked(int T, int G, cudaStream_t stream) {
                                      kv_bits_, stream);
         }
 
-        // 5. Causal self-attention (T queries against T KV entries in seq 0 cache)
+        // 5. Causal self-attention (Q stride = Q_PROJ_DIM so query part is correctly accessed)
         if (kv_bits_ == 0) {
             launch_gqa_prefill_attention(B->attn_out, B->q_buf,
                                           B->kv_keys[layer], B->kv_values[layer],
                                           B->attn_scores, T, B->max_seq_len,
-                                          NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, stream);
+                                          NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_PROJ_DIM, KV_DIM, stream);
         } else {
             launch_turbo_gqa_prefill_attention(B->attn_out, B->q_buf,
                                                 B->kv_keys_q[layer], B->kv_values_q[layer],
                                                 B->kv_keys_norms[layer], B->kv_values_norms[layer],
                                                 state_.turbo_rotation,
                                                 B->attn_scores, T, B->max_seq_len,
-                                                NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, kv_bits_, stream);
+                                                NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_PROJ_DIM, KV_DIM, kv_bits_, stream);
+        }
+
+        // 5b. Gated attention: attn_out *= sigmoid(gate)
+        if (config_.gated_attn) {
+            launch_sigmoid_gate_batch(B->attn_out, B->q_buf + Q_DIM, Q_DIM, T, stream);
         }
 
         // 6. Output projection + residual
@@ -1237,7 +1665,7 @@ void InferenceEngine::prefill_chunked(int T, int G, cudaStream_t stream) {
         // 7. Post-attention norm
         launch_copy_batch(B->residual, B->hidden, HIDDEN_SIZE * T, stream);
         launch_rms_norm_batch(B->norm_buf, B->residual, L.post_attn_layernorm,
-                              HIDDEN_SIZE, T, RMS_NORM_EPS, stream);
+                              HIDDEN_SIZE, T, RMS_NORM_EPS, stream, config_.is_hybrid());
 
         // 8. FFN
         project(B->gate_buf, L.gate_proj_fp16, L.gate_proj_nf4, B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
@@ -1247,11 +1675,25 @@ void InferenceEngine::prefill_chunked(int T, int G, cudaStream_t stream) {
 
         // 9. Residual add
         launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * T, stream);
+
     }
 
-    // Broadcast KV cache from seq 0 to seqs 1..G-1
+    // Broadcast KV cache (attention layers) and SSM state (SSM layers) from seq 0 to seqs 1..G-1
     for (int layer = 0; layer < NUM_LAYERS; layer++) {
         for (int g = 1; g < G; g++) {
+            if (config_.layer_type[layer] == LAYER_SSM) {
+                // Broadcast SSM recurrent state
+                size_t state_per_seq = (size_t)config_.ssm_num_v_heads * config_.ssm_k_head_dim
+                                     * config_.ssm_v_head_dim * sizeof(float);
+                size_t conv_per_seq = (size_t)config_.ssm_conv_dim() * (config_.ssm_conv_kernel - 1) * sizeof(float);
+                cudaMemcpyAsync((char*)B->ssm_state[layer] + g * state_per_seq,
+                                B->ssm_state[layer],
+                                state_per_seq, cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync((char*)B->ssm_conv_state[layer] + g * conv_per_seq,
+                                B->ssm_conv_state[layer],
+                                conv_per_seq, cudaMemcpyDeviceToDevice, stream);
+                continue;
+            }
             if (kv_bits_ == 0) {
                 cudaMemcpyAsync(B->kv_keys[layer] + (size_t)g * B->max_seq_len * KV_DIM,
                                 B->kv_keys[layer],
@@ -1279,7 +1721,35 @@ void InferenceEngine::prefill_chunked(int T, int G, cudaStream_t stream) {
         }
     }
 
-    // No logits/sampling needed -- prefill just fills the KV cache
+    // For hybrid models: compute logits for the last token directly from prefill output.
+    // This avoids re-processing through decode_batch which would corrupt SSM state
+    // (the delta rule updates are not idempotent like KV cache writes).
+    if (config_.is_hybrid()) {
+        // Extract last token's hidden state: hidden[:, T-1] in col-major
+        // Copy to position 0 of norm_buf for the final norm + LM head
+        // hidden is (HIDDEN_SIZE, T) col-major: last token at offset (T-1) * HIDDEN_SIZE
+        half* last_hidden = B->hidden + (T - 1) * HIDDEN_SIZE;
+
+        // Final norm on the last token only
+        launch_rms_norm_batch(B->norm_buf, last_hidden, weights_.final_layernorm,
+                              HIDDEN_SIZE, 1, RMS_NORM_EPS, stream, config_.is_hybrid());
+
+        // LM head: (VOCAB_SIZE, HIDDEN_SIZE) @ (HIDDEN_SIZE, 1) -> (VOCAB_SIZE, 1)
+        ensure_cublas(stream);
+        float alpha = 1.0f, beta_val = 0.0f;
+        cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                     VOCAB_SIZE, G, HIDDEN_SIZE, &alpha,
+                     weights_.embed_tokens, CUDA_R_16F, HIDDEN_SIZE,
+                     B->norm_buf, CUDA_R_16F, HIDDEN_SIZE,
+                     &beta_val, B->logits, CUDA_R_32F, VOCAB_SIZE,
+                     CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        // Logits are now in B->logits for G=1 (broadcast to all G later if needed)
+        // For G > 1, broadcast logits (same prompt → same logits for first token)
+        for (int g = 1; g < G; g++) {
+            cudaMemcpyAsync(B->logits + g * VOCAB_SIZE, B->logits,
+                            VOCAB_SIZE * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        }
+    }
 }
 
 std::vector<std::vector<int>> InferenceEngine::generate_batch(
@@ -1298,7 +1768,18 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
     // Reset
     for (int i = 0; i < G; i++) { B->h_positions[i] = 0; B->h_finished[i] = false; }
     for (int i = 0; i < NUM_LAYERS; i++) {
-        if (kv_bits_ == 0) {
+        if (config_.layer_type[i] == LAYER_SSM) {
+            // Zero SSM state and conv state
+            if (B->ssm_state[i]) {
+                size_t state_sz = (size_t)G * config_.ssm_num_v_heads * config_.ssm_k_head_dim
+                                * config_.ssm_v_head_dim * sizeof(float);
+                cudaMemset(B->ssm_state[i], 0, state_sz);
+            }
+            if (B->ssm_conv_state[i]) {
+                size_t conv_sz = (size_t)G * config_.ssm_conv_dim() * (config_.ssm_conv_kernel - 1) * sizeof(float);
+                cudaMemset(B->ssm_conv_state[i], 0, conv_sz);
+            }
+        } else if (kv_bits_ == 0) {
             cudaMemset(B->kv_keys[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
             cudaMemset(B->kv_values[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
         } else {
@@ -1332,18 +1813,22 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
         prefill_chunked(max_prompt_len, G, gen_stream);
         cudaStreamSynchronize(gen_stream);
 
-        // Prepare d_tokens/d_positions for the first decode step:
-        // All G sequences start from the last prompt token at position T-1
-        for (int g = 0; g < G; g++) {
-            B->h_tokens[g] = prompts[0].back();
-            B->h_positions[g] = max_prompt_len - 1;
+        if (config_.is_hybrid()) {
+            // For hybrid models: prefill already computed logits for the last token.
+            // Skip decode_batch to avoid corrupting SSM state (delta rule is not idempotent).
+            for (int g = 0; g < G; g++) B->h_positions[g] = max_prompt_len;
+        } else {
+            // For attention-only models: re-process last token to get logits
+            for (int g = 0; g < G; g++) {
+                B->h_tokens[g] = prompts[0].back();
+                B->h_positions[g] = max_prompt_len - 1;
+            }
+            cudaMemcpy(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpy(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice);
+            decode_batch(G, gen_stream);
+            cudaStreamSynchronize(gen_stream);
+            for (int g = 0; g < G; g++) B->h_positions[g] = max_prompt_len;
         }
-        cudaMemcpy(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice);
-        // Run one decode_batch to get logits for sampling the first token
-        decode_batch(G, gen_stream);
-        cudaStreamSynchronize(gen_stream);
-        for (int g = 0; g < G; g++) B->h_positions[g] = max_prompt_len;
     }
 
     // Pre-generate ALL random values for decode phase (enables CUDA graph)
@@ -1428,9 +1913,14 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
         }
         cublas_capture_mode = false;
 
-        // Re-prefill (warmup corrupted KV cache) using chunked prefill
+        // Re-prefill (warmup corrupted KV/SSM state) using chunked prefill
         for (int i = 0; i < NUM_LAYERS; i++) {
-            if (kv_bits_ == 0) {
+            if (config_.layer_type[i] == LAYER_SSM) {
+                if (B->ssm_state[i]) cudaMemset(B->ssm_state[i], 0,
+                    (size_t)G * config_.ssm_num_v_heads * config_.ssm_k_head_dim * config_.ssm_v_head_dim * sizeof(half));
+                if (B->ssm_conv_state[i]) cudaMemset(B->ssm_conv_state[i], 0,
+                    (size_t)G * config_.ssm_conv_dim() * (config_.ssm_conv_kernel - 1) * sizeof(half));
+            } else if (kv_bits_ == 0) {
                 cudaMemset(B->kv_keys[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
                 cudaMemset(B->kv_values[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
             } else {
@@ -1458,9 +1948,29 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
         use_graph = true;
     }
 
+    // For hybrid models: sample the first token from prefill logits before the decode loop.
+    // The prefill already computed logits — sample now and set d_tokens for step 0.
+    int first_step = 0;
+    if (config_.is_hybrid()) {
+        if (temperature < 0.01f) {
+            launch_argmax_batch(B->logits, B->d_tokens, VOCAB_SIZE, G, gen_stream);
+        } else {
+            float* step_randoms = B->d_all_randoms;
+            cudaMemcpyAsync(B->d_randoms_ptr, &step_randoms, sizeof(float*),
+                            cudaMemcpyHostToDevice, gen_stream);
+            launch_sample_batch(B->logits, B->d_tokens, B->d_randoms_ptr,
+                                VOCAB_SIZE, G, temperature, top_p, gen_stream);
+        }
+        // Store first token in history and advance positions
+        cudaMemcpyAsync(B->d_token_history, B->d_tokens,
+                        G * sizeof(int), cudaMemcpyDeviceToDevice, gen_stream);
+        launch_increment_positions(B->d_positions, G, gen_stream);
+        first_step = 1;  // decode loop starts from step 1
+    }
+
     // Phase 2: Decode with amortized stop checking
     int last_checked = -1;
-    for (int step = 0; step < max_new_tokens; step++) {
+    for (int step = first_step; step < max_new_tokens; step++) {
         if (use_graph) {
             // Update randoms indirection pointer (8 bytes, no sync needed)
             if (temperature >= 0.01f) {
@@ -1523,6 +2033,24 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
         }
         last_checked = step;
         if (all_done) break;
+    }
+
+    // Collect any unchecked tokens (e.g., hybrid first_step=1 with max_new_tokens=1)
+    if (first_step > 0 && last_checked < 0) {
+        // Pre-loop tokens were stored but never checked/collected
+        cudaStreamSynchronize(gen_stream);
+        int unchecked = std::min(first_step, max_new_tokens);
+        cudaMemcpy(B->h_token_history, B->d_token_history,
+                   unchecked * G * sizeof(int), cudaMemcpyDeviceToHost);
+        for (int s = 0; s < unchecked; s++) {
+            for (int g = 0; g < G; g++) {
+                if (!B->h_finished[g]) {
+                    int tok = B->h_token_history[s * G + g];
+                    outputs[g].push_back(tok);
+                    if (tok == eos_token_id) B->h_finished[g] = true;
+                }
+            }
+        }
     }
 
     // Restore cuBLAS to stream 0 for PyTorch compatibility

@@ -227,8 +227,10 @@ def convert_nf4(args):
     print(f"Saved {len(lines)} tensors ({total_mb:.1f}MB)")
 
 
-def convert_fp16(args):
+def convert_fp16(args, config=None):
     """Dequantize everything to fp16 using bitsandbytes."""
+    if config is None:
+        config = {}
     print(f"Converting {args.model} (fp16 mode)...")
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     import bitsandbytes as bnb
@@ -261,6 +263,18 @@ def convert_fp16(args):
                 ).to(torch.float16).contiguous().cpu()
             else:
                 data = param.data.to(torch.float16).contiguous().cpu()
+
+            # Reorder gated Q projection: [q_h0, gate_h0, q_h1, ...] → [q_h0, q_h1, ..., gate_h0, gate_h1, ...]
+            if "q_proj.weight" in clean and config.get("gated_attn"):
+                hd = config["head_dim"]
+                nh = config["num_attention_heads"]
+                # data is (num_heads * head_dim * 2, hidden_size) = (4096, 1024)
+                # Rows: [q_h0(256), gate_h0(256), q_h1(256), gate_h1(256), ...]
+                # Reorder rows: queries first, then gates
+                data = data.reshape(nh, 2, hd, -1)  # (8, 2, 256, 1024)
+                query = data[:, 0, :, :].reshape(-1, data.shape[-1])  # (2048, 1024)
+                gate = data[:, 1, :, :].reshape(-1, data.shape[-1])   # (2048, 1024)
+                data = torch.cat([query, gate], dim=0).contiguous()  # (4096, 1024)
 
             raw = data.numpy().tobytes()
             shape = ",".join(str(s) for s in data.shape)
@@ -345,21 +359,73 @@ def write_model_config(model_name, output_prefix):
     """Write config.json alongside weights for runtime model config.
 
     Reads the HuggingFace config and writes the fields the C++ engine needs.
+    Supports both pure transformer (Qwen3) and hybrid VLM (Qwen3.5) models.
     """
+    def _get_rope_theta(cfg):
+        """Extract rope_theta from potentially nested config."""
+        theta = getattr(cfg, "rope_theta", None)
+        if theta is not None:
+            return float(theta)
+        # Qwen3.5: nested inside rope_parameters
+        rp = getattr(cfg, "rope_parameters", None)
+        if rp and isinstance(rp, dict) and "rope_theta" in rp:
+            return float(rp["rope_theta"])
+        return 10000.0  # standard default
     from transformers import AutoConfig
     hf_config = AutoConfig.from_pretrained(model_name)
 
+    # For VLM models, the text config is nested under text_config
+    tc = getattr(hf_config, "text_config", hf_config)
+
     config = {
-        "hidden_size": hf_config.hidden_size,
-        "intermediate_size": hf_config.intermediate_size,
-        "num_hidden_layers": hf_config.num_hidden_layers,
-        "num_attention_heads": hf_config.num_attention_heads,
-        "num_key_value_heads": hf_config.num_key_value_heads,
-        "head_dim": getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads),
-        "vocab_size": hf_config.vocab_size,
-        "rms_norm_eps": hf_config.rms_norm_eps,
-        "rope_theta": hf_config.rope_theta,
+        "hidden_size": tc.hidden_size,
+        "intermediate_size": tc.intermediate_size,
+        "num_hidden_layers": tc.num_hidden_layers,
+        "num_attention_heads": tc.num_attention_heads,
+        "num_key_value_heads": tc.num_key_value_heads,
+        "head_dim": getattr(tc, "head_dim", tc.hidden_size // tc.num_attention_heads),
+        "vocab_size": tc.vocab_size,
+        "rms_norm_eps": tc.rms_norm_eps,
+        "rope_theta": _get_rope_theta(tc),
     }
+
+    # RoPE partial rotary factor (Qwen3.5: only 25% of head_dim gets RoPE)
+    prf = getattr(tc, "partial_rotary_factor", None)
+    if prf is None:
+        rp = getattr(tc, "rope_parameters", None)
+        if rp and isinstance(rp, dict):
+            prf = rp.get("partial_rotary_factor", None)
+    if prf is not None and prf < 1.0:
+        config["rope_dim"] = int(config["head_dim"] * prf)  # e.g., 256 * 0.25 = 64
+
+    # Gated attention: Qwen3.5 q_proj outputs 2x (query + gate)
+    # Detect from model class name or config hint
+    model_type = getattr(tc, "model_type", getattr(hf_config, "model_type", ""))
+    if "qwen3_5" in model_type.lower() or "qwen3.5" in model_type.lower():
+        config["gated_attn"] = 1
+
+    # Hybrid architecture (Qwen3.5): SSM layer config
+    if hasattr(tc, "linear_num_key_heads"):
+        config["ssm_num_k_heads"] = tc.linear_num_key_heads
+        config["ssm_num_v_heads"] = tc.linear_num_value_heads
+        config["ssm_k_head_dim"] = tc.linear_key_head_dim
+        config["ssm_v_head_dim"] = tc.linear_value_head_dim
+        config["ssm_conv_kernel"] = getattr(tc, "linear_conv_kernel_dim", 4)
+
+        # Build layer_types array: 0=attention, 1=SSM
+        n = tc.num_hidden_layers
+        if hasattr(tc, "layer_types"):
+            layer_types = [0 if t == "full_attention" else 1 for t in tc.layer_types]
+        else:
+            # Default pattern: every 4th layer is full attention
+            layer_types = [0 if (i + 1) % 4 == 0 else 1 for i in range(n)]
+        config["layer_types"] = layer_types
+        n_attn = sum(1 for t in layer_types if t == 0)
+        n_ssm = n - n_attn
+        print(f"  Hybrid: {n_attn} attention + {n_ssm} SSM layers")
+        print(f"  SSM: k_heads={config['ssm_num_k_heads']}, v_heads={config['ssm_num_v_heads']}, "
+              f"k_hd={config['ssm_k_head_dim']}, v_hd={config['ssm_v_head_dim']}, "
+              f"conv_k={config['ssm_conv_kernel']}")
 
     config_path = output_prefix + ".config.json"
     with open(config_path, "w") as f:
@@ -369,24 +435,133 @@ def write_model_config(model_name, output_prefix):
           f"{config['num_hidden_layers']}L, {config['num_attention_heads']}Qh, "
           f"{config['num_key_value_heads']}KVh, {config['head_dim']}hd, "
           f"{config['vocab_size']}V")
+    return config
+
+
+def convert_vlm_q4l(args):
+    """Convert VLM model (Qwen3.5) to Q4L: extract text model, quantize large projections.
+
+    Strips vision/MTP weights, handles hybrid SSM+attention architecture.
+    Small SSM parameters (A_log, dt_bias, in_proj_a/b, conv1d, norm) stay fp16.
+    Large projections (in_proj_qkv, in_proj_z, out_proj, MLP, attention) get Q4L.
+    """
+    print(f"Converting {args.model} (VLM Q4L mode)...")
+    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+    import bitsandbytes as bnb
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, quantization_config=bnb_config,
+        device_map="cuda", torch_dtype=torch.float16,
+        trust_remote_code=True,
+    )
+
+    bin_path = args.output + ".bin"
+    idx_path = args.output + ".idx"
+    offset = 0
+    lines = []
+    n_q4l = 0
+    n_fp16 = 0
+    n_skipped = 0
+
+    # Prefixes to strip for text model extraction
+    STRIP_PREFIXES = ["model.language_model.", "model."]
+    SKIP_PREFIXES = ["visual", "vision_", "lm_head_mtp", "mtp."]
+
+    # Small params that should stay fp16 (not worth quantizing)
+    FP16_PATTERNS = ["A_log", "dt_bias", "in_proj_a.", "in_proj_b.", "conv1d.",
+                     "layernorm", "norm.", "embed_tokens"]
+
+    with open(bin_path, "wb") as f:
+        for name, param in model.named_parameters():
+            # Strip prefix
+            clean = name
+            for prefix in STRIP_PREFIXES:
+                if clean.startswith(prefix):
+                    clean = clean[len(prefix):]
+                    break
+
+            # Skip vision/MTP weights
+            if any(clean.startswith(p) for p in SKIP_PREFIXES):
+                n_skipped += 1
+                continue
+
+            # Reshape conv1d: [D, 1, K] → [D, K]
+            is_conv1d = "conv1d.weight" in clean
+            if is_conv1d and param.dim() == 3:
+                param_data = param.data.squeeze(1)
+            else:
+                param_data = param.data
+
+            # Check if this is a quantized (4-bit) parameter
+            should_fp16 = any(p in clean for p in FP16_PATTERNS)
+
+            if hasattr(param, "quant_state") and not should_fp16:
+                # Dequantize NF4 → fp16 → Q4L
+                fp16_data = bnb.functional.dequantize_4bit(
+                    param.data, param.quant_state
+                ).to(torch.float16).contiguous().cpu().numpy()
+
+                packed, q4l_scales = quantize_fp16_to_q4l(fp16_data, block_size=64)
+
+                data = packed.tobytes()
+                shape = ",".join(str(s) for s in fp16_data.shape)
+                lines.append(f"{clean} {offset} {len(data)} uint8 {shape}")
+                f.write(data)
+                offset += len(data)
+
+                sdata = q4l_scales.tobytes()
+                lines.append(f"{clean}.absmax {offset} {len(sdata)} float32 {len(q4l_scales)}")
+                f.write(sdata)
+                offset += len(sdata)
+                n_q4l += 1
+            else:
+                # Keep as fp16
+                if hasattr(param, "quant_state"):
+                    # Dequantize small params to fp16
+                    t = bnb.functional.dequantize_4bit(
+                        param.data, param.quant_state
+                    ).to(torch.float16).contiguous().cpu()
+                else:
+                    t = param_data.to(torch.float16).contiguous().cpu()
+
+                data = t.numpy().tobytes()
+                shape = ",".join(str(s) for s in t.shape)
+                lines.append(f"{clean} {offset} {len(data)} float16 {shape}")
+                f.write(data)
+                offset += len(data)
+                n_fp16 += 1
+
+    with open(idx_path, "w") as f:
+        for line in lines:
+            f.write(line + "\n")
+
+    total_mb = os.path.getsize(bin_path) / 1e6
+    print(f"Saved {len(lines)} tensors ({total_mb:.1f}MB)")
+    print(f"  Q4L: {n_q4l}, fp16: {n_fp16}, skipped: {n_skipped}")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="unsloth/Qwen3-0.6B-unsloth-bnb-4bit")
     parser.add_argument("--output", default="engine/weights")
-    parser.add_argument("--mode", choices=["fp16", "nf4", "q4l"], default="fp16")
+    parser.add_argument("--mode", choices=["fp16", "nf4", "q4l", "vlm_q4l"], default="fp16")
     args = parser.parse_args()
 
     # Write model config JSON (used by C++ engine at runtime)
-    write_model_config(args.model, args.output)
+    model_config = write_model_config(args.model, args.output)
 
     if args.mode == "nf4":
         convert_nf4(args)
     elif args.mode == "q4l":
         convert_q4l(args)
+    elif args.mode == "vlm_q4l":
+        convert_vlm_q4l(args)
     else:
-        convert_fp16(args)
+        convert_fp16(args, config=model_config)
 
 
 if __name__ == "__main__":

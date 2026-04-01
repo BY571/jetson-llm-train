@@ -1,19 +1,26 @@
 /**
  * 4-bit GEMV kernels for Jetson Orin (sm_87) — v9 (dp4a).
  *
- * Three kernel variants:
+ * Four kernel variants:
  *   1. NF4 GEMV: shared memory lookup, fp32 FMA (baseline)
  *   2. Q4L GEMV: linear dequant, fp32 FMA (no lookup table)
  *   3. Q4L dp4a GEMV: quantize input to int8, use dp4a for 4 MACs/instruction
+ *   4. W4A16 TC batch GEMM: tensor core mma.m16n8k16, marlin-style dequant
  *
  * dp4a (dot product of 4 int8 pairs, accumulated in int32) does 4x more work
  * per instruction than fp32 FMA. Adapted from llama.cpp Q4_0 kernel design.
  * Input quantized to int8 on-the-fly (once, shared across all projections).
+ *
+ * W4A16 TC kernel reads 4-bit weights directly (300MB vs 680MB fp16 cache),
+ * dequantizes to fp16 in registers using marlin's lop3 trick, and feeds
+ * tensor core mma.sync.aligned.m16n8k16 instructions. Requires weights in
+ * "marlin" packing format (see convert_weights.py --mode marlin).
  */
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <mma.h>
 
 #define ROWS_PER_BLOCK 4
 #define THREADS_PER_BLOCK 256

@@ -8,36 +8,78 @@
 // Maximum number of transformer layers (covers all Qwen3 variants)
 constexpr int MAX_LAYERS = 128;
 
+// Layer type for hybrid architectures (Qwen3.5 = transformer + Mamba-2)
+enum LayerType : int {
+    LAYER_ATTENTION = 0,   // standard GQA attention with KV cache
+    LAYER_SSM = 1,         // Gated Delta Rule SSM (Mamba-2 style)
+};
+
 // Runtime model configuration — loaded from config.json alongside weights.
 // Replaces the old compile-time qwen3:: namespace.
 struct ModelConfig {
     int hidden_size;
     int intermediate_size;
     int num_layers;
-    int num_heads;          // Q heads
-    int num_kv_heads;       // KV heads (GQA)
-    int head_dim;
+    int num_heads;          // Q heads (attention layers)
+    int num_kv_heads;       // KV heads (attention layers, GQA)
+    int head_dim;           // head dimension (attention layers)
     int vocab_size;
     float rms_norm_eps;
     float rope_theta;
+    int rope_dim;              // rotary dim (default = head_dim, partial_rotary_factor < 1 → smaller)
+
+    // Hybrid architecture: SSM (Gated Delta Rule) layer config
+    // Zero if model is pure transformer (e.g., Qwen3-0.6B)
+    int ssm_num_k_heads;    // SSM key heads (16 for Qwen3.5-0.8B)
+    int ssm_num_v_heads;    // SSM value heads (32 for Qwen3.5-0.8B)
+    int ssm_k_head_dim;     // key head dim (128)
+    int ssm_v_head_dim;     // value head dim (128)
+    int ssm_conv_kernel;    // causal conv1d kernel size (4)
+
+    // Per-layer type: 0=attention, 1=SSM
+    LayerType layer_type[MAX_LAYERS];
+
+    bool gated_attn;           // Qwen3.5: q_proj outputs 2x (query + gate), gate applied after attention
 
     // Derived dimensions
-    int q_dim() const { return num_heads * head_dim; }
+    int q_dim() const { return num_heads * head_dim; }  // attention Q dimension
+    int q_proj_dim() const { return num_heads * head_dim * (gated_attn ? 2 : 1); }  // q_proj output dimension
     int kv_dim() const { return num_kv_heads * head_dim; }
     int gqa_groups() const { return num_heads / num_kv_heads; }
 
+    // SSM derived dimensions
+    int ssm_key_dim() const { return ssm_num_k_heads * ssm_k_head_dim; }
+    int ssm_value_dim() const { return ssm_num_v_heads * ssm_v_head_dim; }
+    int ssm_conv_dim() const { return 2 * ssm_key_dim() + ssm_value_dim(); }
+    int ssm_state_dim() const { return ssm_k_head_dim * ssm_v_head_dim; } // per head
+    bool is_hybrid() const { return ssm_num_v_heads > 0; }
+
+    // Count layer types
+    int num_attn_layers() const {
+        int n = 0;
+        for (int i = 0; i < num_layers; i++) if (layer_type[i] == LAYER_ATTENTION) n++;
+        return n;
+    }
+    int num_ssm_layers() const { return num_layers - num_attn_layers(); }
+
     // Built-in presets
     static ModelConfig qwen3_0_6b() {
-        return {1024, 3072, 28, 16, 8, 128, 151936, 1e-6f, 1000000.0f};
+        ModelConfig c = {};
+        c.hidden_size = 1024; c.intermediate_size = 3072; c.num_layers = 28;
+        c.num_heads = 16; c.num_kv_heads = 8; c.head_dim = 128;
+        c.vocab_size = 151936; c.rms_norm_eps = 1e-6f; c.rope_theta = 1000000.0f;
+        c.rope_dim = 128; c.gated_attn = false;
+        for (int i = 0; i < 28; i++) c.layer_type[i] = LAYER_ATTENTION;
+        return c;
     }
     static ModelConfig qwen3_1_7b() {
-        return {2048, 6144, 28, 16, 8, 128, 151936, 1e-6f, 1000000.0f};
-    }
-    static ModelConfig qwen3_4b() {
-        return {2560, 9216, 36, 32, 8, 128, 151936, 1e-6f, 1000000.0f};
-    }
-    static ModelConfig qwen3_8b() {
-        return {4096, 12288, 36, 32, 8, 128, 151936, 1e-6f, 1000000.0f};
+        ModelConfig c = {};
+        c.hidden_size = 2048; c.intermediate_size = 6144; c.num_layers = 28;
+        c.num_heads = 16; c.num_kv_heads = 8; c.head_dim = 128;
+        c.vocab_size = 151936; c.rms_norm_eps = 1e-6f; c.rope_theta = 1000000.0f;
+        c.rope_dim = 128; c.gated_attn = false;
+        for (int i = 0; i < 28; i++) c.layer_type[i] = LAYER_ATTENTION;
+        return c;
     }
 
     // Load from JSON file (written by convert_weights.py)
@@ -117,6 +159,36 @@ struct TransformerLayerWeights {
     LoRAAdapter* lora_gate;
     LoRAAdapter* lora_up;
     LoRAAdapter* lora_down;
+
+    // === SSM (Gated Delta Rule) weights — used when layer_type == LAYER_SSM ===
+    // Large projections (Q4L quantized or fp16)
+    half* ssm_in_proj_qkv_fp16;    // (conv_dim, hidden) — Q,K,V fused
+    NF4Weight ssm_in_proj_qkv_nf4;
+    half* ssm_in_proj_z_fp16;      // (value_dim, hidden) — gate
+    NF4Weight ssm_in_proj_z_nf4;
+    half* ssm_out_proj_fp16;       // (hidden, value_dim) — output
+    NF4Weight ssm_out_proj_nf4;
+    bool ssm_is_q4l = false;
+
+    // Small projections (always fp16, too small for quantization)
+    half* ssm_in_proj_a_fp16;      // (num_v_heads, hidden) — decay input
+    half* ssm_in_proj_b_fp16;      // (num_v_heads, hidden) — beta/gate input
+
+    // Conv1d (fp16)
+    half* ssm_conv1d_weight;       // (conv_dim, conv_kernel) — depthwise causal conv
+    half* ssm_conv1d_bias;         // (conv_dim,) or nullptr
+
+    // SSM parameters (fp16, tiny)
+    half* ssm_A_log;               // (num_v_heads,) — log eigenvalues
+    half* ssm_dt_bias;             // (num_v_heads,) — dt bias
+
+    // Gated RMSNorm (fp16)
+    half* ssm_norm_weight;         // (v_head_dim,) — shared across heads
+
+    // LoRA for SSM projections
+    LoRAAdapter* lora_ssm_qkv;
+    LoRAAdapter* lora_ssm_z;
+    LoRAAdapter* lora_ssm_out;
 };
 
 // KV cache for one layer
@@ -215,7 +287,7 @@ struct BatchState {
     half* hidden;       // (HIDDEN_SIZE, G)
     half* residual;     // (HIDDEN_SIZE, G)
     half* norm_buf;     // (HIDDEN_SIZE, G) temp for norm output
-    half* q_buf;        // (Q_DIM, G)
+    half* q_buf;        // (Q_PROJ_DIM, G) — full q_proj output; for gated attn, first half = Q, second half = gate
     half* k_buf;        // (KV_DIM, G)
     half* v_buf;        // (KV_DIM, G)
     half* attn_out;     // (Q_DIM, G)
@@ -235,6 +307,31 @@ struct BatchState {
     uint8_t* kv_values_q[MAX_LAYERS];  // same
     half* kv_keys_norms[MAX_LAYERS];   // (G * max_seq_len, num_kv_heads)
     half* kv_values_norms[MAX_LAYERS]; // same
+
+    // SSM recurrent state (Gated Delta Rule, for LAYER_SSM layers)
+    float* ssm_state[MAX_LAYERS];      // (G, num_v_heads, k_head_dim, v_head_dim) per SSM layer — fp32 to avoid overflow
+    float* ssm_conv_state[MAX_LAYERS]; // (G, conv_dim, conv_kernel-1) per SSM layer — fp32
+
+    // SSM scratch buffers (reused across layers, sized for largest SSM dims)
+    float* ssm_qkv_fp32;              // (conv_dim, G) — QKV after conv1d+SiLU (fp32 for SSM precision)
+    half* ssm_qkv_buf;                // (conv_dim, G) — QKV projection output (fp16 from GEMM)
+    half* ssm_z_buf;                   // (value_dim, G) — gate projection
+    float* ssm_y_fp32;                // (value_dim, G) — SSM delta rule output (fp32, avoids overflow)
+    half* ssm_y_buf;                   // (value_dim, G) — after gated rmsnorm (fp16, for out_proj GEMM)
+    float* ssm_dt_buf;                // (num_v_heads, G) — decay values
+    half* ssm_a_buf;                   // (num_v_heads, G) — in_proj_a output
+    half* ssm_b_buf;                   // (num_v_heads, G) — in_proj_b output (beta input)
+
+    // SSM chunked prefill workspace (reused across layers)
+    float* ssm_chunk_Q;               // (H, T_padded, D) — rearranged Q
+    float* ssm_chunk_K;               // (H, T_padded, D) — rearranged K
+    float* ssm_chunk_V;               // (H, T_padded, D) — rearranged V
+    float* ssm_chunk_K_beta;          // (H, T_padded, D) — K * beta
+    float* ssm_chunk_V_beta;          // (H, T_padded, D) — V * beta
+    float* ssm_chunk_g;               // (H, T) — raw gate values
+    float* ssm_chunk_beta;            // (H, T) — beta values
+    float* ssm_chunk_output;          // (H, T_padded, D) — chunked output
+    float* ssm_chunk_workspace;       // (H, ws_per_head) — per-chunk scratch
 
     // Q4L dequant scratch (largest projection = INTERMEDIATE_SIZE * HIDDEN_SIZE)
     half* dequant_scratch;
@@ -356,8 +453,9 @@ private:
     ModelWeights weights_;
     InferenceState state_;
 
-    // Forward pass for one token through one layer
+    // Forward pass for one token through one layer (dispatches attn vs SSM)
     void forward_layer(int layer_idx);
+    void forward_layer_ssm(int layer_idx);  // Gated Delta Rule SSM
 
     // Allocate GPU buffers (called from load_weights after config is known)
     void allocate_buffers();
@@ -371,6 +469,8 @@ private:
     void decode_batch(int G, cudaStream_t stream = 0);
     void prefill_chunked(int T, int G, cudaStream_t stream);
     void forward_layer_batch(int layer_idx, int G, cudaStream_t stream);
+    void forward_layer_ssm_batch(int layer_idx, int G, cudaStream_t stream);
+    void forward_layer_ssm_prefill(int layer_idx, int T, cudaStream_t stream);
 
     // Batched GEMM: (M,K) @ (K,N) -> (M,N) where N=G
     void batch_gemm(half* out, const half* weight, const half* in,

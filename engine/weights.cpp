@@ -23,6 +23,7 @@
 #define HEAD_DIM config_.head_dim
 #define VOCAB_SIZE config_.vocab_size
 #define Q_DIM config_.q_dim()
+#define Q_PROJ_DIM config_.q_proj_dim()
 #define KV_DIM config_.kv_dim()
 
 struct TensorInfo {
@@ -140,48 +141,27 @@ void InferenceEngine::load_weights(const std::string& prefix) {
             && index.find(base + ".weight.quant_map") == index.end();
     };
 
+    // SSM dimension macros for weight loading
+    int SSM_CONV_DIM = config_.ssm_conv_dim();
+    int SSM_VALUE_DIM = config_.ssm_value_dim();
+    int SSM_NUM_V_HEADS = config_.ssm_num_v_heads;
+    int SSM_CONV_KERNEL = config_.ssm_conv_kernel;
+
     for (int i = 0; i < NUM_LAYERS; i++) {
         auto& L = weights_.layers[i];
         std::string p = "layers." + std::to_string(i) + ".";
 
-        // Attention: check EACH projection individually
-        L.attn_is_nf4 = false;
-        struct { const char* name; half** fp16; NF4Weight* nf4; int out_dim; int in_dim; } attn_projs[] = {
-            {"self_attn.q_proj", &L.q_proj_fp16, &L.q_proj_nf4, Q_DIM, HIDDEN_SIZE},
-            {"self_attn.k_proj", &L.k_proj_fp16, &L.k_proj_nf4, KV_DIM, HIDDEN_SIZE},
-            {"self_attn.v_proj", &L.v_proj_fp16, &L.v_proj_nf4, KV_DIM, HIDDEN_SIZE},
-            {"self_attn.o_proj", &L.o_proj_fp16, &L.o_proj_nf4, HIDDEN_SIZE, Q_DIM},
-        };
-        for (auto& ap : attn_projs) {
-            std::string wname = p + ap.name + ".weight";
+        // Helper: load one projection (Q4L > NF4 > fp16 priority)
+        auto load_proj = [&](const std::string& proj, half** fp16, NF4Weight* nf4,
+                              int out_d, int in_d, bool& set_nf4, bool& set_q4l) {
+            std::string wname = p + proj + ".weight";
+            std::string pref = p + proj;
             if (is_q4l(wname)) {
-                *ap.nf4 = load_nf4(p + ap.name, ap.out_dim, ap.in_dim);
-                *ap.fp16 = nullptr;
-                L.attn_is_q4l = true;
-            } else if (is_nf4(wname)) {
-                *ap.nf4 = load_nf4(p + ap.name, ap.out_dim, ap.in_dim);
-                *ap.fp16 = nullptr;
-                L.attn_is_nf4 = true;
-            } else {
-                *ap.fp16 = load(wname);
-            }
-        }
-
-        // MLP: check EACH weight individually
-        L.mlp_is_nf4 = false;
-        L.mlp_is_q4l = false;
-
-        // Helper: load one MLP projection (Q4L > NF4 > fp16 priority)
-        auto load_mlp_proj = [&](const char* proj, half** fp16, NF4Weight* nf4,
-                                  int out_d, int in_d, bool& set_nf4, bool& set_q4l) {
-            std::string wname = p + std::string("mlp.") + proj + ".weight";
-            std::string prefix = p + std::string("mlp.") + proj;
-            if (is_q4l(wname)) {
-                *nf4 = load_nf4(prefix, out_d, in_d);
+                *nf4 = load_nf4(pref, out_d, in_d);
                 *fp16 = nullptr;
                 set_q4l = true;
             } else if (is_nf4(wname)) {
-                *nf4 = load_nf4(prefix, out_d, in_d);
+                *nf4 = load_nf4(pref, out_d, in_d);
                 *fp16 = nullptr;
                 set_nf4 = true;
             } else {
@@ -189,22 +169,101 @@ void InferenceEngine::load_weights(const std::string& prefix) {
             }
         };
 
-        load_mlp_proj("gate_proj", &L.gate_proj_fp16, &L.gate_proj_nf4,
-                       INTERMEDIATE_SIZE, HIDDEN_SIZE, L.mlp_is_nf4, L.mlp_is_q4l);
-        load_mlp_proj("up_proj", &L.up_proj_fp16, &L.up_proj_nf4,
-                       INTERMEDIATE_SIZE, HIDDEN_SIZE, L.mlp_is_nf4, L.mlp_is_q4l);
-        load_mlp_proj("down_proj", &L.down_proj_fp16, &L.down_proj_nf4,
-                       HIDDEN_SIZE, INTERMEDIATE_SIZE, L.mlp_is_nf4, L.mlp_is_q4l);
+        if (config_.layer_type[i] == LAYER_ATTENTION) {
+            // === Standard attention layer ===
+            L.attn_is_nf4 = false;
+            L.attn_is_q4l = false;
+            load_proj("self_attn.q_proj", &L.q_proj_fp16, &L.q_proj_nf4,
+                      Q_PROJ_DIM, HIDDEN_SIZE, L.attn_is_nf4, L.attn_is_q4l);
+            load_proj("self_attn.k_proj", &L.k_proj_fp16, &L.k_proj_nf4,
+                      KV_DIM, HIDDEN_SIZE, L.attn_is_nf4, L.attn_is_q4l);
+            load_proj("self_attn.v_proj", &L.v_proj_fp16, &L.v_proj_nf4,
+                      KV_DIM, HIDDEN_SIZE, L.attn_is_nf4, L.attn_is_q4l);
+            load_proj("self_attn.o_proj", &L.o_proj_fp16, &L.o_proj_nf4,
+                      HIDDEN_SIZE, Q_DIM, L.attn_is_nf4, L.attn_is_q4l);
+            L.q_norm = load(p + "self_attn.q_norm.weight");
+            L.k_norm = load(p + "self_attn.k_norm.weight");
+            L.lora_q = L.lora_k = L.lora_v = L.lora_o = nullptr;
+
+            // Null out SSM fields
+            L.ssm_in_proj_qkv_fp16 = nullptr;
+            L.ssm_in_proj_z_fp16 = nullptr;
+            L.ssm_out_proj_fp16 = nullptr;
+            L.ssm_in_proj_a_fp16 = nullptr;
+            L.ssm_in_proj_b_fp16 = nullptr;
+            L.ssm_conv1d_weight = nullptr;
+            L.ssm_conv1d_bias = nullptr;
+            L.ssm_A_log = nullptr;
+            L.ssm_dt_bias = nullptr;
+            L.ssm_norm_weight = nullptr;
+            L.lora_ssm_qkv = L.lora_ssm_z = L.lora_ssm_out = nullptr;
+
+        } else {
+            // === SSM (Gated Delta Rule) layer ===
+            L.ssm_is_q4l = false;
+            bool ssm_nf4 = false;
+
+            // Large projections: Q4L quantized
+            load_proj("linear_attn.in_proj_qkv", &L.ssm_in_proj_qkv_fp16,
+                      &L.ssm_in_proj_qkv_nf4, SSM_CONV_DIM, HIDDEN_SIZE, ssm_nf4, L.ssm_is_q4l);
+            load_proj("linear_attn.in_proj_z", &L.ssm_in_proj_z_fp16,
+                      &L.ssm_in_proj_z_nf4, SSM_VALUE_DIM, HIDDEN_SIZE, ssm_nf4, L.ssm_is_q4l);
+            load_proj("linear_attn.out_proj", &L.ssm_out_proj_fp16,
+                      &L.ssm_out_proj_nf4, HIDDEN_SIZE, SSM_VALUE_DIM, ssm_nf4, L.ssm_is_q4l);
+
+            // Small projections: always fp16
+            L.ssm_in_proj_a_fp16 = load(p + "linear_attn.in_proj_a.weight");
+            L.ssm_in_proj_b_fp16 = load(p + "linear_attn.in_proj_b.weight");
+
+            // Conv1d
+            L.ssm_conv1d_weight = load(p + "linear_attn.conv1d.weight");
+            L.ssm_conv1d_bias = load(p + "linear_attn.conv1d.bias"); // may be nullptr
+
+            // SSM parameters
+            L.ssm_A_log = load(p + "linear_attn.A_log");
+            L.ssm_dt_bias = load(p + "linear_attn.dt_bias");
+            L.ssm_norm_weight = load(p + "linear_attn.norm.weight");
+
+            L.lora_ssm_qkv = L.lora_ssm_z = L.lora_ssm_out = nullptr;
+
+            // Null out attention fields
+            L.q_proj_fp16 = L.k_proj_fp16 = L.v_proj_fp16 = L.o_proj_fp16 = nullptr;
+            L.q_norm = L.k_norm = nullptr;
+            L.attn_is_nf4 = L.attn_is_q4l = false;
+            L.lora_q = L.lora_k = L.lora_v = L.lora_o = nullptr;
+        }
+
+        // MLP: shared between attention and SSM layers
+        L.mlp_is_nf4 = false;
+        L.mlp_is_q4l = false;
+        load_proj("mlp.gate_proj", &L.gate_proj_fp16, &L.gate_proj_nf4,
+                  INTERMEDIATE_SIZE, HIDDEN_SIZE, L.mlp_is_nf4, L.mlp_is_q4l);
+        load_proj("mlp.up_proj", &L.up_proj_fp16, &L.up_proj_nf4,
+                  INTERMEDIATE_SIZE, HIDDEN_SIZE, L.mlp_is_nf4, L.mlp_is_q4l);
+        load_proj("mlp.down_proj", &L.down_proj_fp16, &L.down_proj_nf4,
+                  HIDDEN_SIZE, INTERMEDIATE_SIZE, L.mlp_is_nf4, L.mlp_is_q4l);
+
+        // Norms (shared between layer types)
         L.input_layernorm = load(p + "input_layernorm.weight");
         L.post_attn_layernorm = load(p + "post_attention_layernorm.weight");
-        L.q_norm = load(p + "self_attn.q_norm.weight");
-        L.k_norm = load(p + "self_attn.k_norm.weight");
-        L.lora_q = L.lora_k = L.lora_v = L.lora_o = nullptr;
+
         L.lora_gate = L.lora_up = L.lora_down = nullptr;
     }
+
     // Detect model-wide Q4L format
-    weights_.is_q4l = weights_.layers[1].attn_is_q4l || weights_.layers[1].mlp_is_q4l;
+    // Check first non-SSM layer for attention Q4L, or first SSM layer for SSM Q4L
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        if (weights_.layers[i].attn_is_q4l || weights_.layers[i].mlp_is_q4l
+            || weights_.layers[i].ssm_is_q4l) {
+            weights_.is_q4l = true;
+            break;
+        }
+    }
     if (weights_.is_q4l) std::cout << "  Weights: Q4 Linear (no lookup table)" << std::endl;
+    if (config_.is_hybrid()) {
+        std::cout << "  Hybrid: " << config_.num_attn_layers() << " attention + "
+                  << config_.num_ssm_layers() << " SSM layers" << std::endl;
+    }
     std::cout << "  All " << NUM_LAYERS << " layers loaded" << std::endl;
 
 }

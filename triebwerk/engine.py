@@ -11,7 +11,9 @@ def load_engine(num_generations, max_completion_tokens, temperature, top_p,
     Returns (engine, model_config) or raises ImportError if engine not built.
     Engine is loaded BEFORE PyTorch so it gets clean VRAM with no fragmentation.
     """
-    sys.path.insert(0, os.environ.get("ENGINE_BUILD", "engine/build2"))
+    engine_build = os.environ.get("ENGINE_BUILD", "engine/build2")
+    if engine_build not in sys.path:
+        sys.path.insert(0, engine_build)
     import jetson_engine
 
     engine = jetson_engine.Engine(1024, kv_bits=kv_bits)

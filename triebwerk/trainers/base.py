@@ -314,6 +314,12 @@ class BaseTrainer(ABC):
             prompt = sample["prompt"]
             answer = sample["answer"]
 
+            # Build kwargs for reward functions (all dataset columns, expanded G times)
+            reward_kwargs = {}
+            for key in sample:
+                if key != "prompt":
+                    reward_kwargs[key] = [sample[key]] * num_generations
+
             # 1. Sync LoRA to engine
             if self.syncer is not None:
                 self.syncer.sync()
@@ -337,11 +343,10 @@ class BaseTrainer(ABC):
                 self.tokenizer.decode(c["completion_ids"], skip_special_tokens=True)
                 for c in completions
             ]
-            expanded_answers = [answer] * num_generations
 
             rewards = torch.zeros(num_generations)
             for func in reward_funcs:
-                scores = func(comp_texts, answer=expanded_answers)
+                scores = func(comp_texts, **reward_kwargs)
                 rewards += torch.tensor(scores, dtype=torch.float32)
 
             # 4. Compute advantages
