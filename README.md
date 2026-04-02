@@ -30,6 +30,8 @@
    ...
 ```
 
+> **Warning:** This project is under heavy development and is mainly experimental. APIs, performance numbers, and supported models may change without notice.
+
 RL fine-tuning engine for LLMs. C++/CUDA inference engine with CUDA graphs and 4-bit quantization. Matches vLLM on desktop GPUs, runs on Jetson Orin where vLLM can't. Outputs standard HuggingFace PEFT LoRA adapters.
 
 ## Algorithms
