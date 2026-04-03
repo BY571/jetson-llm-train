@@ -54,7 +54,8 @@ def compute_token_logprobs(model, prompt_ids, completion_ids, device):
 def compute_batch_token_logprobs(model, completions, device):
     """Batched forward pass for all G completions at once.
 
-    Much faster than G sequential calls: one GEMM instead of G GEMVs.
+    Does a single forward pass with all sequences padded and batched,
+    then extracts per-token log-probs for each completion.
     Returns list of (completion_len_i,) tensors.
     """
     # Build padded batch (left-pad so completion tokens align at the right)
@@ -75,30 +76,33 @@ def compute_batch_token_logprobs(model, completions, device):
     input_ids = torch.tensor(padded, device=device)
     attention_mask = torch.tensor(masks, device=device)
 
-    # Process one sequence at a time and extract per-token log-probs immediately
-    # to avoid holding full (seq_len, vocab_size) tensors in memory.
+    # Single forward pass for ALL sequences at once
+    with torch.amp.autocast("cuda", dtype=torch.float16):
+        outputs = model(input_ids, attention_mask=attention_mask)
+
+    # Gather log-probs for target tokens only (1 float per position, not 151K)
+    seq_logits = outputs.logits[:, :-1, :]  # (batch, seq_len-1, vocab)
+    seq_targets = input_ids[:, 1:]  # (batch, seq_len-1)
+    batch_size = seq_logits.shape[0]
+
+    # Compute log-softmax in chunks to avoid fp32 OOM on full vocab
+    tok_lp = torch.zeros(batch_size, seq_logits.shape[1], device=device)
+    chunk = 256  # process 256 positions at a time
+    for c in range(0, seq_logits.shape[1], chunk):
+        end_c = min(c + chunk, seq_logits.shape[1])
+        lp_chunk = F.log_softmax(seq_logits[:, c:end_c].float(), dim=-1)
+        tok_lp[:, c:end_c] = lp_chunk.gather(2, seq_targets[:, c:end_c].unsqueeze(2)).squeeze(2)
+        del lp_chunk
+
+    del outputs, seq_logits
+
+    # Extract completion portions for each sequence
     result = []
     for i in range(len(completions)):
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            out_i = model(input_ids[i:i+1], attention_mask=attention_mask[i:i+1])
-        # Gather log-probs for target tokens only (1 float per position, not 151K)
-        seq_logits = out_i.logits[0, :-1, :]  # (seq_len-1, vocab)
-        seq_targets = input_ids[i, 1:]
-        # Compute log-softmax in chunks to avoid fp32 OOM on full vocab
-        tok_lp = torch.zeros(seq_logits.shape[0], device=seq_logits.device)
-        chunk = 256  # process 256 positions at a time
-        for c in range(0, seq_logits.shape[0], chunk):
-            end_c = min(c + chunk, seq_logits.shape[0])
-            lp_chunk = F.log_softmax(seq_logits[c:end_c].float(), dim=-1)
-            tok_lp[c:end_c] = lp_chunk.gather(1, seq_targets[c:end_c].unsqueeze(1)).squeeze(1)
-            del lp_chunk
-        del out_i, seq_logits
-        # Extract completion portion
         pad_len = max_len - len(seqs[i])
         start = pad_len + prompt_lens[i] - 1
         end = start + comp_lens[i]
-        result.append(tok_lp[start:end].detach())
-        del tok_lp
+        result.append(tok_lp[i, start:end].detach())
 
-    del input_ids, attention_mask
+    del tok_lp, input_ids, attention_mask
     return result

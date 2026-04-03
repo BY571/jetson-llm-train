@@ -6,6 +6,7 @@
  */
 
 #include "model.h"
+#include <cuda_runtime.h>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -13,6 +14,15 @@
 #include <unordered_map>
 #include <vector>
 #include <cstring>
+
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error in weights [%s:%d]: %s\n", \
+                __FILE__, __LINE__, cudaGetErrorString(err)); \
+        throw std::runtime_error(cudaGetErrorString(err)); \
+    } \
+} while(0)
 
 // Runtime config aliases (same as engine.cpp — macros reference config_ member)
 #define HIDDEN_SIZE config_.hidden_size
@@ -59,9 +69,19 @@ void InferenceEngine::load_weights(const std::string& prefix) {
 
     auto index = load_index(prefix + ".idx");
     std::ifstream f(prefix + ".bin", std::ios::binary | std::ios::ate);
+    if (!f.is_open()) {
+        std::cerr << "  ERROR: cannot open " << prefix << ".bin" << std::endl;
+        return;
+    }
     size_t sz = f.tellg(); f.seekg(0);
     std::vector<char> data(sz);
-    f.read(data.data(), sz); f.close();
+    f.read(data.data(), sz);
+    if (!f.good() || f.gcount() != static_cast<std::streamsize>(sz)) {
+        std::cerr << "  ERROR: truncated read of " << prefix << ".bin (expected "
+                  << sz << " bytes, got " << f.gcount() << ")" << std::endl;
+        return;
+    }
+    f.close();
     const char* base = data.data();
 
     std::cout << "Loading " << index.size() << " tensors (" << sz/1e6 << "MB)" << std::endl;
@@ -69,8 +89,9 @@ void InferenceEngine::load_weights(const std::string& prefix) {
     auto load = [&](const std::string& name) -> half* {
         auto it = index.find(name);
         if (it == index.end()) { std::cerr << "  MISS: " << name << std::endl; return nullptr; }
-        void* p; cudaMalloc(&p, it->second.nbytes);
-        cudaMemcpy(p, base + it->second.offset, it->second.nbytes, cudaMemcpyHostToDevice);
+        void* p;
+        CUDA_CHECK(cudaMalloc(&p, it->second.nbytes));
+        CUDA_CHECK(cudaMemcpy(p, base + it->second.offset, it->second.nbytes, cudaMemcpyHostToDevice));
         return (half*)p;
     };
 
@@ -87,13 +108,22 @@ void InferenceEngine::load_weights(const std::string& prefix) {
         }
     };
 
+    // Helper: checked cudaMemcpy
+    auto checked_memcpy = [](void* dst, const void* src, size_t size, cudaMemcpyKind kind, const char* name) {
+        cudaError_t err = cudaMemcpy(dst, src, size, kind);
+        if (err != cudaSuccess) {
+            std::cerr << "  CUDA MEMCPY FAILED: " << name << " (" << size << " bytes): "
+                      << cudaGetErrorString(err) << std::endl;
+        }
+    };
+
     // NF4 loader (used for both attention and MLP)
     auto load_nf4 = [&](const std::string& prefix, int out_dim, int in_dim) -> NF4Weight {
                 NF4Weight w = {};
                 w.out_dim = out_dim;
                 w.in_dim = in_dim;
                 w.block_size = 64;
-                w.n_blocks = out_dim * in_dim / 64;
+                w.n_blocks = (out_dim * in_dim + 63) / 64;
 
                 auto it_d = index.find(prefix + ".weight");
                 auto it_a = index.find(prefix + ".weight.absmax");
@@ -102,19 +132,19 @@ void InferenceEngine::load_weights(const std::string& prefix) {
                 if (it_d != index.end()) {
                     void* p;
                     checked_malloc(&p, it_d->second.nbytes, (prefix + ".data").c_str());
-                    if (p) cudaMemcpy(p, base + it_d->second.offset, it_d->second.nbytes, cudaMemcpyHostToDevice);
+                    if (p) checked_memcpy(p, base + it_d->second.offset, it_d->second.nbytes, cudaMemcpyHostToDevice, (prefix + ".data").c_str());
                     w.data = (uint8_t*)p;
                 }
                 if (it_a != index.end()) {
                     void* p;
                     checked_malloc(&p, it_a->second.nbytes, (prefix + ".absmax").c_str());
-                    if (p) cudaMemcpy(p, base + it_a->second.offset, it_a->second.nbytes, cudaMemcpyHostToDevice);
+                    if (p) checked_memcpy(p, base + it_a->second.offset, it_a->second.nbytes, cudaMemcpyHostToDevice, (prefix + ".absmax").c_str());
                     w.absmax = (float*)p;
                 }
                 if (it_q != index.end()) {
                     void* p;
                     checked_malloc(&p, it_q->second.nbytes, (prefix + ".qmap").c_str());
-                    if (p) cudaMemcpy(p, base + it_q->second.offset, it_q->second.nbytes, cudaMemcpyHostToDevice);
+                    if (p) checked_memcpy(p, base + it_q->second.offset, it_q->second.nbytes, cudaMemcpyHostToDevice, (prefix + ".qmap").c_str());
                     w.quant_map = (float*)p;
                 }
         if (!w.data || !w.absmax) {
@@ -271,16 +301,26 @@ void InferenceEngine::load_weights(const std::string& prefix) {
 void InferenceEngine::load_lora(const std::string& prefix, float scale) {
     auto index = load_index(prefix + ".idx");
     std::ifstream f(prefix + ".bin", std::ios::binary | std::ios::ate);
+    if (!f.is_open()) {
+        std::cerr << "  ERROR: cannot open " << prefix << ".bin" << std::endl;
+        return;
+    }
     size_t sz = f.tellg(); f.seekg(0);
     std::vector<char> data(sz);
-    f.read(data.data(), sz); f.close();
+    f.read(data.data(), sz);
+    if (!f.good() || f.gcount() != static_cast<std::streamsize>(sz)) {
+        std::cerr << "  ERROR: truncated read of " << prefix << ".bin" << std::endl;
+        return;
+    }
+    f.close();
     const char* base = data.data();
 
     auto load = [&](const std::string& name) -> half* {
         auto it = index.find(name);
         if (it == index.end()) return nullptr;
-        void* p; cudaMalloc(&p, it->second.nbytes);
-        cudaMemcpy(p, base + it->second.offset, it->second.nbytes, cudaMemcpyHostToDevice);
+        void* p;
+        CUDA_CHECK(cudaMalloc(&p, it->second.nbytes));
+        CUDA_CHECK(cudaMemcpy(p, base + it->second.offset, it->second.nbytes, cudaMemcpyHostToDevice));
         return (half*)p;
     };
     auto dim = [&](const std::string& name, int d) -> int {
@@ -304,6 +344,12 @@ void InferenceEngine::load_lora(const std::string& prefix, float scale) {
             std::string bn = p + proj + ".lora_B.weight";
             half* a = load(an); half* b = load(bn);
             if (a && b) {
+                // Free existing adapter if present (prevents leak on repeated calls)
+                if (*ptr) {
+                    if ((*ptr)->A) cudaFree((*ptr)->A);
+                    if ((*ptr)->B) cudaFree((*ptr)->B);
+                    delete *ptr;
+                }
                 auto* ad = new LoRAAdapter{a, b, dim(an,0), dim(an,1), dim(bn,0), scale};
                 *ptr = ad; n++;
             }

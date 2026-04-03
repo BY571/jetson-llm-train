@@ -298,17 +298,31 @@ void GGUFFile::dequant_q4_k(const void* src, half* dst, uint64_t n) const {
         const uint8_t* qs = block + 16;
 
         // K-quant scales: 8 sub-blocks of 32 elements each
-        // scales[0..5]: 6-bit scales packed, scales[6..11]: 6-bit mins packed
-        // Simplified: extract scale and min for each of 8 sub-blocks
+        // 6-bit scales packed in scales[0..5], 6-bit mins in scales[6..11]
+        // Correct extraction: 4 values per 3 bytes
         float sc[8], mn[8];
+        // Scales (bytes 0-5)
+        sc[0] = scales[0] & 0x3F;
+        sc[1] = ((scales[1] & 0x0F) << 2) | (scales[0] >> 6);
+        sc[2] = ((scales[2] & 0x03) << 4) | (scales[1] >> 4);
+        sc[3] = scales[2] >> 2;
+        sc[4] = scales[3] & 0x3F;
+        sc[5] = ((scales[4] & 0x0F) << 2) | (scales[3] >> 6);
+        sc[6] = ((scales[5] & 0x03) << 4) | (scales[4] >> 4);
+        sc[7] = scales[5] >> 2;
+        // Mins (bytes 6-11)
+        mn[0] = scales[6] & 0x3F;
+        mn[1] = ((scales[7] & 0x0F) << 2) | (scales[6] >> 6);
+        mn[2] = ((scales[8] & 0x03) << 4) | (scales[7] >> 4);
+        mn[3] = scales[8] >> 2;
+        mn[4] = scales[9] & 0x3F;
+        mn[5] = ((scales[10] & 0x0F) << 2) | (scales[9] >> 6);
+        mn[6] = ((scales[11] & 0x03) << 4) | (scales[10] >> 4);
+        mn[7] = scales[11] >> 2;
+        // Apply d and dmin multipliers
         for (int i = 0; i < 8; i++) {
-            if (i < 4) {
-                sc[i] = d * (scales[i] & 63);
-                mn[i] = dmin * (scales[i + 4] & 63);
-            } else {
-                sc[i] = d * ((scales[i + 4] & 0xF) | ((scales[i - 4] >> 6) << 4));
-                mn[i] = dmin * ((scales[i + 4] >> 4) | ((scales[i] >> 6) << 4));
-            }
+            sc[i] = d * sc[i];
+            mn[i] = dmin * mn[i];
         }
 
         for (int i = 0; i < 8; i++) {
@@ -418,18 +432,27 @@ uint64_t GGUFFile::load_tensor_fp16(const std::string& name, half* gpu_dst) cons
     if (!t) return 0;
 
     FILE* f = fopen(path_.c_str(), "rb");
-    if (!f) return 0;
+    if (!f) {
+        fprintf(stderr, "GGUF: cannot reopen %s\n", path_.c_str());
+        return 0;
+    }
 
     // Seek to tensor data
-    fseek(f, tensor_data_offset_ + t->offset, SEEK_SET);
-
-    // Read raw data
-    std::vector<uint8_t> raw(t->data_size);
-    if (fread(raw.data(), 1, t->data_size, f) != t->data_size) {
+    if (fseek(f, tensor_data_offset_ + t->offset, SEEK_SET) != 0) {
+        fprintf(stderr, "GGUF: seek failed for '%s'\n", name.c_str());
         fclose(f);
         return 0;
     }
+
+    // Read raw data
+    std::vector<uint8_t> raw(t->data_size);
+    size_t n_read = fread(raw.data(), 1, t->data_size, f);
     fclose(f);
+    if (n_read != t->data_size) {
+        fprintf(stderr, "GGUF: truncated read for '%s' (expected %zu, got %zu)\n",
+                name.c_str(), (size_t)t->data_size, n_read);
+        return 0;
+    }
 
     // Dequantize to fp16 on CPU
     std::vector<half> fp16(t->n_elements);
@@ -465,8 +488,238 @@ uint64_t GGUFFile::load_tensor_fp16(const std::string& name, half* gpu_dst) cons
             return 0;
     }
 
-    // Upload to GPU
-    cudaMemcpy(gpu_dst, fp16.data(), t->n_elements * sizeof(half), cudaMemcpyHostToDevice);
+    // Upload to GPU with error checking
+    cudaError_t err = cudaMemcpy(gpu_dst, fp16.data(), t->n_elements * sizeof(half), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GGUF: cudaMemcpy failed for '%s': %s\n", name.c_str(), cudaGetErrorString(err));
+        return 0;
+    }
 
     return t->n_elements;
+}
+
+// ── Load quantized tensor and convert to Q4L format on GPU ──
+// This keeps the base model quantized for QLoRA training.
+// Q4L format: packed uint8 data (nibble = value - 8) + per-64-element absmax scale.
+uint64_t GGUFFile::load_tensor_q4l(const std::string& name, uint8_t* q4l_data, float* absmax, uint64_t max_elements) const {
+    const GGUFTensorInfo* t = find_tensor(name);
+    if (!t) return 0;
+
+    FILE* f = fopen(path_.c_str(), "rb");
+    if (!f) {
+        fprintf(stderr, "GGUF: cannot reopen %s\n", path_.c_str());
+        return 0;
+    }
+
+    if (fseek(f, tensor_data_offset_ + t->offset, SEEK_SET) != 0) {
+        fprintf(stderr, "GGUF: seek failed for '%s'\n", name.c_str());
+        fclose(f);
+        return 0;
+    }
+
+    std::vector<uint8_t> raw(t->data_size);
+    size_t n_read = fread(raw.data(), 1, t->data_size, f);
+    fclose(f);
+    if (n_read != t->data_size) {
+        fprintf(stderr, "GGUF: truncated read for '%s'\n", name.c_str());
+        return 0;
+    }
+
+    uint64_t n = t->n_elements;
+    if (n > max_elements) {
+        fprintf(stderr, "GGUF: tensor '%s' has %lu elements, max is %lu\n", name.c_str(), (unsigned long)n, (unsigned long)max_elements);
+        return 0;
+    }
+
+    // Q4L requires block_size=64. GGML types use block_size=32 (Q4_0, Q8_0) or 256 (Q4_K, Q6_K).
+    // Strategy: dequant to fp32 on CPU, then re-quantize to Q4L on CPU, then upload.
+    // This is a one-time cost during model load.
+    std::vector<float> fp32(n);
+
+    switch (t->type) {
+        case GGML_TYPE_F16: {
+            const uint16_t* src = (const uint16_t*)raw.data();
+            for (uint64_t i = 0; i < n; i++) {
+                uint16_t h = src[i];
+                // Fast fp16 -> fp32
+                uint32_t sign = (h >> 15) & 1;
+                int32_t exp = ((h >> 10) & 0x1F) - 15;
+                int32_t mant = h & 0x3FF;
+                float v = (mant / 1024.0f + 1.0f) * (1 << exp) * (sign ? -1.0f : 1.0f);
+                if (exp == -15) v = (mant / 1024.0f) * (1.0f / 32768.0f) * (sign ? -1.0f : 1.0f);
+                fp32[i] = v;
+            }
+            break;
+        }
+        case GGML_TYPE_F32:
+            memcpy(fp32.data(), raw.data(), n * sizeof(float));
+            break;
+        case GGML_TYPE_BF16: {
+            const uint16_t* src = (const uint16_t*)raw.data();
+            for (uint64_t i = 0; i < n; i++) {
+                uint32_t bf = (uint32_t)src[i] << 16;
+                fp32[i] = *(float*)&bf;
+            }
+            break;
+        }
+        case GGML_TYPE_Q4_0: {
+            // Block size 32: fp16 scale + 16 bytes packed nibbles
+            const size_t block_bytes = 18;
+            uint64_t n_blocks = n / 32;
+            for (uint64_t b = 0; b < n_blocks; b++) {
+                const uint8_t* blk = raw.data() + b * block_bytes;
+                uint16_t d_bits;
+                memcpy(&d_bits, blk, 2);
+                float d = __half2float(*(half*)&d_bits);
+                for (int i = 0; i < 16; i++) {
+                    uint8_t byte = blk[2 + i];
+                    fp32[b * 32 + i]      = ((int8_t)(byte & 0x0F) - 8) * d;
+                    fp32[b * 32 + i + 16] = ((int8_t)(byte >> 4) - 8) * d;
+                }
+            }
+            break;
+        }
+        case GGML_TYPE_Q4_K: {
+            const size_t block_bytes = 144;
+            uint64_t n_blocks = n / 256;
+            for (uint64_t b = 0; b < n_blocks; b++) {
+                const uint8_t* block = raw.data() + b * block_bytes;
+                uint16_t d_bits, dmin_bits;
+                memcpy(&d_bits, block, 2);
+                memcpy(&dmin_bits, block + 2, 2);
+                float d = __half2float(*(half*)&d_bits);
+                float dmin = __half2float(*(half*)&dmin_bits);
+                const uint8_t* scales = block + 4;
+                const uint8_t* qs = block + 16;
+                float sc[8], mn[8];
+                sc[0] = d * (scales[0] & 0x3F);
+                sc[1] = d * (((scales[1] & 0x0F) << 2) | (scales[0] >> 6));
+                sc[2] = d * (((scales[2] & 0x03) << 4) | (scales[1] >> 4));
+                sc[3] = d * (scales[2] >> 2);
+                sc[4] = d * (scales[3] & 0x3F);
+                sc[5] = d * (((scales[4] & 0x0F) << 2) | (scales[3] >> 6));
+                sc[6] = d * (((scales[5] & 0x03) << 4) | (scales[4] >> 4));
+                sc[7] = d * (scales[5] >> 2);
+                mn[0] = dmin * (scales[6] & 0x3F);
+                mn[1] = dmin * (((scales[7] & 0x0F) << 2) | (scales[6] >> 6));
+                mn[2] = dmin * (((scales[8] & 0x03) << 4) | (scales[7] >> 4));
+                mn[3] = dmin * (scales[8] >> 2);
+                mn[4] = dmin * (scales[9] & 0x3F);
+                mn[5] = dmin * (((scales[10] & 0x0F) << 2) | (scales[9] >> 6));
+                mn[6] = dmin * (((scales[11] & 0x03) << 4) | (scales[10] >> 4));
+                mn[7] = dmin * (scales[11] >> 2);
+                for (int i = 0; i < 8; i++) {
+                    for (int j = 0; j < 16; j++) {
+                        uint8_t byte = qs[i * 16 + j];
+                        fp32[b * 256 + i * 32 + j]      = (byte & 0x0F) * sc[i] - mn[i];
+                        fp32[b * 256 + i * 32 + j + 16] = (byte >> 4) * sc[i] - mn[i];
+                    }
+                }
+            }
+            break;
+        }
+        case GGML_TYPE_Q8_0: {
+            const size_t block_bytes = 34;
+            uint64_t n_blocks = n / 32;
+            for (uint64_t b = 0; b < n_blocks; b++) {
+                const uint8_t* blk = raw.data() + b * block_bytes;
+                uint16_t d_bits;
+                memcpy(&d_bits, blk, 2);
+                float d = __half2float(*(half*)&d_bits);
+                for (int i = 0; i < 32; i++) {
+                    fp32[b * 32 + i] = ((int8_t)blk[2 + i]) * d;
+                }
+            }
+            break;
+        }
+        case GGML_TYPE_Q6_K: {
+            const size_t block_bytes = 210;
+            uint64_t n_blocks = n / 256;
+            for (uint64_t b = 0; b < n_blocks; b++) {
+                const uint8_t* blk = raw.data() + b * block_bytes;
+                const uint8_t* ql = blk;
+                const uint8_t* qh = blk + 128;
+                const int8_t* scales = (const int8_t*)(blk + 192);
+                uint16_t d_bits;
+                memcpy(&d_bits, blk + 208, 2);
+                float d = __half2float(*(half*)&d_bits);
+                for (int i = 0; i < 16; i++) {
+                    for (int j = 0; j < 16; j++) {
+                        int idx = i * 16 + j;
+                        int ql_val = ql[idx];
+                        int qh_bits = (qh[i * 2 + (j / 8)] >> ((j % 8) * 2)) & 0x03;
+                        int q = (ql_val & 0x0F) | (qh_bits << 4);
+                        fp32[b * 256 + i * 16 + j] = (q - 32) * scales[i] * d;
+                    }
+                }
+            }
+            break;
+        }
+        default:
+            fprintf(stderr, "GGUF: unsupported type %d for Q4L conversion of '%s'\n", (int)t->type, name.c_str());
+            return 0;
+    }
+
+    // Re-quantize fp32 -> Q4L format with dp4a-friendly packing (block_size=64)
+    //
+    // dp4a packing: for each group of 8 elements [e0..e7]:
+    //   byte[0] = e0 | (e4 << 4)
+    //   byte[1] = e1 | (e5 << 4)
+    //   byte[2] = e2 | (e6 << 4)
+    //   byte[3] = e3 | (e7 << 4)
+    //
+    // dp4a extraction:
+    //   (packed >> 0) & 0x0F0F0F0F = [e0, e1, e2, e3]
+    //   (packed >> 4) & 0x0F0F0F0F = [e4, e5, e6, e7]
+    int block_size = 64;
+    int n_blocks = (n + block_size - 1) / block_size;
+
+    std::vector<uint8_t> q4l_packed(n_blocks * block_size / 2);  // 4 bits per element
+    std::vector<float> q4l_absmax(n_blocks);
+
+    for (int b = 0; b < n_blocks; b++) {
+        int base = b * block_size;
+        // Find absmax for this block
+        float amax = 0.0f;
+        for (int i = 0; i < block_size && base + i < (int)n; i++) {
+            float v = fabsf(fp32[base + i]);
+            if (v > amax) amax = v;
+        }
+        if (amax < 1e-10f) amax = 1e-10f;
+        q4l_absmax[b] = amax / 7.5f;  // scale = absmax / 7.5 (matches convert_weights.py)
+
+        float inv_scale = 7.5f / amax;
+        // Quantize to nibbles
+        uint8_t nibbles[64] = {};
+        for (int i = 0; i < block_size && base + i < (int)n; i++) {
+            int q = (int)roundf(fp32[base + i] * inv_scale + 8.0f);
+            nibbles[i] = (uint8_t)std::max(0, std::min(15, q));
+        }
+        // dp4a-friendly interleave: groups of 8
+        uint8_t* dst = q4l_packed.data() + b * (block_size / 2);
+        for (int g = 0; g < block_size / 8; g++) {
+            uint8_t* grp = nibbles + g * 8;
+            dst[g * 4 + 0] = grp[0] | (grp[4] << 4);
+            dst[g * 4 + 1] = grp[1] | (grp[5] << 4);
+            dst[g * 4 + 2] = grp[2] | (grp[6] << 4);
+            dst[g * 4 + 3] = grp[3] | (grp[7] << 4);
+        }
+    }
+
+    // Upload to GPU
+    size_t data_bytes = (size_t)n_blocks * block_size / 2;
+    size_t scale_bytes = (size_t)n_blocks * sizeof(float);
+    cudaError_t err;
+    err = cudaMemcpy(q4l_data, q4l_packed.data(), data_bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GGUF: cudaMemcpy failed for q4l_data '%s': %s\n", name.c_str(), cudaGetErrorString(err));
+        return 0;
+    }
+    err = cudaMemcpy(absmax, q4l_absmax.data(), scale_bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GGUF: cudaMemcpy failed for absmax '%s': %s\n", name.c_str(), cudaGetErrorString(err));
+        return 0;
+    }
+
+    return n;
 }

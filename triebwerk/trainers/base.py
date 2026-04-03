@@ -162,17 +162,28 @@ class BaseTrainer(ABC):
             quantization_config=bnb_config,
             device_map="auto",
             torch_dtype=torch.float16,
+            trust_remote_code=True,
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name, trust_remote_code=True,
+        )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         cast_model_to_fp16(self.model)
 
-        # LoRA
+        # LoRA: base targets + SSM projections for hybrid models
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                          "gate_proj", "up_proj", "down_proj"]
+
+        # Detect hybrid SSM model by checking for linear_attn modules
+        has_ssm = any("linear_attn" in n for n, _ in self.model.named_modules())
+        if has_ssm:
+            target_modules += ["in_proj_qkv", "in_proj_z", "out_proj"]
+            print(f"  Hybrid model: adding SSM LoRA targets")
+
         lora_config = LoraConfig(
             r=self.lora_rank, lora_alpha=self.lora_rank,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                             "gate_proj", "up_proj", "down_proj"],
+            target_modules=target_modules,
             lora_dropout=0.0, bias="none", task_type="CAUSAL_LM",
         )
         self.model = get_peft_model(self.model, lora_config)
@@ -188,29 +199,30 @@ class BaseTrainer(ABC):
         return trainable, total
 
     def _connect_engine(self, args):
-        """Connect engine to PyTorch model (share embedding, init syncer)."""
+        """Connect engine to PyTorch model (share weights, init syncer)."""
         if self.engine is None:
             return
 
-        # Share embedding (engine uses PyTorch's tensor, saves ~300MB)
-        embed_weight = self.model.base_model.model.model.embed_tokens.weight
-        if embed_weight.dtype == torch.float16 and embed_weight.is_cuda:
-            self.engine.share_embedding(embed_weight.data_ptr())
+        # Share bnb NF4 weights → engine uses PyTorch's quantized data directly.
+        # load_weights loaded Q4L from file; share_bnb_weights overrides projections
+        # with bnb NF4 pointers and frees the old Q4L data (~600MB).
+        from triebwerk.engine import share_bnb_weights
+        self._shared_refs = share_bnb_weights(self.engine, self.model)
 
         self.syncer = LoRASyncer(
             self.model, self.engine,
             lora_alpha=self.lora_rank, lora_rank=self.lora_rank,
         )
 
-        # Pre-allocate arena + capture CUDA graph (AFTER share_embedding so pointers are final)
-        dummy_prompt = list(range(200))
+        # Short warmup to trigger alloc_batch
+        dummy_prompt = list(range(10))
         self.engine.generate_batch(
             [dummy_prompt] * args.num_generations,
-            max_new_tokens=args.max_completion_tokens,
+            max_new_tokens=2,
             temperature=self.temperature, top_p=self.top_p,
-            eos_token_id=dummy_prompt[0],
+            eos_token_id=0,
         )
-        print(f"  Arena pre-allocated + CUDA graph captured")
+        print(f"  Engine warmup done")
 
     def train(self, dataset=None, max_steps=300, num_generations=4,
               max_completion_tokens=512, stop_texts=None):
@@ -234,11 +246,11 @@ class BaseTrainer(ABC):
         print_banner(args, run_id)
         print("=" * 60)
 
-        # 2. Load PyTorch model first (on Jetson, CPU=GPU share RAM, so load order matters)
-        trainable, total = self._load_model()
-
-        # 3. Load engine (uses remaining VRAM for Q4L weights + arena)
+        # 2. Load engine first (GGUF/Q4L via cudaMalloc — before PyTorch's pools)
         self._load_engine(args)
+
+        # 3. Load PyTorch model (bnb 4-bit + LoRA for training loss)
+        trainable, total = self._load_model()
 
         # 4. Connect engine to model
         self._connect_engine(args)

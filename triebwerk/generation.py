@@ -3,14 +3,25 @@
 import torch
 
 
+def _apply_template(tokenizer, prompt):
+    """Apply chat template with thinking enabled (Qwen3/3.5 reasoning mode)."""
+    try:
+        return tokenizer.apply_chat_template(
+            prompt, tokenize=False, add_generation_prompt=True,
+            enable_thinking=True,
+        )
+    except TypeError:
+        # Tokenizer doesn't support enable_thinking kwarg
+        return tokenizer.apply_chat_template(
+            prompt, tokenize=False, add_generation_prompt=True,
+        )
+
+
 def generate_with_engine(engine, tokenizer, prompt, num_generations,
                          max_tokens, temperature, top_p, stop_ids):
     """Generate G completions using C++ engine (batched GEMM with tensor cores)."""
     if isinstance(prompt, list):
-        text = tokenizer.apply_chat_template(
-            prompt, tokenize=False, add_generation_prompt=True,
-            enable_thinking=True,
-        )
+        text = _apply_template(tokenizer, prompt)
     else:
         text = prompt
 
@@ -46,10 +57,7 @@ def generate_with_hf(model, tokenizer, prompt, num_generations,
                      max_tokens, temperature, top_p, stop_ids):
     """Generate G completions using HuggingFace generate (for dry-run)."""
     if isinstance(prompt, list):
-        text = tokenizer.apply_chat_template(
-            prompt, tokenize=False, add_generation_prompt=True,
-            enable_thinking=True,
-        )
+        text = _apply_template(tokenizer, prompt)
     else:
         text = prompt
 

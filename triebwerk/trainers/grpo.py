@@ -32,7 +32,7 @@ class GRPOTrainer(BaseTrainer):
         return True
 
     def compute_loss(self, model, optimizer, scaler, samples):
-        """One GRPO/DAPO gradient step (TRL-compatible loss normalization).
+        """One GRPO/DAPO gradient step with batched forward pass.
 
         Uses flat token averaging across all completions, matching TRL's
         GRPOTrainer.compute_loss: loss = sum(token_losses) / total_tokens.
@@ -53,50 +53,67 @@ class GRPOTrainer(BaseTrainer):
         if total_tokens == 0:
             return 0.0
 
-        total_loss_val = 0.0
+        # Build padded batch for single forward pass
+        seqs = [s["prompt_ids"] + s["completion_ids"] for s in valid_samples]
+        max_len = max(len(s) for s in seqs)
+        pad_id = 0
+        padded = []
+        masks = []
+        for s in seqs:
+            pad_len = max_len - len(s)
+            padded.append([pad_id] * pad_len + s)
+            masks.append([0] * pad_len + [1] * len(s))
 
-        for s in valid_samples:
-            p_ids = s["prompt_ids"]
-            c_ids = s["completion_ids"]
+        input_ids = torch.tensor(padded, device=device)
+        attention_mask = torch.tensor(masks, device=device)
+
+        # Single forward pass
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            outputs = model(input_ids, attention_mask=attention_mask)
+            logits = outputs.logits[:, :-1, :]  # (batch, seq_len-1, vocab)
+            targets = input_ids[:, 1:]  # (batch, seq_len-1)
+
+            # Chunked log-softmax to avoid fp32 OOM
+            batch_size = logits.shape[0]
+            new_lp = torch.zeros(batch_size, logits.shape[1], device=device)
+            chunk = 256
+            for ci in range(0, logits.shape[1], chunk):
+                ei = min(ci + chunk, logits.shape[1])
+                lp_c = F.log_softmax(logits[:, ci:ei].float(), dim=-1)
+                new_lp[:, ci:ei] = lp_c.gather(2, targets[:, ci:ei].unsqueeze(2)).squeeze(2)
+                del lp_c
+
+        # Accumulate loss across all samples, then single backward
+        total_loss = torch.tensor(0.0, device=device)
+        total_loss_val = 0.0
+        for i, s in enumerate(valid_samples):
+            p_len = len(s["prompt_ids"])
+            c_len = len(s["completion_ids"])
             old_lp = s["old_logprobs"]
             adv = s["advantage"]
+            seq_len = p_len + c_len
+            pad_len = max_len - seq_len
+            new_comp_lp = new_lp[i, pad_len + p_len - 1 : pad_len + p_len - 1 + c_len]
 
-            full_ids = p_ids + c_ids
-            input_tensor = torch.tensor([full_ids], device=device)
+            if self.loss_type == "grpo":
+                ratio = torch.exp(new_comp_lp - old_lp)
+                surr1 = ratio * adv
+                surr2 = torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon_high) * adv
+                per_token_loss = -torch.min(surr1, surr2)
+            else:  # dapo
+                ratio = torch.exp(new_comp_lp - old_lp)
+                clipped_ratio = torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon_high)
+                per_token_loss = -clipped_ratio * adv
 
-            with torch.amp.autocast("cuda", dtype=torch.float16):
-                outputs = model(input_tensor)
-                logits = outputs.logits[0, :-1, :]
-                targets = input_tensor[0, 1:]
-
-                # Chunked log-softmax to avoid fp32 OOM on (seq_len, vocab_size)
-                new_lp = torch.zeros(logits.shape[0], device=device)
-                chunk = 256
-                for ci in range(0, logits.shape[0], chunk):
-                    ei = min(ci + chunk, logits.shape[0])
-                    lp_c = F.log_softmax(logits[ci:ei].float(), dim=-1)
-                    new_lp[ci:ei] = lp_c.gather(1, targets[ci:ei].unsqueeze(1)).squeeze(1)
-                    del lp_c
-                new_comp_lp = new_lp[len(p_ids) - 1:]
-
-                if self.loss_type == "grpo":
-                    ratio = torch.exp(new_comp_lp - old_lp)
-                    surr1 = ratio * adv
-                    surr2 = torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon_high) * adv
-                    per_token_loss = -torch.min(surr1, surr2)
-                else:  # dapo
-                    ratio = torch.exp(new_comp_lp - old_lp)
-                    clipped_ratio = torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon_high)
-                    per_token_loss = -clipped_ratio * adv
-
-                sample_loss = per_token_loss.sum() / total_tokens
-
-            loss_val = sample_loss.item()
-            if not (math.isnan(loss_val) or math.isinf(loss_val)):
-                scaler.scale(sample_loss).backward()
+            sample_loss = per_token_loss.sum() / total_tokens
+            if not (math.isnan(sample_loss.item()) or math.isinf(sample_loss.item())):
+                total_loss = total_loss + sample_loss
                 total_loss_val += per_token_loss.sum().item()
 
-            del outputs, logits, new_lp, input_tensor, sample_loss, per_token_loss, new_comp_lp
+        if total_loss.item() != 0.0:
+            scaler.scale(total_loss).backward()
+
+        del outputs, logits, new_lp, input_ids, attention_mask, total_loss
 
         if self.empty_cache:
             torch.cuda.empty_cache()

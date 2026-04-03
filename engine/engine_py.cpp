@@ -33,6 +33,10 @@ PYBIND11_MODULE(jetson_engine, m) {
              py::arg("gguf_path"),
              "Load model weights from a single GGUF file (quantized, no conversion needed)")
 
+        .def("load_config", &InferenceEngine::load_config,
+             py::arg("config_path"),
+             "Load model config + allocate buffers (no weights). Use with share_weight() to share PyTorch weights.")
+
         .def("load_lora", &InferenceEngine::load_lora,
              py::arg("lora_dir"), py::arg("scale") = 1.0f,
              "Load LoRA adapter weights")
@@ -51,6 +55,20 @@ PYBIND11_MODULE(jetson_engine, m) {
              },
              py::arg("layer"), py::arg("name"), py::arg("data_ptr"),
              "Share a dequantized weight from PyTorch (pass tensor.data_ptr())")
+
+        .def("share_weight_nf4", [](InferenceEngine& self, int layer, const std::string& name,
+                                     size_t data_ptr, size_t absmax_ptr, size_t quant_map_ptr,
+                                     int out_dim, int in_dim) {
+                 self.share_weight_nf4(layer, name.c_str(),
+                     reinterpret_cast<uint8_t*>(data_ptr),
+                     reinterpret_cast<float*>(absmax_ptr),
+                     reinterpret_cast<float*>(quant_map_ptr),
+                     out_dim, in_dim);
+             },
+             py::arg("layer"), py::arg("name"),
+             py::arg("data_ptr"), py::arg("absmax_ptr"), py::arg("quant_map_ptr"),
+             py::arg("out_dim"), py::arg("in_dim"),
+             "Share NF4 quantized weight from bnb (zero-copy, pass data_ptr() for each component)")
 
         .def("cache_weights", &InferenceEngine::cache_weights,
              "Pre-dequant Q4L weights to fp16 for fast batched GEMM")

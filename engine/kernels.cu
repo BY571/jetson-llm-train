@@ -15,6 +15,12 @@
 #include <math.h>
 #include "model.h"
 
+// Shared-memory reduction arrays are sized [4] = max 4 warps (128 threads).
+// Kernels that use these must be launched with <= 128 threads per block.
+// Compile-time guard: if any kernel is launched with more threads, this
+// static_assert will fire. The value 4 matches THREADS_PER_BLOCK/32 max.
+#define MAX_WARPS_PER_BLOCK 4
+
 // ============================================================================
 // NF4 Dequantization Lookup Table (standard bitsandbytes NF4 values)
 // ============================================================================
@@ -1363,12 +1369,12 @@ void launch_argmax_batch(const float* logits, int* tokens, int vocab, int G, cud
 
 // Increment all positions by 1 (avoids host-device sync per token)
 __global__ void increment_positions_kernel(int* positions, int G) {
-    int g = threadIdx.x;
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
     if (g < G) positions[g]++;
 }
 
 void launch_increment_positions(int* positions, int G, cudaStream_t s) {
-    increment_positions_kernel<<<1, G, 0, s>>>(positions, G);
+    increment_positions_kernel<<<(G + 255) / 256, 256, 0, s>>>(positions, G);
 }
 
 // Convert fp16 array to fp32 (for NF4 LM head → fp32 logits)

@@ -333,8 +333,13 @@ struct BatchState {
     float* ssm_chunk_output;          // (H, T_padded, D) — chunked output
     float* ssm_chunk_workspace;       // (H, ws_per_head) — per-chunk scratch
 
-    // Q4L dequant scratch (largest projection = INTERMEDIATE_SIZE * HIDDEN_SIZE)
+    // Q4L dequant scratch (largest projection, for prefill path only)
     half* dequant_scratch;
+
+    // dp4a input quantization buffers (for batched Q4L dp4a GEMV, decode path)
+    int8_t* q8_data;        // (max_input_dim,) quantized input for one sequence
+    float* q8_scales;       // (max_input_dim/64,) per-block scale
+    float* q8_sums;         // (max_input_dim/64,) per-block sum
 
     // LoRA scratch for batched A @ x intermediate (max_rank * G)
     half* lora_scratch;
@@ -391,6 +396,9 @@ public:
     // Pass the raw GPU pointer from model.embed_tokens.weight.data_ptr()
     void share_embedding(void* external_embed_ptr);
     void share_weight(int layer, const char* name, half* ptr);
+    void share_weight_nf4(int layer, const char* name,
+                          uint8_t* data, float* absmax, float* quant_map,
+                          int out_dim, int in_dim);
     void load_config(const std::string& config_path);
     void load_weights_gguf(const std::string& gguf_path);
     bool embed_is_external_ = false;

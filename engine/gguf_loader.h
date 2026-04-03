@@ -1,20 +1,25 @@
 /**
  * GGUF file format loader for the inference engine.
  *
- * Reads quantized weights from GGUF files (llama.cpp format),
- * dequantizes to fp16 on GPU, and populates engine weight structures.
+ * Reads quantized weights from GGUF files (llama.cpp format).
+ * Two loading modes:
+ *   1. load_tensor_fp16() — dequantizes to fp16 (for inference)
+ *   2. load_tensor_q4l()  — converts to Q4L format, keeping weights quantized (for QLoRA training)
  *
  * Supported quantization types:
- *   - F16:    no dequant needed
- *   - F32:    cast to fp16
- *   - Q4_0:   4-bit with one scale per 32-element block
- *   - Q4_K_M: 4-bit K-quants with min/scale per super-block
- *   - Q8_0:   8-bit with one scale per 32-element block
- *   - Q6_K:   6-bit K-quants
+ *   - F16, F32, BF16: converted to target format
+ *   - Q4_0, Q8_0: 4-bit/8-bit with per-block scale
+ *   - Q4_K, Q5_K, Q6_K: K-quants with per-super-block scales
  *
  * Usage:
- *   GGUFFile gguf("model.gguf");
- *   half* tensor = gguf.load_tensor_fp16("blk.0.attn_q.weight", gpu_ptr);
+ *   GGUFFile gguf;
+ *   gguf.open("model.gguf");
+ *
+ *   // For QLoRA training (keeps base model quantized):
+ *   gguf.load_tensor_q4l("blk.0.attn_q.weight", q4l_data, absmax, max_elements);
+ *
+ *   // For inference (dequantizes to fp16):
+ *   gguf.load_tensor_fp16("blk.0.attn_q.weight", gpu_ptr);
  */
 #pragma once
 
@@ -142,6 +147,12 @@ public:
     // Caller provides GPU destination pointer (must be pre-allocated: n_elements * sizeof(half))
     // Returns number of elements, or 0 on failure
     uint64_t load_tensor_fp16(const std::string& name, half* gpu_dst) const;
+
+    // Load a quantized tensor and convert to Q4L format on GPU.
+    // This keeps the base model quantized for QLoRA training.
+    // Caller provides GPU destination pointers for Q4L data and absmax scales.
+    // Returns number of elements, or 0 on failure.
+    uint64_t load_tensor_q4l(const std::string& name, uint8_t* q4l_data, float* absmax, uint64_t max_elements) const;
 
     // Get all tensor names
     const std::vector<GGUFTensorInfo>& tensors() const { return tensors_; }

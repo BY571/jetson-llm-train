@@ -24,6 +24,10 @@ class LoRASyncer:
             "mlp.gate_proj": "gate_proj",
             "mlp.up_proj": "up_proj",
             "mlp.down_proj": "down_proj",
+            # SSM (Gated Delta Rule) projections — Qwen3.5 hybrid
+            "linear_attn.in_proj_qkv": "ssm_qkv",
+            "linear_attn.in_proj_z": "ssm_z",
+            "linear_attn.out_proj": "ssm_out",
         }
 
         params = dict(model.named_parameters())

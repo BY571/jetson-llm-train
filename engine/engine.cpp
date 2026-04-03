@@ -104,6 +104,7 @@ inline void cudaMallocChecked(T** ptr, size_t size) {
 extern "C" {
     void launch_fp16_gemv(const half* weight, const half* input, half* output, int out_dim, int in_dim, cudaStream_t stream);
     void launch_nf4_gemv_fast(const uint8_t* packed, const float* absmax, const half* input, half* output, int out_dim, int in_dim, int block_size, cudaStream_t stream);
+    void launch_nf4_dp4a_gemv(const uint8_t* w, const float* absmax, const int8_t* q8, const float* q8_sc, const float* q8_sm, half* y, int out_dim, int in_dim, cudaStream_t stream);
     void launch_nf4_fused_2(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const half* input, int in_dim, cudaStream_t stream);
     void launch_q4l_fused_2(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const half* input, int in_dim, cudaStream_t stream);
     void launch_nf4_fused_3(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const uint8_t* c_w, const float* c_abs, half* c_out, int c_dim, const half* input, int in_dim, cudaStream_t stream);
@@ -257,16 +258,17 @@ ModelConfig ModelConfig::from_json(const std::string& path) {
     return c;
 }
 
-// Dispatch macros: use dp4a for Q4L, fallback to fp32 FMA for NF4
+// Dispatch macros: per-weight format detection (quant_map != null → NF4 dp4a, null → Q4L dp4a)
+// Both use dp4a int8 dot products. NF4 adds a 16-entry shared memory lookup.
 #define GEMV_4BIT(w, in, out, stream) \
-    do { if (weights_.is_q4l) launch_q4l_dp4a_gemv((w).data, (w).absmax, state_.q8_data, state_.q8_scales, state_.q8_sums, (out), (w).out_dim, (w).in_dim, (stream)); \
-         else launch_nf4_gemv_fast((w).data, (w).absmax, (in), (out), (w).out_dim, (w).in_dim, (w).block_size, (stream)); } while(0)
+    do { if ((w).quant_map) launch_nf4_dp4a_gemv((w).data, (w).absmax, state_.q8_data, state_.q8_scales, state_.q8_sums, (out), (w).out_dim, (w).in_dim, (stream)); \
+         else launch_q4l_dp4a_gemv((w).data, (w).absmax, state_.q8_data, state_.q8_scales, state_.q8_sums, (out), (w).out_dim, (w).in_dim, (stream)); } while(0)
 #define FUSED2_4BIT(aw, ay, bw, by, x, id, stream) \
-    do { if (weights_.is_q4l) launch_q4l_fused_2((aw).data, (aw).absmax, (ay), (aw).out_dim, (bw).data, (bw).absmax, (by), (bw).out_dim, (x), (id), (stream)); \
-         else launch_nf4_fused_2((aw).data, (aw).absmax, (ay), (aw).out_dim, (bw).data, (bw).absmax, (by), (bw).out_dim, (x), (id), (stream)); } while(0)
+    do { if ((aw).quant_map) launch_nf4_fused_2((aw).data, (aw).absmax, (ay), (aw).out_dim, (bw).data, (bw).absmax, (by), (bw).out_dim, (x), (id), (stream)); \
+         else launch_q4l_fused_2((aw).data, (aw).absmax, (ay), (aw).out_dim, (bw).data, (bw).absmax, (by), (bw).out_dim, (x), (id), (stream)); } while(0)
 #define FUSED3_4BIT(aw, ay, bw, by, cw, cy, x, id, stream) \
-    do { if (weights_.is_q4l) launch_q4l_fused_3((aw).data, (aw).absmax, (ay), (aw).out_dim, (bw).data, (bw).absmax, (by), (bw).out_dim, (cw).data, (cw).absmax, (cy), (cw).out_dim, (x), (id), (stream)); \
-         else launch_nf4_fused_3((aw).data, (aw).absmax, (ay), (aw).out_dim, (bw).data, (bw).absmax, (by), (bw).out_dim, (cw).data, (cw).absmax, (cy), (cw).out_dim, (x), (id), (stream)); } while(0)
+    do { if ((aw).quant_map) launch_nf4_fused_3((aw).data, (aw).absmax, (ay), (aw).out_dim, (bw).data, (bw).absmax, (by), (bw).out_dim, (cw).data, (cw).absmax, (cy), (cw).out_dim, (x), (id), (stream)); \
+         else launch_q4l_fused_3((aw).data, (aw).absmax, (ay), (aw).out_dim, (bw).data, (bw).absmax, (by), (bw).out_dim, (cw).data, (cw).absmax, (cy), (cw).out_dim, (x), (id), (stream)); } while(0)
 
 // Runtime config aliases — these macros replace the old compile-time qwen3:: namespace.
 // They expand to config_ member access, so they work in all InferenceEngine methods.
@@ -403,6 +405,97 @@ void InferenceEngine::allocate_buffers() {
 }
 
 InferenceEngine::~InferenceEngine() {
+    // Free LoRA adapters (GPU memory + host struct)
+    auto free_lora = [](LoRAAdapter*& lora) {
+        if (lora) {
+            if (lora->A) cudaFree(lora->A);
+            if (lora->B) cudaFree(lora->B);
+            delete lora;
+            lora = nullptr;
+        }
+    };
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        auto& L = weights_.layers[i];
+        free_lora(L.lora_q); free_lora(L.lora_k); free_lora(L.lora_v);
+        free_lora(L.lora_o); free_lora(L.lora_gate); free_lora(L.lora_up);
+        free_lora(L.lora_down); free_lora(L.lora_ssm_qkv);
+        free_lora(L.lora_ssm_z); free_lora(L.lora_ssm_out);
+
+        // Free fp16 weights
+        if (!embed_is_external_) {
+            if (L.q_proj_fp16) cudaFree(L.q_proj_fp16);
+            if (L.k_proj_fp16) cudaFree(L.k_proj_fp16);
+            if (L.v_proj_fp16) cudaFree(L.v_proj_fp16);
+            if (L.o_proj_fp16) cudaFree(L.o_proj_fp16);
+        }
+        if (L.gate_proj_fp16) cudaFree(L.gate_proj_fp16);
+        if (L.up_proj_fp16) cudaFree(L.up_proj_fp16);
+        if (L.down_proj_fp16) cudaFree(L.down_proj_fp16);
+        if (L.input_layernorm) cudaFree(L.input_layernorm);
+        if (L.post_attn_layernorm) cudaFree(L.post_attn_layernorm);
+        if (L.q_norm) cudaFree(L.q_norm);
+        if (L.k_norm) cudaFree(L.k_norm);
+
+        // Free NF4/Q4L weights
+        if (L.q_proj_nf4.data) cudaFree(L.q_proj_nf4.data);
+        if (L.q_proj_nf4.absmax) cudaFree(L.q_proj_nf4.absmax);
+        if (L.q_proj_nf4.quant_map) cudaFree(L.q_proj_nf4.quant_map);
+        if (L.q_proj_nf4.fp16_cache) cudaFree(L.q_proj_nf4.fp16_cache);
+        if (L.k_proj_nf4.data) cudaFree(L.k_proj_nf4.data);
+        if (L.k_proj_nf4.absmax) cudaFree(L.k_proj_nf4.absmax);
+        if (L.k_proj_nf4.quant_map) cudaFree(L.k_proj_nf4.quant_map);
+        if (L.k_proj_nf4.fp16_cache) cudaFree(L.k_proj_nf4.fp16_cache);
+        if (L.v_proj_nf4.data) cudaFree(L.v_proj_nf4.data);
+        if (L.v_proj_nf4.absmax) cudaFree(L.v_proj_nf4.absmax);
+        if (L.v_proj_nf4.quant_map) cudaFree(L.v_proj_nf4.quant_map);
+        if (L.v_proj_nf4.fp16_cache) cudaFree(L.v_proj_nf4.fp16_cache);
+        if (L.o_proj_nf4.data) cudaFree(L.o_proj_nf4.data);
+        if (L.o_proj_nf4.absmax) cudaFree(L.o_proj_nf4.absmax);
+        if (L.o_proj_nf4.quant_map) cudaFree(L.o_proj_nf4.quant_map);
+        if (L.o_proj_nf4.fp16_cache) cudaFree(L.o_proj_nf4.fp16_cache);
+        if (L.gate_proj_nf4.data) cudaFree(L.gate_proj_nf4.data);
+        if (L.gate_proj_nf4.absmax) cudaFree(L.gate_proj_nf4.absmax);
+        if (L.gate_proj_nf4.quant_map) cudaFree(L.gate_proj_nf4.quant_map);
+        if (L.gate_proj_nf4.fp16_cache) cudaFree(L.gate_proj_nf4.fp16_cache);
+        if (L.up_proj_nf4.data) cudaFree(L.up_proj_nf4.data);
+        if (L.up_proj_nf4.absmax) cudaFree(L.up_proj_nf4.absmax);
+        if (L.up_proj_nf4.quant_map) cudaFree(L.up_proj_nf4.quant_map);
+        if (L.up_proj_nf4.fp16_cache) cudaFree(L.up_proj_nf4.fp16_cache);
+        if (L.down_proj_nf4.data) cudaFree(L.down_proj_nf4.data);
+        if (L.down_proj_nf4.absmax) cudaFree(L.down_proj_nf4.absmax);
+        if (L.down_proj_nf4.quant_map) cudaFree(L.down_proj_nf4.quant_map);
+        if (L.down_proj_nf4.fp16_cache) cudaFree(L.down_proj_nf4.fp16_cache);
+
+        // Free SSM weights
+        if (L.ssm_in_proj_qkv_fp16) cudaFree(L.ssm_in_proj_qkv_fp16);
+        if (L.ssm_in_proj_qkv_nf4.data) cudaFree(L.ssm_in_proj_qkv_nf4.data);
+        if (L.ssm_in_proj_qkv_nf4.absmax) cudaFree(L.ssm_in_proj_qkv_nf4.absmax);
+        if (L.ssm_in_proj_qkv_nf4.quant_map) cudaFree(L.ssm_in_proj_qkv_nf4.quant_map);
+        if (L.ssm_in_proj_qkv_nf4.fp16_cache) cudaFree(L.ssm_in_proj_qkv_nf4.fp16_cache);
+        if (L.ssm_in_proj_z_fp16) cudaFree(L.ssm_in_proj_z_fp16);
+        if (L.ssm_in_proj_z_nf4.data) cudaFree(L.ssm_in_proj_z_nf4.data);
+        if (L.ssm_in_proj_z_nf4.absmax) cudaFree(L.ssm_in_proj_z_nf4.absmax);
+        if (L.ssm_in_proj_z_nf4.quant_map) cudaFree(L.ssm_in_proj_z_nf4.quant_map);
+        if (L.ssm_in_proj_z_nf4.fp16_cache) cudaFree(L.ssm_in_proj_z_nf4.fp16_cache);
+        if (L.ssm_out_proj_fp16) cudaFree(L.ssm_out_proj_fp16);
+        if (L.ssm_out_proj_nf4.data) cudaFree(L.ssm_out_proj_nf4.data);
+        if (L.ssm_out_proj_nf4.absmax) cudaFree(L.ssm_out_proj_nf4.absmax);
+        if (L.ssm_out_proj_nf4.quant_map) cudaFree(L.ssm_out_proj_nf4.quant_map);
+        if (L.ssm_out_proj_nf4.fp16_cache) cudaFree(L.ssm_out_proj_nf4.fp16_cache);
+        if (L.ssm_in_proj_a_fp16) cudaFree(L.ssm_in_proj_a_fp16);
+        if (L.ssm_in_proj_b_fp16) cudaFree(L.ssm_in_proj_b_fp16);
+        if (L.ssm_conv1d_weight) cudaFree(L.ssm_conv1d_weight);
+        if (L.ssm_conv1d_bias) cudaFree(L.ssm_conv1d_bias);
+        if (L.ssm_A_log) cudaFree(L.ssm_A_log);
+        if (L.ssm_dt_bias) cudaFree(L.ssm_dt_bias);
+        if (L.ssm_norm_weight) cudaFree(L.ssm_norm_weight);
+    }
+
+    // Free embedding and final norm (only if not externally shared)
+    if (weights_.embed_tokens && !embed_is_external_) cudaFree(weights_.embed_tokens);
+    if (weights_.final_layernorm) cudaFree(weights_.final_layernorm);
+
+    // Free KV caches and state buffers
     for (int i = 0; i < NUM_LAYERS; i++) {
         cudaFree(state_.kv_cache[i].key);
         cudaFree(state_.kv_cache[i].value);
@@ -440,11 +533,14 @@ InferenceEngine::~InferenceEngine() {
         delete[] batch_->h_positions; delete[] batch_->h_tokens;
         delete[] batch_->h_finished; delete[] batch_->h_randoms;
         delete batch_;
+        batch_ = nullptr;
     }
-    if (batch_arena_.base) cudaFree(batch_arena_.base);
+    if (batch_arena_.base && !embed_is_external_) cudaFree(batch_arena_.base);
     if (decode_graph_exec_) cudaGraphExecDestroy(decode_graph_exec_);
     if (decode_graph_) cudaGraphDestroy(decode_graph_);
     if (engine_stream_) cudaStreamDestroy(engine_stream_);
+    if (cublas_handle) { cublasDestroy(cublas_handle); cublas_handle = nullptr; }
+    if (cublas_workspace) { cudaFree(cublas_workspace); cublas_workspace = nullptr; }
 }
 
 // ============================================================================
@@ -555,8 +651,8 @@ void InferenceEngine::load_weights_gguf(const std::string& gguf_path) {
     // Allocate buffers now that config is known
     allocate_buffers();
 
-    // Helper: allocate GPU memory and load a GGUF tensor into it
-    auto load = [&](const std::string& name) -> half* {
+    // Helper: load small tensor (norms, biases) as fp16
+    auto load_fp16 = [&](const std::string& name) -> half* {
         auto* t = gguf.find_tensor(name);
         if (!t) return nullptr;
         half* ptr;
@@ -565,17 +661,33 @@ void InferenceEngine::load_weights_gguf(const std::string& gguf_path) {
         return ptr;
     };
 
-    // Helper: load and transpose a 2D tensor (GGUF stores [cols, rows], we need [rows, cols])
-    auto load_transposed = [&](const std::string& name) -> half* {
+    // Helper: load projection as Q4L (quantized, dp4a-ready)
+    auto load_q4l = [&](const std::string& name, int out_dim, int in_dim) -> NF4Weight {
+        NF4Weight w = {};
         auto* t = gguf.find_tensor(name);
-        if (!t || t->n_dims < 2) return load(name);
-        int rows = t->dims[1];  // outer dim = rows in target
-        int cols = t->dims[0];  // inner dim = cols in target
-        // Load to temp
+        if (!t) return w;
+        w.out_dim = out_dim;
+        w.in_dim = in_dim;
+        w.block_size = 64;
+        w.n_blocks = ((size_t)out_dim * in_dim + 63) / 64;
+        size_t data_bytes = (size_t)w.n_blocks * 64 / 2;
+        size_t scale_bytes = (size_t)w.n_blocks * sizeof(float);
+        cudaMalloc(&w.data, data_bytes);
+        cudaMalloc(&w.absmax, scale_bytes);
+        w.quant_map = nullptr;  // Q4L has no lookup table
+        w.fp16_cache = nullptr;
+        gguf.load_tensor_q4l(name, w.data, w.absmax, (uint64_t)out_dim * in_dim);
+        return w;
+    };
+
+    // Helper: load and transpose embedding (GGUF [hidden, vocab] → engine [vocab, hidden])
+    auto load_embed = [&](const std::string& name) -> half* {
+        auto* t = gguf.find_tensor(name);
+        if (!t || t->n_dims < 2) return load_fp16(name);
+        int rows = t->dims[1], cols = t->dims[0];
         half* tmp;
         cudaMalloc(&tmp, t->n_elements * sizeof(half));
         gguf.load_tensor_fp16(name, tmp);
-        // Transpose on CPU (embedding is accessed by lookup, not GEMM)
         std::vector<half> h_src(t->n_elements), h_dst(t->n_elements);
         cudaMemcpy(h_src.data(), tmp, t->n_elements * sizeof(half), cudaMemcpyDeviceToHost);
         for (int r = 0; r < rows; r++)
@@ -585,86 +697,113 @@ void InferenceEngine::load_weights_gguf(const std::string& gguf_path) {
         return tmp;
     };
 
-    // Load embedding (needs transpose: GGUF [hidden, vocab] → engine [vocab, hidden])
-    weights_.embed_tokens = load_transposed("token_embd.weight");
-    weights_.final_layernorm = load("output_norm.weight");
+    weights_.embed_tokens = load_embed("token_embd.weight");
+    weights_.final_layernorm = load_fp16("output_norm.weight");
+    weights_.is_q4l = true;  // all projections are Q4L
 
-    // Load per-layer weights using GGUF tensor names
-    // GGUF Qwen3.5 naming:
-    //   blk.N.attn_qkv.weight  — fused Q+K+V (attention) or Q+K+V (SSM in_proj_qkv)
-    //   blk.N.attn_gate.weight — attention sigmoid gate
-    //   blk.N.ssm_a            — A_log
-    //   blk.N.ssm_alpha.weight — in_proj_a (decay input)
-    //   blk.N.ssm_beta.weight  — in_proj_b (write strength input)
-    //   blk.N.ssm_conv1d.weight
-    //   blk.N.ssm_dt.bias
-    //   blk.N.ssm_norm.weight
-    //   blk.N.ssm_out.weight   — out_proj
+    int SSM_CONV_DIM = config_.ssm_conv_dim();
+    int SSM_VALUE_DIM = config_.ssm_value_dim();
+    int SSM_NUM_V_HEADS = config_.ssm_num_v_heads;
 
-    int n_attn = 0, n_ssm = 0, n_missing = 0;
+    int n_attn = 0, n_ssm = 0;
     for (int i = 0; i < config_.num_layers; i++) {
         auto& L = weights_.layers[i];
         L = {};
         std::string p = "blk." + std::to_string(i) + ".";
 
-        // Shared: norms and MLP
-        L.input_layernorm = load(p + "attn_norm.weight");
-        L.post_attn_layernorm = load(p + "post_attention_norm.weight");
-        if (!L.post_attn_layernorm) L.post_attn_layernorm = load(p + "ffn_norm.weight");
-        L.gate_proj_fp16 = load(p + "ffn_gate.weight");
-        L.up_proj_fp16 = load(p + "ffn_up.weight");
-        L.down_proj_fp16 = load(p + "ffn_down.weight");
+        // Norms (small, always fp16)
+        L.input_layernorm = load_fp16(p + "attn_norm.weight");
+        L.post_attn_layernorm = load_fp16(p + "post_attention_norm.weight");
+        if (!L.post_attn_layernorm) L.post_attn_layernorm = load_fp16(p + "ffn_norm.weight");
+
+        // MLP projections (Q4L quantized)
+        L.gate_proj_nf4 = load_q4l(p + "ffn_gate.weight", INTERMEDIATE_SIZE, HIDDEN_SIZE);
+        L.up_proj_nf4 = load_q4l(p + "ffn_up.weight", INTERMEDIATE_SIZE, HIDDEN_SIZE);
+        L.down_proj_nf4 = load_q4l(p + "ffn_down.weight", HIDDEN_SIZE, INTERMEDIATE_SIZE);
+        L.mlp_is_q4l = true;
 
         if (config_.layer_type[i] == LAYER_ATTENTION) {
-            // Attention: separate Q, K, V, O tensors
-            // Q is (hidden, q_proj_dim) where q_proj_dim includes gate for gated attn
-            L.q_proj_fp16 = load(p + "attn_q.weight");
-            L.k_proj_fp16 = load(p + "attn_k.weight");
-            L.v_proj_fp16 = load(p + "attn_v.weight");
-            L.o_proj_fp16 = load(p + "attn_output.weight");
-            L.q_norm = load(p + "attn_q_norm.weight");
-            L.k_norm = load(p + "attn_k_norm.weight");
+            // Attention projections (Q4L quantized)
+            L.q_proj_nf4 = load_q4l(p + "attn_q.weight", Q_PROJ_DIM, HIDDEN_SIZE);
+            L.k_proj_nf4 = load_q4l(p + "attn_k.weight", KV_DIM, HIDDEN_SIZE);
+            L.v_proj_nf4 = load_q4l(p + "attn_v.weight", KV_DIM, HIDDEN_SIZE);
+            L.o_proj_nf4 = load_q4l(p + "attn_output.weight", HIDDEN_SIZE, Q_DIM);
+            L.attn_is_q4l = true;
+            // QK norms (fp16)
+            L.q_norm = load_fp16(p + "attn_q_norm.weight");
+            L.k_norm = load_fp16(p + "attn_k_norm.weight");
             n_attn++;
         } else {
-            // SSM layer:
-            // attn_qkv.weight = in_proj_qkv (Q+K+V fused)
-            // attn_gate.weight = in_proj_z (the Z/gate projection)
-            L.ssm_in_proj_qkv_fp16 = load(p + "attn_qkv.weight");
-            L.ssm_in_proj_z_fp16 = load(p + "attn_gate.weight");
-            L.ssm_out_proj_fp16 = load(p + "ssm_out.weight");
-            L.ssm_in_proj_a_fp16 = load(p + "ssm_alpha.weight");
-            L.ssm_in_proj_b_fp16 = load(p + "ssm_beta.weight");
-            L.ssm_conv1d_weight = load(p + "ssm_conv1d.weight");
+            // SSM projections (Q4L for large, fp16 for small)
+            L.ssm_in_proj_qkv_nf4 = load_q4l(p + "attn_qkv.weight", SSM_CONV_DIM, HIDDEN_SIZE);
+            L.ssm_in_proj_z_nf4 = load_q4l(p + "attn_gate.weight", SSM_VALUE_DIM, HIDDEN_SIZE);
+            L.ssm_out_proj_nf4 = load_q4l(p + "ssm_out.weight", HIDDEN_SIZE, SSM_VALUE_DIM);
+            L.ssm_is_q4l = true;
+            // Small SSM params (fp16)
+            L.ssm_in_proj_a_fp16 = load_fp16(p + "ssm_alpha.weight");
+            L.ssm_in_proj_b_fp16 = load_fp16(p + "ssm_beta.weight");
+            L.ssm_conv1d_weight = load_fp16(p + "ssm_conv1d.weight");
             L.ssm_conv1d_bias = nullptr;
-            L.ssm_A_log = load(p + "ssm_a");
-            L.ssm_dt_bias = load(p + "ssm_dt.bias");
-            L.ssm_norm_weight = load(p + "ssm_norm.weight");
+            L.ssm_A_log = load_fp16(p + "ssm_a");
+            L.ssm_dt_bias = load_fp16(p + "ssm_dt.bias");
+            L.ssm_norm_weight = load_fp16(p + "ssm_norm.weight");
             n_ssm++;
         }
+
+        L.lora_q = L.lora_k = L.lora_v = L.lora_o = nullptr;
+        L.lora_gate = L.lora_up = L.lora_down = nullptr;
+        L.lora_ssm_qkv = L.lora_ssm_z = L.lora_ssm_out = nullptr;
     }
 
-    fprintf(stderr, "  Loaded %d attention + %d SSM layers from GGUF\n", n_attn, n_ssm);
+    fprintf(stderr, "  Loaded %d attention + %d SSM layers from GGUF (Q4L quantized)\n", n_attn, n_ssm);
 }
 
 void InferenceEngine::load_config(const std::string& config_path) {
     config_ = ModelConfig::from_json(config_path);
-    allocate_buffers();
-    // Initialize layer weight pointers to null
-    for (int i = 0; i < config_.num_layers; i++) {
-        auto& L = weights_.layers[i];
-        L = {};  // zero-init all pointers
+    if (!state_.hidden) {
+        // First time: allocate all GPU buffers
+        allocate_buffers();
     }
+
+    // Zero all weight pointers (will be set via share_weight/share_weight_nf4)
     weights_.embed_tokens = nullptr;
     weights_.final_layernorm = nullptr;
+    weights_.is_q4l = true;
+    for (int i = 0; i < config_.num_layers; i++) {
+        auto& L = weights_.layers[i];
+        // Zero only the weight DATA pointers, keep struct metadata
+        L.q_proj_fp16 = L.k_proj_fp16 = L.v_proj_fp16 = L.o_proj_fp16 = nullptr;
+        L.gate_proj_fp16 = L.up_proj_fp16 = L.down_proj_fp16 = nullptr;
+        L.input_layernorm = L.post_attn_layernorm = nullptr;
+        L.q_norm = L.k_norm = nullptr;
+        L.q_proj_nf4 = L.k_proj_nf4 = L.v_proj_nf4 = L.o_proj_nf4 = {};
+        L.gate_proj_nf4 = L.up_proj_nf4 = L.down_proj_nf4 = {};
+        L.attn_is_nf4 = L.attn_is_q4l = false;
+        L.mlp_is_nf4 = L.mlp_is_q4l = false;
+        L.ssm_in_proj_qkv_fp16 = L.ssm_in_proj_z_fp16 = nullptr;
+        L.ssm_out_proj_fp16 = nullptr;
+        L.ssm_in_proj_a_fp16 = L.ssm_in_proj_b_fp16 = nullptr;
+        L.ssm_conv1d_weight = L.ssm_conv1d_bias = nullptr;
+        L.ssm_A_log = L.ssm_dt_bias = L.ssm_norm_weight = nullptr;
+        L.ssm_in_proj_qkv_nf4 = L.ssm_in_proj_z_nf4 = L.ssm_out_proj_nf4 = {};
+        L.ssm_is_q4l = false;
+        L.lora_q = L.lora_k = L.lora_v = L.lora_o = nullptr;
+        L.lora_gate = L.lora_up = L.lora_down = nullptr;
+        L.lora_ssm_qkv = L.lora_ssm_z = L.lora_ssm_out = nullptr;
+    }
     fprintf(stderr, "  Config loaded: %dh, %dL, %dQh/%dKVh, %dhd\n",
             config_.hidden_size, config_.num_layers, config_.num_heads,
             config_.num_kv_heads, config_.head_dim);
 }
 
 void InferenceEngine::share_weight(int layer, const char* name, half* ptr) {
+    std::string n(name);
+
+    // Model-level weights (layer index ignored)
+    if (n == "final_layernorm") { weights_.final_layernorm = ptr; return; }
+
     if (layer < 0 || layer >= config_.num_layers) return;
     auto& L = weights_.layers[layer];
-    std::string n(name);
 
     // Attention projections
     if (n == "q_proj") { L.q_proj_fp16 = ptr; }
@@ -691,6 +830,51 @@ void InferenceEngine::share_weight(int layer, const char* name, half* ptr) {
     else if (n == "ssm_norm") { L.ssm_norm_weight = ptr; }
     else if (n == "ssm_A_log") { L.ssm_A_log = ptr; }
     else if (n == "ssm_dt_bias") { L.ssm_dt_bias = ptr; }
+}
+
+void InferenceEngine::share_weight_nf4(int layer, const char* name,
+                                        uint8_t* data, float* absmax, float* quant_map,
+                                        int out_dim, int in_dim) {
+    if (layer < 0 || layer >= config_.num_layers) return;
+    auto& L = weights_.layers[layer];
+    std::string n(name);
+
+    auto make_nf4 = [&](NF4Weight& old) -> NF4Weight {
+        // Free old weight data if it was internally allocated
+        if (old.data) cudaFree(old.data);
+        if (old.absmax) cudaFree(old.absmax);
+        if (old.quant_map) cudaFree(old.quant_map);
+        if (old.fp16_cache) cudaFree(old.fp16_cache);
+        NF4Weight w = {};
+        w.data = data;
+        w.absmax = absmax;
+        w.quant_map = quant_map;
+        w.fp16_cache = nullptr;
+        w.out_dim = out_dim;
+        w.in_dim = in_dim;
+        w.block_size = 64;
+        w.n_blocks = ((size_t)out_dim * in_dim + 63) / 64;
+        return w;
+    };
+
+    // Detect format: quant_map=null → Q4L, quant_map!=null → NF4
+    bool is_q4l = (quant_map == nullptr);
+
+    // Attention projections
+    if (n == "q_proj") { L.q_proj_nf4 = make_nf4(L.q_proj_nf4); if (is_q4l) L.attn_is_q4l = true; else L.attn_is_nf4 = true; }
+    else if (n == "k_proj") { L.k_proj_nf4 = make_nf4(L.k_proj_nf4); }
+    else if (n == "v_proj") { L.v_proj_nf4 = make_nf4(L.v_proj_nf4); }
+    else if (n == "o_proj") { L.o_proj_nf4 = make_nf4(L.o_proj_nf4); }
+    // MLP
+    else if (n == "gate_proj") { L.gate_proj_nf4 = make_nf4(L.gate_proj_nf4); if (is_q4l) L.mlp_is_q4l = true; else L.mlp_is_nf4 = true; }
+    else if (n == "up_proj") { L.up_proj_nf4 = make_nf4(L.up_proj_nf4); }
+    else if (n == "down_proj") { L.down_proj_nf4 = make_nf4(L.down_proj_nf4); }
+    // SSM
+    else if (n == "ssm_in_proj_qkv") { L.ssm_in_proj_qkv_nf4 = make_nf4(L.ssm_in_proj_qkv_nf4); if (is_q4l) L.ssm_is_q4l = true; }
+    else if (n == "ssm_in_proj_z") { L.ssm_in_proj_z_nf4 = make_nf4(L.ssm_in_proj_z_nf4); }
+    else if (n == "ssm_out_proj") { L.ssm_out_proj_nf4 = make_nf4(L.ssm_out_proj_nf4); }
+
+    if (is_q4l) weights_.is_q4l = true;
 }
 
 void InferenceEngine::share_embedding(void* external_embed_ptr) {
@@ -844,14 +1028,19 @@ void InferenceEngine::forward_layer(int layer_idx) {
 
     // 1. Input LayerNorm
     half* norm_out = state_.ffn_out;
+    if (!layer.input_layernorm) { fprintf(stderr, "[L%d] input_layernorm is NULL!\n", layer_idx); return; }
     launch_copy_rms_norm(state_.hidden, layer.input_layernorm,
                          state_.residual, norm_out,
                          HIDDEN_SIZE, RMS_NORM_EPS, stream);
+    cudaStreamSynchronize(stream);
+    { auto _e = cudaGetLastError(); if (_e != cudaSuccess) { fprintf(stderr, "[L%d] norm FAIL: %s\n", layer_idx, cudaGetErrorString(_e)); return; } }
 
     // Quantize input to int8 for dp4a
     if (weights_.is_q4l) {
         launch_quantize_input_q8(norm_out, state_.q8_data, state_.q8_scales,
                                  state_.q8_sums, HIDDEN_SIZE, stream);
+        cudaStreamSynchronize(stream);
+        { auto _e = cudaGetLastError(); if (_e != cudaSuccess) { fprintf(stderr, "[L%d] q8 FAIL: %s\n", layer_idx, cudaGetErrorString(_e)); return; } }
     }
 
     // 2. QKV projections
@@ -861,7 +1050,15 @@ void InferenceEngine::forward_layer(int layer_idx) {
         FUSED3_4BIT(q, state_.q_buf, k, state_.k_buf, v, state_.v_buf, norm_out, q.in_dim, stream);
     } else {
         if (layer.q_proj_fp16) cublas_hgemv_lora(layer.q_proj_fp16, norm_out, state_.q_buf, Q_DIM, HIDDEN_SIZE, layer.lora_q, state_.lora_scratch);
-        else { auto& w = layer.q_proj_nf4; GEMV_4BIT(w, norm_out, state_.q_buf, stream); }
+        else {
+            auto& w = layer.q_proj_nf4;
+            if (!w.data) { fprintf(stderr, "[L%d] q_proj_nf4.data is NULL!\n", layer_idx); return; }
+            fprintf(stderr, "[L%d] q_proj: data=%p absmax=%p qmap=%p od=%d id=%d bs=%d\n",
+                    layer_idx, (void*)w.data, (void*)w.absmax, (void*)w.quant_map, w.out_dim, w.in_dim, w.block_size);
+            GEMV_4BIT(w, norm_out, state_.q_buf, stream);
+        }
+        cudaStreamSynchronize(stream);
+        { auto _e = cudaGetLastError(); if (_e != cudaSuccess) { fprintf(stderr, "[L%d] q_proj FAIL: %s\n", layer_idx, cudaGetErrorString(_e)); return; } }
         if (layer.k_proj_fp16) cublas_hgemv_lora(layer.k_proj_fp16, norm_out, state_.k_buf, KV_DIM, HIDDEN_SIZE, layer.lora_k, state_.lora_scratch);
         else { auto& w = layer.k_proj_nf4; GEMV_4BIT(w, norm_out, state_.k_buf, stream); }
         if (layer.v_proj_fp16) cublas_hgemv_lora(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE, layer.lora_v, state_.lora_scratch);
@@ -973,9 +1170,15 @@ void InferenceEngine::decode(int token_id) {
 
     // Embedding lookup
     launch_embedding(weights_.embed_tokens, token_id, state_.hidden, HIDDEN_SIZE, stream);
+    cudaStreamSynchronize(stream);
+    auto e1 = cudaGetLastError();
+    if (e1 != cudaSuccess) { fprintf(stderr, "[decode] embed FAIL: %s\n", cudaGetErrorString(e1)); return; }
 
     for (int i = 0; i < NUM_LAYERS; i++) {
         forward_layer(i);
+        cudaStreamSynchronize(stream);
+        auto e2 = cudaGetLastError();
+        if (e2 != cudaSuccess) { fprintf(stderr, "[decode] layer %d FAIL: %s\n", i, cudaGetErrorString(e2)); return; }
     }
 
     // Final LayerNorm
@@ -1025,6 +1228,10 @@ void InferenceEngine::update_lora_weight(
     else if (proj == "gate_proj") target = &layer.lora_gate;
     else if (proj == "up_proj") target = &layer.lora_up;
     else if (proj == "down_proj") target = &layer.lora_down;
+    // SSM (Gated Delta Rule) projections
+    else if (proj == "ssm_qkv") target = &layer.lora_ssm_qkv;
+    else if (proj == "ssm_z") target = &layer.lora_ssm_z;
+    else if (proj == "ssm_out") target = &layer.lora_ssm_out;
     if (!target) return;
 
     // Create or update adapter
@@ -1032,6 +1239,15 @@ void InferenceEngine::update_lora_weight(
         *target = new LoRAAdapter();
         cudaMallocChecked(&(*target)->A, A_rows * A_cols * sizeof(half));
         cudaMallocChecked(&(*target)->B, B_rows * B_cols * sizeof(half));
+    } else {
+        // Resize if dimensions changed
+        LoRAAdapter* old = *target;
+        if (old->rank != A_rows || old->in_features != A_cols || old->out_features != B_rows) {
+            cudaFree(old->A);
+            cudaFree(old->B);
+            cudaMallocChecked(&old->A, A_rows * A_cols * sizeof(half));
+            cudaMallocChecked(&old->B, B_rows * B_cols * sizeof(half));
+        }
     }
 
     // Copy weights (auto-detect host vs device source)
@@ -1139,9 +1355,13 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
 
     // Free old batch (host only -- GPU memory is in the arena)
     if (batch_) {
+        // Free LoRA adapters from old batch state
         delete[] batch_->h_positions; delete[] batch_->h_tokens;
         delete[] batch_->h_finished; delete[] batch_->h_randoms;
+        delete[] batch_->h_token_history;
+        if (batch_->d_token_history) cudaFree(batch_->d_token_history);
         delete batch_;
+        batch_ = nullptr;
     }
 
     // Activation buffers sized for max(G, prefill_tokens) to support chunked prefill.
@@ -1164,8 +1384,17 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     add(INTERMEDIATE_SIZE * N * sizeof(half));     // up_buf
     add(VOCAB_SIZE * G * sizeof(float));           // logits (decode only, stays at G)
     add(std::max((size_t)G, (size_t)N) * NUM_HEADS * max_seq_len * sizeof(float)); // attn_scores
-    if (!weights_cached_)
-        add((size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half)); // dequant_scratch
+    if (!weights_cached_) {
+        // Size for largest weight matrix: max of MLP (intermediate×hidden) and SSM (conv_dim×hidden)
+        size_t max_proj = std::max((size_t)INTERMEDIATE_SIZE, (size_t)config_.ssm_conv_dim());
+        add(max_proj * HIDDEN_SIZE * sizeof(half)); // dequant_scratch
+    }
+    if (weights_.is_q4l) {
+        int max_in = std::max(HIDDEN_SIZE, INTERMEDIATE_SIZE);
+        add(max_in * sizeof(int8_t));           // q8_data
+        add((max_in / 64) * sizeof(float));     // q8_scales
+        add((max_in / 64) * sizeof(float));     // q8_sums
+    }
     for (int i = 0; i < NUM_LAYERS; i++) {
         if (config_.layer_type[i] == LAYER_SSM) {
             // SSM state: (G, num_v_heads, k_head_dim, v_head_dim) per layer — fp32
@@ -1215,7 +1444,7 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     add(N * sizeof(int));   // d_positions (max(G, T))
     add(N * sizeof(int));   // d_tokens (max(G, T))
     add(G * sizeof(float)); // d_randoms
-    add(64 * G * sizeof(half)); // lora_scratch
+    add(64 * N * sizeof(half)); // lora_scratch (N = max(G, prompt_len) for prefill LoRA)
 
     // (Re)allocate arena if needed
     if (need > batch_arena_.capacity) {
@@ -1252,9 +1481,21 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     batch_->logits    = (float*)batch_arena_.alloc(VOCAB_SIZE * G * sizeof(float));
     batch_->attn_scores = (float*)batch_arena_.alloc(std::max((size_t)G, (size_t)N) * NUM_HEADS * max_seq_len * sizeof(float));
     if (!weights_cached_) {
-        batch_->dequant_scratch = (half*)batch_arena_.alloc((size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half));
+        size_t max_proj = std::max((size_t)INTERMEDIATE_SIZE, (size_t)config_.ssm_conv_dim());
+        batch_->dequant_scratch = (half*)batch_arena_.alloc(max_proj * HIDDEN_SIZE * sizeof(half));
     } else {
         batch_->dequant_scratch = nullptr;
+    }
+    // dp4a q8 buffers for batched GEMV (decode path, reused per-sequence)
+    if (weights_.is_q4l) {
+        int max_in = std::max(HIDDEN_SIZE, INTERMEDIATE_SIZE);
+        batch_->q8_data = (int8_t*)batch_arena_.alloc(max_in * sizeof(int8_t));
+        batch_->q8_scales = (float*)batch_arena_.alloc((max_in / 64) * sizeof(float));
+        batch_->q8_sums = (float*)batch_arena_.alloc((max_in / 64) * sizeof(float));
+    } else {
+        batch_->q8_data = nullptr;
+        batch_->q8_scales = nullptr;
+        batch_->q8_sums = nullptr;
     }
     for (int i = 0; i < NUM_LAYERS; i++) {
         // Initialize all pointers to null
@@ -1321,7 +1562,7 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     batch_->d_positions  = (int*)batch_arena_.alloc(N * sizeof(int));
     batch_->d_tokens     = (int*)batch_arena_.alloc(N * sizeof(int));
     batch_->d_randoms    = (float*)batch_arena_.alloc(G * sizeof(float));
-    batch_->lora_scratch = (half*)batch_arena_.alloc(64 * G * sizeof(half));
+    batch_->lora_scratch = (half*)batch_arena_.alloc(64 * N * sizeof(half));
 
     // Host allocations
     batch_->h_positions = new int[G]();
@@ -1384,8 +1625,8 @@ void InferenceEngine::set_arena(void* ptr, size_t size) {
     // Use externally-allocated memory (from PyTorch) as the batch arena.
     // This eliminates cudaMalloc/PyTorch allocator contention.
     if (batch_arena_.base && batch_arena_.capacity > 0) {
-        // Only free if we own it (not external)
-        // After set_arena, we never own the base pointer
+        // Free internally-allocated arena before replacing
+        cudaFree(batch_arena_.base);
     }
     batch_arena_.base = (char*)ptr;
     batch_arena_.capacity = size;
@@ -1398,8 +1639,38 @@ void InferenceEngine::batch_gemm_q4l(half* out, const NF4Weight& w, const half* 
     if (w.fp16_cache) {
         // Use pre-dequanted fp16 weights with cuBLAS tensor cores
         batch_gemm(out, w.fp16_cache, in, w.out_dim, N, w.in_dim, stream);
+    } else if (N <= 8 && w.quant_map && batch_->q8_data) {
+        // NF4 format: N independent NF4 dp4a GEMVs (int8 dot products + NF4 lookup)
+        for (int g = 0; g < N; g++) {
+            const half* in_g = in + (size_t)g * w.in_dim;
+            half* out_g = out + (size_t)g * w.out_dim;
+            launch_quantize_input_q8(in_g, batch_->q8_data, batch_->q8_scales,
+                                     batch_->q8_sums, w.in_dim, stream);
+            launch_nf4_dp4a_gemv(w.data, w.absmax, batch_->q8_data,
+                                 batch_->q8_scales, batch_->q8_sums,
+                                 out_g, w.out_dim, w.in_dim, stream);
+        }
+    } else if (N <= 8 && batch_->q8_data) {
+        // Q4L format (no lookup table): N independent dp4a GEMVs
+        for (int g = 0; g < N; g++) {
+            const half* in_g = in + (size_t)g * w.in_dim;
+            half* out_g = out + (size_t)g * w.out_dim;
+            launch_quantize_input_q8(in_g, batch_->q8_data, batch_->q8_scales,
+                                     batch_->q8_sums, w.in_dim, stream);
+            launch_q4l_dp4a_gemv(w.data, w.absmax, batch_->q8_data,
+                                 batch_->q8_scales, batch_->q8_sums,
+                                 out_g, w.out_dim, w.in_dim, stream);
+        }
+    } else if (w.quant_map) {
+        // NF4 large batch (prefill): per-token GEMV (no NF4 batched dequant kernel)
+        for (int g = 0; g < N; g++) {
+            const half* in_g = in + (size_t)g * w.in_dim;
+            half* out_g = out + (size_t)g * w.out_dim;
+            launch_nf4_gemv_fast(w.data, w.absmax, in_g, out_g,
+                                 w.out_dim, w.in_dim, w.block_size, stream);
+        }
     } else {
-        // Fallback: dequant to scratch then cuBLAS
+        // Q4L large batch (prefill): dequant to scratch then cuBLAS
         launch_dequant_q4l(batch_->dequant_scratch, w.data, w.absmax,
                            w.out_dim, w.in_dim, stream);
         batch_gemm(out, (const half*)batch_->dequant_scratch, in,
@@ -1423,21 +1694,33 @@ void InferenceEngine::forward_layer_ssm_batch(int layer_idx, int G, cudaStream_t
     int SSM_K_HEAD_DIM = config_.ssm_k_head_dim;
     int SSM_V_HEAD_DIM = config_.ssm_v_head_dim;
 
+    // Batched projection with optional LoRA (same pattern as attention forward)
     auto project = [&](half* out, half* fp16w, NF4Weight& nf4w, const half* input,
-                       int out_dim, int in_dim) {
+                       int out_dim, int in_dim, const LoRAAdapter* lora = nullptr) {
         if (fp16w) batch_gemm(out, fp16w, input, out_dim, G, in_dim, stream);
         else batch_gemm_q4l(out, nf4w, input, G, stream);
+        if (lora && lora->A && lora->B) {
+            ensure_cublas(stream);
+            float alpha = 1.0f, beta = 0.0f;
+            cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                         lora->rank, G, lora->in_features, &alpha,
+                         lora->A, CUDA_R_16F, lora->in_features,
+                         input, CUDA_R_16F, lora->in_features,
+                         &beta, B->lora_scratch, CUDA_R_16F, lora->rank,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            float one = 1.0f;
+            float scale = lora->scale;
+            cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                         lora->out_features, G, lora->rank, &scale,
+                         lora->B, CUDA_R_16F, lora->rank,
+                         B->lora_scratch, CUDA_R_16F, lora->rank,
+                         &one, out, CUDA_R_16F, lora->out_features,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
     };
 
-    // Debug: sync + check after each step to find crash
-    #define SSM_CHECK(msg) do { \
-        cudaStreamSynchronize(stream); \
-        auto _e = cudaGetLastError(); \
-        if (_e != cudaSuccess) { \
-            fprintf(stderr, "[SSM L%d] CUDA error at %s: %s\n", layer_idx, msg, cudaGetErrorString(_e)); \
-            return; \
-        } \
-    } while(0)
+    // SSM_CHECK: no-op in release (debug sync kills perf: 60K syncs/step)
+    #define SSM_CHECK(msg) ((void)0)
 
     // 1. RMSNorm
     launch_copy_batch(B->residual, B->hidden, HIDDEN_SIZE * G, stream);
@@ -1448,10 +1731,10 @@ void InferenceEngine::forward_layer_ssm_batch(int layer_idx, int G, cudaStream_t
 
     // 2. Projections: QKV, Z, A, B
     project(B->ssm_qkv_buf, L.ssm_in_proj_qkv_fp16, L.ssm_in_proj_qkv_nf4,
-            B->norm_buf, SSM_CONV_DIM, HIDDEN_SIZE);
+            B->norm_buf, SSM_CONV_DIM, HIDDEN_SIZE, L.lora_ssm_qkv);
     SSM_CHECK("qkv_proj");
     project(B->ssm_z_buf, L.ssm_in_proj_z_fp16, L.ssm_in_proj_z_nf4,
-            B->norm_buf, SSM_VALUE_DIM, HIDDEN_SIZE);
+            B->norm_buf, SSM_VALUE_DIM, HIDDEN_SIZE, L.lora_ssm_z);
     SSM_CHECK("z_proj");
     // Small projections: always fp16 GEMV
     batch_gemm(B->ssm_a_buf, L.ssm_in_proj_a_fp16, B->norm_buf,
@@ -1509,7 +1792,7 @@ void InferenceEngine::forward_layer_ssm_batch(int layer_idx, int G, cudaStream_t
 
     // 10. Output projection: hidden = out_proj @ y_buf
     project(B->hidden, L.ssm_out_proj_fp16, L.ssm_out_proj_nf4,
-            B->ssm_y_buf, HIDDEN_SIZE, SSM_VALUE_DIM);
+            B->ssm_y_buf, HIDDEN_SIZE, SSM_VALUE_DIM, L.lora_ssm_out);
     SSM_CHECK("out_proj");
 
     // 11. Residual add
@@ -1521,12 +1804,12 @@ void InferenceEngine::forward_layer_ssm_batch(int layer_idx, int G, cudaStream_t
                           HIDDEN_SIZE, G, RMS_NORM_EPS, stream, config_.is_hybrid());
 
     project(B->gate_buf, L.gate_proj_fp16, L.gate_proj_nf4,
-            B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+            B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, L.lora_gate);
     project(B->up_buf, L.up_proj_fp16, L.up_proj_nf4,
-            B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+            B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, L.lora_up);
     launch_silu_mul_batch(B->gate_buf, B->up_buf, INTERMEDIATE_SIZE * G, stream);
     project(B->hidden, L.down_proj_fp16, L.down_proj_nf4,
-            B->gate_buf, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+            B->gate_buf, HIDDEN_SIZE, INTERMEDIATE_SIZE, L.lora_down);
 
     launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * G, stream);
 }
@@ -1551,10 +1834,29 @@ void InferenceEngine::forward_layer_ssm_prefill(int layer_idx, int T, cudaStream
     int T_padded = ((T + CHUNK_SIZE - 1) / CHUNK_SIZE) * CHUNK_SIZE;
     int num_chunks = T_padded / CHUNK_SIZE;
 
+    // Batched projection with optional LoRA
     auto project = [&](half* out, half* fp16w, NF4Weight& nf4w, const half* input,
-                       int out_dim, int in_dim) {
+                       int out_dim, int in_dim, const LoRAAdapter* lora = nullptr) {
         if (fp16w) batch_gemm(out, fp16w, input, out_dim, T, in_dim, stream);
         else batch_gemm_q4l(out, nf4w, input, T, stream);
+        if (lora && lora->A && lora->B) {
+            ensure_cublas(stream);
+            float alpha = 1.0f, beta = 0.0f;
+            cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                         lora->rank, T, lora->in_features, &alpha,
+                         lora->A, CUDA_R_16F, lora->in_features,
+                         input, CUDA_R_16F, lora->in_features,
+                         &beta, B->lora_scratch, CUDA_R_16F, lora->rank,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            float one = 1.0f;
+            float scale = lora->scale;
+            cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                         lora->out_features, T, lora->rank, &scale,
+                         lora->B, CUDA_R_16F, lora->rank,
+                         B->lora_scratch, CUDA_R_16F, lora->rank,
+                         &one, out, CUDA_R_16F, lora->out_features,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
     };
 
     // 1. RMSNorm (all T tokens)
@@ -1564,9 +1866,9 @@ void InferenceEngine::forward_layer_ssm_prefill(int layer_idx, int T, cudaStream
 
     // 2. Projections: QKV, Z, A, B (all T tokens at once via batched GEMM)
     project(B->ssm_qkv_buf, L.ssm_in_proj_qkv_fp16, L.ssm_in_proj_qkv_nf4,
-            B->norm_buf, SSM_CONV_DIM, HIDDEN_SIZE);
+            B->norm_buf, SSM_CONV_DIM, HIDDEN_SIZE, L.lora_ssm_qkv);
     project(B->ssm_z_buf, L.ssm_in_proj_z_fp16, L.ssm_in_proj_z_nf4,
-            B->norm_buf, SSM_VALUE_DIM, HIDDEN_SIZE);
+            B->norm_buf, SSM_VALUE_DIM, HIDDEN_SIZE, L.lora_ssm_z);
     batch_gemm(B->ssm_a_buf, L.ssm_in_proj_a_fp16, B->norm_buf,
                SSM_NUM_HEADS, T, HIDDEN_SIZE, stream);
     batch_gemm(B->ssm_b_buf, L.ssm_in_proj_b_fp16, B->norm_buf,
@@ -1618,7 +1920,7 @@ void InferenceEngine::forward_layer_ssm_prefill(int layer_idx, int T, cudaStream
 
     // 10. Output projection
     project(B->hidden, L.ssm_out_proj_fp16, L.ssm_out_proj_nf4,
-            B->ssm_y_buf, HIDDEN_SIZE, SSM_VALUE_DIM);
+            B->ssm_y_buf, HIDDEN_SIZE, SSM_VALUE_DIM, L.lora_ssm_out);
 
     // 11. Residual add
     launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * T, stream);
@@ -1629,12 +1931,12 @@ void InferenceEngine::forward_layer_ssm_prefill(int layer_idx, int T, cudaStream
                           HIDDEN_SIZE, T, RMS_NORM_EPS, stream, config_.is_hybrid());
 
     project(B->gate_buf, L.gate_proj_fp16, L.gate_proj_nf4,
-            B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+            B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, L.lora_gate);
     project(B->up_buf, L.up_proj_fp16, L.up_proj_nf4,
-            B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+            B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, L.lora_up);
     launch_silu_mul_batch(B->gate_buf, B->up_buf, INTERMEDIATE_SIZE * T, stream);
     project(B->hidden, L.down_proj_fp16, L.down_proj_nf4,
-            B->gate_buf, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+            B->gate_buf, HIDDEN_SIZE, INTERMEDIATE_SIZE, L.lora_down);
 
     launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * T, stream);
 }
@@ -1955,7 +2257,7 @@ void InferenceEngine::prefill_chunked(int T, int G, cudaStream_t stream) {
         ensure_cublas(stream);
         float alpha = 1.0f, beta_val = 0.0f;
         cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                     VOCAB_SIZE, G, HIDDEN_SIZE, &alpha,
+                     VOCAB_SIZE, 1, HIDDEN_SIZE, &alpha,
                      weights_.embed_tokens, CUDA_R_16F, HIDDEN_SIZE,
                      B->norm_buf, CUDA_R_16F, HIDDEN_SIZE,
                      &beta_val, B->logits, CUDA_R_32F, VOCAB_SIZE,
@@ -2135,7 +2437,7 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
         for (int i = 0; i < NUM_LAYERS; i++) {
             if (config_.layer_type[i] == LAYER_SSM) {
                 if (B->ssm_state[i]) cudaMemset(B->ssm_state[i], 0,
-                    (size_t)G * config_.ssm_num_v_heads * config_.ssm_k_head_dim * config_.ssm_v_head_dim * sizeof(half));
+                    (size_t)G * config_.ssm_num_v_heads * config_.ssm_k_head_dim * config_.ssm_v_head_dim * sizeof(float));
                 if (B->ssm_conv_state[i]) cudaMemset(B->ssm_conv_state[i], 0,
                     (size_t)G * config_.ssm_conv_dim() * (config_.ssm_conv_kernel - 1) * sizeof(half));
             } else if (kv_bits_ == 0) {
