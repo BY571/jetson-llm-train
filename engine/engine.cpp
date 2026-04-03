@@ -1661,13 +1661,16 @@ void InferenceEngine::batch_gemm_q4l(half* out, const NF4Weight& w, const half* 
                                  batch_->q8_scales, batch_->q8_sums,
                                  out_g, w.out_dim, w.in_dim, stream);
         }
-    } else if (w.quant_map) {
-        // NF4 large batch (prefill): per-token GEMV (no NF4 batched dequant kernel)
+    } else if (w.quant_map && batch_->q8_data) {
+        // NF4 large batch (prefill): per-token NF4 dp4a GEMV
         for (int g = 0; g < N; g++) {
             const half* in_g = in + (size_t)g * w.in_dim;
             half* out_g = out + (size_t)g * w.out_dim;
-            launch_nf4_gemv_fast(w.data, w.absmax, in_g, out_g,
-                                 w.out_dim, w.in_dim, w.block_size, stream);
+            launch_quantize_input_q8(in_g, batch_->q8_data, batch_->q8_scales,
+                                     batch_->q8_sums, w.in_dim, stream);
+            launch_nf4_dp4a_gemv(w.data, w.absmax, batch_->q8_data,
+                                 batch_->q8_scales, batch_->q8_sums,
+                                 out_g, w.out_dim, w.in_dim, stream);
         }
     } else {
         // Q4L large batch (prefill): dequant to scratch then cuBLAS
