@@ -956,4 +956,52 @@ void launch_dequant_q4l(
         out, data, scales, out_dim, in_dim);
 }
 
+// ============================================================================
+// NF4 dequantization: packed uint8 + absmax + NF4 table -> fp16
+// Same as Q4L dequant but uses lookup table instead of linear (nibble-8)*scale
+// ============================================================================
+
+__global__ void dequant_nf4_kernel(
+    half* __restrict__ out,
+    const uint8_t* __restrict__ data,
+    const float* __restrict__ absmax,
+    int out_dim, int in_dim
+) {
+    // Hardcoded NF4 lookup table
+    const float NF4[16] = {
+        -1.0f, -0.6961928f, -0.5250731f, -0.3949175f,
+        -0.2844414f, -0.1847734f, -0.0910500f, 0.0f,
+        0.0795803f, 0.1609302f, 0.2461123f, 0.3379152f,
+        0.4407098f, 0.5626170f, 0.7229568f, 1.0f
+    };
+
+    int bytes_total = out_dim * in_dim / 2;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= bytes_total) return;
+
+    uint8_t packed = data[idx];
+    // dp4a packing: byte[g*4+i] = elem[g*8+i] | (elem[g*8+i+4] << 4)
+    int group = idx / 4;
+    int byte_in_group = idx % 4;
+    int elem_lo = group * 8 + byte_in_group;
+    int elem_hi = elem_lo + 4;
+
+    int block_idx = elem_lo / 64;
+    float am = absmax[block_idx];
+
+    out[elem_lo] = __float2half(NF4[packed & 0x0F] * am);
+    out[elem_hi] = __float2half(NF4[packed >> 4] * am);
+}
+
+void launch_dequant_nf4(
+    half* out, const uint8_t* data, const float* absmax,
+    int out_dim, int in_dim, cudaStream_t stream
+) {
+    int bytes_total = out_dim * in_dim / 2;
+    int threads = 256;
+    int blocks = (bytes_total + threads - 1) / threads;
+    dequant_nf4_kernel<<<blocks, threads, 0, stream>>>(
+        out, data, absmax, out_dim, in_dim);
+}
+
 } // extern "C"

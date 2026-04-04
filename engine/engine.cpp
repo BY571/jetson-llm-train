@@ -113,6 +113,7 @@ extern "C" {
     void launch_quantize_input_q8(const half* input, int8_t* q8_data, float* q8_scales, float* q8_sums, int dim, cudaStream_t stream);
     void launch_q4l_dp4a_gemv(const uint8_t* w, const float* w_scales, const int8_t* q8, const float* q8_sc, const float* q8_sm, half* y, int out_dim, int in_dim, cudaStream_t stream);
     void launch_dequant_q4l(half* out, const uint8_t* data, const float* scales, int out_dim, int in_dim, cudaStream_t stream);
+    void launch_dequant_nf4(half* out, const uint8_t* data, const float* absmax, int out_dim, int in_dim, cudaStream_t stream);
     void launch_q4l_batch_gemm(const uint8_t* w, const float* w_scales, const half* input, half* output, int out_dim, int in_dim, int G, cudaStream_t stream);
     void launch_nf4_batch_gemv(const uint8_t* w, const float* absmax, const half* input, half* output, int out_dim, int in_dim, int G, cudaStream_t stream);
 
@@ -1644,17 +1645,13 @@ void InferenceEngine::batch_gemm_q4l(half* out, const NF4Weight& w, const half* 
                                  batch_->q8_scales, batch_->q8_sums,
                                  out_g, w.out_dim, w.in_dim, stream);
         }
-    } else if (w.quant_map && batch_->q8_data) {
-        // NF4 large batch (prefill): per-token dp4a
-        for (int g = 0; g < N; g++) {
-            const half* in_g = in + (size_t)g * w.in_dim;
-            half* out_g = out + (size_t)g * w.out_dim;
-            launch_quantize_input_q8(in_g, batch_->q8_data, batch_->q8_scales,
-                                     batch_->q8_sums, w.in_dim, stream);
-            launch_nf4_dp4a_gemv(w.data, w.absmax, batch_->q8_data,
-                                 batch_->q8_scales, batch_->q8_sums,
-                                 out_g, w.out_dim, w.in_dim, stream);
-        }
+    } else if (w.quant_map && batch_->dequant_scratch) {
+        // NF4 large batch (prefill): dequant NF4 to fp16 scratch, then cuBLAS GEMM
+        // Uses the NF4 lookup table for dequant (not Q4L linear dequant)
+        launch_dequant_nf4(batch_->dequant_scratch, w.data, w.absmax,
+                           w.out_dim, w.in_dim, stream);
+        batch_gemm(out, (const half*)batch_->dequant_scratch, in,
+                   w.out_dim, N, w.in_dim, stream);
     } else {
         // Q4L large batch (prefill): dequant to scratch then cuBLAS
         launch_dequant_q4l(batch_->dequant_scratch, w.data, w.absmax,
