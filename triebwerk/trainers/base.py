@@ -352,6 +352,10 @@ class BaseTrainer(ABC):
                 if key != "prompt":
                     reward_kwargs[key] = [sample[key]] * num_generations
 
+            # 0. Wake engine if sleeping (re-allocates GPU buffers freed after last gen)
+            if self.engine is not None and self.empty_cache:
+                self.engine.wake()
+
             # 1. Sync LoRA to engine (skip for hybrid SSM — cuBLAS LoRA overhead
             # makes generation 40x slower. GRPO importance sampling handles the mismatch.)
             if self.syncer is not None and not getattr(self.engine, '_skip_lora', False):
@@ -359,13 +363,16 @@ class BaseTrainer(ABC):
             if step == 1:
                 print(f"  [timing] sync: {time.time()-t_step:.1f}s", flush=True)
 
-            # 2. Generate G completions
+            # 2. Generate G completions (wake engine, generate, sleep to free arena for PyTorch)
             t_gen = time.time()
             if self.engine is not None:
                 completions = generate_with_engine(
                     self.engine, self.tokenizer, prompt, num_generations,
                     max_completion_tokens, self.temperature, self.top_p, stop_ids,
                 )
+                if self.empty_cache:
+                    self.engine.sleep()
+                    torch.cuda.empty_cache()
             else:
                 completions = generate_with_hf(
                     self.model, self.tokenizer, prompt, num_generations,
