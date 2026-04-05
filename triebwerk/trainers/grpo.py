@@ -101,6 +101,8 @@ class GRPOTrainer(BaseTrainer):
                 total_loss_val += per_token_loss.sum().item()
 
             del outputs, logits, new_lp, input_ids, sample_loss, per_token_loss, new_comp_lp
+            if self.empty_cache:
+                torch.cuda.empty_cache()
 
         if self.empty_cache:
             torch.cuda.empty_cache()

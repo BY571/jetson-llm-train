@@ -4,17 +4,11 @@ import torch
 
 
 def _apply_template(tokenizer, prompt):
-    """Apply chat template with thinking enabled (Qwen3/3.5 reasoning mode)."""
-    try:
-        return tokenizer.apply_chat_template(
-            prompt, tokenize=False, add_generation_prompt=True,
-            enable_thinking=True,
-        )
-    except TypeError:
-        # Tokenizer doesn't support enable_thinking kwarg
-        return tokenizer.apply_chat_template(
-            prompt, tokenize=False, add_generation_prompt=True,
-        )
+    """Apply chat template for generation. No enable_thinking — let GRPO
+    teach the model to produce <think>...</think><answer>...</answer> from scratch."""
+    return tokenizer.apply_chat_template(
+        prompt, tokenize=False, add_generation_prompt=True,
+    )
 
 
 def generate_with_engine(engine, tokenizer, prompt, num_generations,
