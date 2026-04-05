@@ -212,17 +212,10 @@ class BaseTrainer(ABC):
         if self.engine is None:
             return
 
-        # Don't share embedding for hybrid SSM — the bf16→fp16 cast from bnb
-        # differs slightly from the Q4L file's fp16 embedding, affecting output quality.
-        # For pure transformers, share to save memory.
-        has_ssm = any("linear_attn" in n for n, _ in self.model.named_modules())
-        if not has_ssm:
-            embed_weight = self.model.base_model.model.model.embed_tokens.weight
-            if embed_weight.is_cuda:
-                if embed_weight.dtype != torch.float16:
-                    embed_weight = embed_weight.data.to(torch.float16).contiguous()
-                    self._embed_ref = embed_weight
-                self.engine.share_embedding(embed_weight.data_ptr())
+        # Share bnb NF4 weights → engine dequants via lookup table at runtime.
+        # Zero quantization error (reads original NF4 values, not double-quantized Q4L).
+        from triebwerk.engine import share_bnb_weights
+        self._shared_refs = share_bnb_weights(self.engine, self.model)
 
         # For hybrid SSM models, skip LoRA sync — cuBLAS overhead for 150 tiny
         # LoRA GEMMs makes generation 40x slower. GRPO importance sampling
